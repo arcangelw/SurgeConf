@@ -1,0 +1,793 @@
+{% extends "base.html" %}
+{% block title %}{{ t["rule.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["rule.title"] }}</h1>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h3>{{ t["rule.count"] }}</h3>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span style="font-size:12px;color:var(--text2);" id="rule-count"></span>
+      <button class="btn btn-primary btn-sm" onclick="showAddRule()">{{ t["rule.add"] }}</button>
+      <button class="btn btn-outline btn-sm" onclick="resetDefaultOrder()">{{ t["rule.reset_order"] }}</button>
+    </div>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.drag_hint"] }}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:24px;"></th>
+          <th>{{ t["rule.name"] }}</th>
+          <th>{{ t["rule.type"] }}</th>
+          <th>{{ t["rule.action"] }}</th>
+          <th>{{ t["rule.category"] }}</th>
+          <th>{{ t["group.order"] }}</th>
+          <th>{{ t["sub.status"] }}</th>
+          <th>{{ t["node.col_action"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="rule-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 前置自定义规则 -->
+<div class="card" style="margin-top:16px;">
+  <div class="card-header">
+    <h3>{{ t["rule.pre_title"] }}</h3>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span style="font-size:12px;color:var(--text2);" id="pre-count"></span>
+      <button class="btn btn-primary btn-sm" onclick="showAddCustomRule('pre')">{{ t["rule.add_custom"] }}</button>
+    </div>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.pre_hint"] }}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:24px;"></th>
+          <th>{{ t["rule.rule_text"] }}</th>
+          <th>{{ t["rule.comment"] }}</th>
+          <th>{{ t["sub.status"] }}</th>
+          <th>{{ t["node.col_action"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="pre-rule-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 通用自定义规则 -->
+<div class="card" style="margin-top:16px;">
+  <div class="card-header">
+    <h3>{{ t["rule.general_title"] }}</h3>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span style="font-size:12px;color:var(--text2);" id="general-count"></span>
+      <button class="btn btn-primary btn-sm" onclick="showAddCustomRule('general')">{{ t["rule.add_custom"] }}</button>
+    </div>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.general_hint"] }}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:24px;"></th>
+          <th>{{ t["rule.rule_text"] }}</th>
+          <th>{{ t["rule.comment"] }}</th>
+          <th>{{ t["sub.status"] }}</th>
+          <th>{{ t["node.col_action"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="general-rule-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 默认 Host 映射 -->
+<div class="card" style="margin-top:16px;">
+  <div class="card-header">
+    <h3>{{ t["rule.host_title"] }}</h3>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span style="font-size:12px;color:var(--text2);" id="host-count"></span>
+      <button class="btn btn-primary btn-sm" onclick="showAddHost()">{{ t["profile.add_host"] }}</button>
+    </div>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.host_hint"] }}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ t["profile.host_domain"] }}</th>
+          <th>{{ t["profile.host_target"] }}</th>
+          <th>{{ t["sub.status"] }}</th>
+          <th>{{ t["node.col_action"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="host-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Host 映射编辑弹窗 -->
+<div class="modal-overlay" id="host-modal">
+  <div class="modal">
+    <h3 id="host-modal-title">{{ t["profile.add_host"] }}</h3>
+    <input type="hidden" id="host-edit-id">
+    <div class="form-group">
+      <label>{{ t["profile.host_domain"] }}</label>
+      <input type="text" id="host-domain" placeholder="*.example.com">
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.host_target"] }}</label>
+      <select id="host-target-preset">
+        <option value="">{{ t["profile.host_select_preset"] }}</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.host_target_custom"] }}</label>
+      <input type="text" id="host-target" placeholder="server:223.5.5.5 或 IP 地址">
+      <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.host_target_hint"] }}</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('host-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveHost()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 规则源编辑弹窗 -->
+<div class="modal-overlay" id="rule-modal">
+  <div class="modal">
+    <h3 id="rule-modal-title">{{ t["rule.add"] }}</h3>
+    <input type="hidden" id="rule-edit-id">
+    <div class="form-group">
+      <label>{{ t["rule.name"] }}</label>
+      <input type="text" id="rule-name" placeholder="例：MyService">
+    </div>
+    <div class="form-group">
+      <label>{{ t["sub.url"] }}</label>
+      <input type="url" id="rule-url" placeholder="https://...">
+    </div>
+    <div style="display:flex;gap:12px;">
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["rule.type"] }}</label>
+        <select id="rule-type">
+          <option value="RULE-SET">RULE-SET</option>
+          <option value="DOMAIN-SET">DOMAIN-SET</option>
+          <option value="DOMAIN">DOMAIN</option>
+          <option value="DOMAIN-SUFFIX">DOMAIN-SUFFIX</option>
+          <option value="DOMAIN-KEYWORD">DOMAIN-KEYWORD</option>
+          <option value="IP-CIDR">IP-CIDR</option>
+          <option value="URL-REGEX">URL-REGEX</option>
+          <option value="AND">AND</option>
+          <option value="OR">OR</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["rule.category"] }}</label>
+        <select id="rule-category">
+          <option value="">--</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["rule.action"] }}</label>
+      <select id="rule-action"></select>
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.order"] }}</label>
+      <input type="number" id="rule-order" value="50">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('rule-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveRule()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 自定义规则编辑弹窗 -->
+<div class="modal-overlay" id="custom-rule-modal">
+  <div class="modal">
+    <h3 id="custom-rule-modal-title">{{ t["rule.add_custom"] }}</h3>
+    <input type="hidden" id="custom-rule-edit-id">
+    <input type="hidden" id="custom-rule-position">
+    <div class="form-group">
+      <label class="checkbox">
+        <input type="checkbox" id="custom-rule-raw-mode" onchange="toggleCustomRuleMode()"> {{ t["rule.raw_mode"] }}
+      </label>
+    </div>
+    <!-- 结构化模式 -->
+    <div id="custom-rule-structured">
+      <div class="form-group">
+        <label>{{ t["rule.type"] }}</label>
+        <select id="custom-rule-type">
+          <option value="DOMAIN">DOMAIN</option>
+          <option value="DOMAIN-SUFFIX">DOMAIN-SUFFIX</option>
+          <option value="DOMAIN-KEYWORD">DOMAIN-KEYWORD</option>
+          <option value="IP-CIDR">IP-CIDR</option>
+          <option value="IP-CIDR6">IP-CIDR6</option>
+          <option value="URL-REGEX">URL-REGEX</option>
+          <option value="PROCESS-NAME">PROCESS-NAME</option>
+          <option value="PROTOCOL">PROTOCOL</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label id="custom-rule-value-label">{{ t["rule.value_domain"] }}</label>
+        <input type="text" id="custom-rule-value" placeholder="example.com">
+      </div>
+      <div class="form-group">
+        <label>{{ t["rule.action"] }}</label>
+        <select id="custom-rule-action"></select>
+      </div>
+    </div>
+    <!-- 原始文本模式 -->
+    <div id="custom-rule-raw" style="display:none;">
+      <div class="form-group">
+        <label>{{ t["rule.rule_text"] }}</label>
+        <input type="text" id="custom-rule-text" placeholder="DOMAIN-SUFFIX,example.com,DIRECT">
+        <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["rule.rule_text_hint"] }}</p>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["rule.comment"] }}</label>
+      <input type="text" id="custom-rule-comment" placeholder="{{ t["rule.comment_placeholder"] }}">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('custom-rule-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveCustomRule()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let allRules = [];
+let allRegions = [];
+let allServices = [];
+let allCustomRules = {pre: [], general: []};
+let dragRow = null;
+let dragType = null; // "rule" | "custom-pre" | "custom-general"
+
+const VIRT_LABELS = {
+  "全部节点": "{{ t["group.virt.all_nodes"] }}",
+  "自动选择": "{{ t["group.virt.auto"] }}",
+  "代理": "{{ t["group.virt.proxy"] }}",
+  "手动选择": "{{ t["group.virt.manual_select"] }}",
+  "大陆直连": "{{ t["group.virt.mainland"] }}",
+  "兜底": "{{ t["group.virt.fallback"] }}",
+};
+
+const CATEGORY_MAP = {
+  unbreak: "{{ t["rule.cat.unbreak"] }}",
+  adblock: "{{ t["rule.cat.adblock"] }}",
+  mainland_app: "{{ t["rule.cat.mainland_app"] }}",
+  apple: "{{ t["rule.cat.apple"] }}",
+  ai: "{{ t["rule.cat.ai"] }}",
+  google: "{{ t["rule.cat.google"] }}",
+  streaming: "{{ t["rule.cat.streaming"] }}",
+  region_stream: "{{ t["rule.cat.region_stream"] }}",
+  social: "{{ t["rule.cat.social"] }}",
+  intl_service: "{{ t["rule.cat.intl_service"] }}",
+  dev: "{{ t["rule.cat.dev"] }}",
+  mainland: "{{ t["rule.cat.mainland"] }}",
+  global: "{{ t["rule.cat.global"] }}",
+  lan: "{{ t["rule.cat.lan"] }}",
+};
+
+function translateName(name) {
+  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
+    if (name.endsWith("手动")) {
+      const region = name.slice(0, -2);
+      return (LOCALE_NAMES[region] || region) + " Manual";
+    }
+    return LOCALE_NAMES[name] || name;
+  }
+  return name;
+}
+
+function displayAction(name) {
+  return VIRT_LABELS[name] || translateName(name);
+}
+
+function buildActionOptions(selectedValue) {
+  const parts = [];
+
+  const sysActions = ["DIRECT", "REJECT", "REJECT-DROP", "REJECT-NO-DROP"];
+  parts.push('<optgroup label="{{ t["rule.action_system"] }}">');
+  for (const a of sysActions) {
+    parts.push(`<option value="${a}" ${a === selectedValue ? 'selected' : ''}>${a}</option>`);
+  }
+  parts.push('</optgroup>');
+
+  const virtGroups = ["全部节点", "自动选择", "代理", "手动选择", "大陆直连", "其他"];
+  parts.push('<optgroup label="{{ t["rule.action_virtual"] }}">');
+  for (const g of virtGroups) {
+    const label = VIRT_LABELS[g] || g;
+    parts.push(`<option value="${escapeHtml(g)}" ${g === selectedValue ? 'selected' : ''}>${escapeHtml(label)}</option>`);
+  }
+  parts.push('</optgroup>');
+
+  if (allServices.length > 0) {
+    parts.push('<optgroup label="{{ t["rule.action_service"] }}">');
+    for (const s of allServices) {
+      const label = translateName(s.name);
+      parts.push(`<option value="${escapeHtml(s.name)}" ${s.name === selectedValue ? 'selected' : ''}>${escapeHtml(label)}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+
+  if (allRegions.length > 0) {
+    parts.push('<optgroup label="{{ t["rule.action_region_auto"] }}">');
+    for (const r of allRegions) {
+      parts.push(`<option value="${escapeHtml(r.name)}" ${r.name === selectedValue ? 'selected' : ''}>${escapeHtml(translateName(r.name))}</option>`);
+    }
+    parts.push('</optgroup>');
+
+    parts.push('<optgroup label="{{ t["rule.action_region_manual"] }}">');
+    for (const r of allRegions) {
+      const manName = r.name + "手动";
+      const manLabel = translateName(r.name) + " Manual";
+      parts.push(`<option value="${escapeHtml(manName)}" ${manName === selectedValue ? 'selected' : ''}>${escapeHtml(manLabel)}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+
+  return parts.join("");
+}
+
+function buildCategoryOptions() {
+  let html = '<option value="">--</option>';
+  for (const [key, label] of Object.entries(CATEGORY_MAP)) {
+    html += `<option value="${key}">${label}</option>`;
+  }
+  return html;
+}
+
+async function loadGroups() {
+  try {
+    const [regions, services] = await Promise.all([
+      API.get("/api/groups/regions"),
+      API.get("/api/groups/services"),
+    ]);
+    allRegions = regions.filter(r => r.enabled);
+    allServices = services.filter(s => s.enabled);
+  } catch (e) { /* ignore */ }
+}
+
+async function loadData() {
+  try {
+    allRules = await API.get("/api/configs/rules");
+    document.getElementById("rule-count").textContent = "{{ t["rule.total"] }}".replace("{0}", allRules.length);
+    renderTable();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function loadCustomRules() {
+  try {
+    const rules = await API.get("/api/configs/custom-rules");
+    allCustomRules.pre = rules.filter(r => r.position === "pre");
+    allCustomRules.general = rules.filter(r => r.position === "general");
+    renderCustomRuleTable("pre");
+    renderCustomRuleTable("general");
+    document.getElementById("pre-count").textContent = "{{ t["rule.total"] }}".replace("{0}", allCustomRules.pre.length);
+    document.getElementById("general-count").textContent = "{{ t["rule.total"] }}".replace("{0}", allCustomRules.general.length);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderTable() {
+  const tbody = document.getElementById("rule-list");
+  tbody.innerHTML = allRules.map((r, idx) => `
+    <tr draggable="true" data-idx="${idx}" data-id="${r.id}"
+        ondragstart="onDragStart(event,'rule')" ondragover="onDragOver(event)" ondrop="onDrop(event,'rule')"
+        style="cursor:grab;">
+      <td style="cursor:grab;color:var(--text2);font-size:14px;">⠿</td>
+      <td><strong>${escapeHtml(r.name)}</strong></td>
+      <td><span class="badge badge-primary">${r.rule_type}</span></td>
+      <td><span class="badge badge-success">${escapeHtml(displayAction(r.action))}</span></td>
+      <td>${categoryLabel(r.category)}</td>
+      <td style="font-size:12px;color:var(--text2);">${r.sort_order}</td>
+      <td><span class="badge ${r.enabled ? 'badge-success' : 'badge-danger'}">${r.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
+      <td>
+        <button class="btn btn-sm btn-outline" onclick='editRule(${JSON.stringify(r)})'>{{ t["btn.edit"] }}</button>
+        <button class="btn btn-sm ${r.enabled ? 'btn-outline' : 'btn-success'}" onclick="toggleRule(${r.id}, ${!r.enabled})">${r.enabled ? '{{ t["btn.disable"] }}' : '{{ t["btn.enable"] }}'}</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteRule(${r.id})">{{ t["btn.delete"] }}</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+function renderCustomRuleTable(position) {
+  const rules = allCustomRules[position];
+  const tbody = document.getElementById(position + "-rule-list");
+  tbody.innerHTML = rules.map((r, idx) => `
+    <tr draggable="true" data-idx="${idx}" data-id="${r.id}"
+        ondragstart="onDragStart(event,'custom-${position}')" ondragover="onDragOver(event)" ondrop="onDrop(event,'custom-${position}')"
+        style="cursor:grab;">
+      <td style="cursor:grab;color:var(--text2);font-size:14px;">⠿</td>
+      <td><code style="font-size:12px;">${escapeHtml(r.rule_text)}</code></td>
+      <td style="font-size:12px;color:var(--text2);">${escapeHtml(r.comment || '-')}</td>
+      <td><span class="badge ${r.enabled ? 'badge-success' : 'badge-danger'}">${r.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
+      <td>
+        <button class="btn btn-sm btn-outline" onclick='editCustomRule(${JSON.stringify(r)})'>{{ t["btn.edit"] }}</button>
+        <button class="btn btn-sm ${r.enabled ? 'btn-outline' : 'btn-success'}" onclick="toggleCustomRule(${r.id}, ${!r.enabled})">${r.enabled ? '{{ t["btn.disable"] }}' : '{{ t["btn.enable"] }}'}</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteCustomRule(${r.id})">{{ t["btn.delete"] }}</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+function categoryLabel(cat) {
+  return CATEGORY_MAP[cat] || cat || "-";
+}
+
+function onDragStart(e, type) {
+  dragRow = e.target.closest("tr");
+  dragType = type;
+  e.dataTransfer.effectAllowed = "move";
+  e.target.closest("tr").style.opacity = "0.4";
+}
+
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+}
+
+function onDrop(e, type) {
+  e.preventDefault();
+  const targetRow = e.target.closest("tr");
+  if (!dragRow || !targetRow || dragRow === targetRow || dragType !== type) {
+    if (dragRow) dragRow.style.opacity = "";
+    return;
+  }
+
+  const fromIdx = parseInt(dragRow.dataset.idx);
+  const toIdx = parseInt(targetRow.dataset.idx);
+  dragRow.style.opacity = "";
+
+  if (type === "rule") {
+    const [moved] = allRules.splice(fromIdx, 1);
+    allRules.splice(toIdx, 0, moved);
+    const updates = allRules.map((r, i) => ({ id: r.id, sort_order: i }));
+    saveReorder(updates);
+    renderTable();
+  } else {
+    const position = type === "custom-pre" ? "pre" : "general";
+    const rules = allCustomRules[position];
+    const [moved] = rules.splice(fromIdx, 1);
+    rules.splice(toIdx, 0, moved);
+    const updates = rules.map((r, i) => ({ id: r.id, sort_order: i }));
+    saveCustomReorder(updates);
+    renderCustomRuleTable(position);
+  }
+}
+
+async function saveReorder(updates) {
+  try {
+    await API.put("/api/configs/rules/reorder", updates);
+    toast("{{ t["rule.order_saved"] }}");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function saveCustomReorder(updates) {
+  try {
+    await API.put("/api/configs/custom-rules/reorder", updates);
+    toast("{{ t["rule.order_saved"] }}");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function resetDefaultOrder() {
+  if (!confirm("{{ t["rule.confirm_reset"] }}")) return;
+  try {
+    const rules = await API.get("/api/configs/rules");
+    const updates = rules.map((r, i) => ({ id: r.id, sort_order: r.sort_order }));
+    await API.put("/api/configs/rules/reorder", updates);
+    toast("{{ t["rule.reset_done"] }}");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== 规则源 CRUD =====
+
+function showAddRule() {
+  document.getElementById("rule-modal-title").textContent = "{{ t["rule.add"] }}";
+  document.getElementById("rule-edit-id").value = "";
+  document.getElementById("rule-name").value = "";
+  document.getElementById("rule-url").value = "";
+  document.getElementById("rule-type").value = "RULE-SET";
+  document.getElementById("rule-action").innerHTML = buildActionOptions("");
+  document.getElementById("rule-category").value = "";
+  document.getElementById("rule-order").value = 50;
+  showModal("rule-modal");
+}
+
+function editRule(r) {
+  document.getElementById("rule-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("rule-edit-id").value = r.id;
+  document.getElementById("rule-name").value = r.name;
+  document.getElementById("rule-url").value = r.url;
+  document.getElementById("rule-type").value = r.rule_type;
+  document.getElementById("rule-action").innerHTML = buildActionOptions(r.action);
+  document.getElementById("rule-category").value = r.category || "";
+  document.getElementById("rule-order").value = r.sort_order;
+  showModal("rule-modal");
+}
+
+async function saveRule() {
+  const id = document.getElementById("rule-edit-id").value;
+  const data = {
+    name: document.getElementById("rule-name").value,
+    url: document.getElementById("rule-url").value,
+    rule_type: document.getElementById("rule-type").value,
+    action: document.getElementById("rule-action").value,
+    category: document.getElementById("rule-category").value || null,
+    sort_order: parseInt(document.getElementById("rule-order").value) || 0,
+  };
+  try {
+    if (id) {
+      await API.put(`/api/configs/rules/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/configs/rules", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("rule-modal");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleRule(id, enabled) {
+  try {
+    await API.put(`/api/configs/rules/${id}`, { enabled });
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteRule(id) {
+  if (!confirm("{{ t["rule.confirm_delete"] }}")) return;
+  try {
+    await API.del(`/api/configs/rules/${id}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== 自定义规则 CRUD =====
+
+const RULE_TYPE_LABELS = {
+  "DOMAIN": "{{ t["rule.value_domain"] }}",
+  "DOMAIN-SUFFIX": "{{ t["rule.value_domain"] }}",
+  "DOMAIN-KEYWORD": "{{ t["rule.value_keyword"] }}",
+  "IP-CIDR": "{{ t["rule.value_ip"] }}",
+  "IP-CIDR6": "{{ t["rule.value_ipv6"] }}",
+  "URL-REGEX": "{{ t["rule.value_regex"] }}",
+  "PROCESS-NAME": "{{ t["rule.value_process"] }}",
+  "PROTOCOL": "{{ t["rule.value_protocol"] }}",
+};
+
+const SIMPLE_RULE_TYPES = ["DOMAIN","DOMAIN-SUFFIX","DOMAIN-KEYWORD","IP-CIDR","IP-CIDR6","URL-REGEX","PROCESS-NAME","PROTOCOL"];
+
+function toggleCustomRuleMode() {
+  const raw = document.getElementById("custom-rule-raw-mode").checked;
+  document.getElementById("custom-rule-structured").style.display = raw ? "none" : "block";
+  document.getElementById("custom-rule-raw").style.display = raw ? "block" : "none";
+}
+
+function updateCustomRuleValueLabel() {
+  const type = document.getElementById("custom-rule-type").value;
+  const label = RULE_TYPE_LABELS[type] || "{{ t["rule.value_domain"] }}";
+  document.getElementById("custom-rule-value-label").textContent = label;
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  const sel = document.getElementById("custom-rule-type");
+  if (sel) sel.addEventListener("change", updateCustomRuleValueLabel);
+});
+
+function parseRuleText(text) {
+  const parts = text.split(",");
+  if (parts.length >= 3 && SIMPLE_RULE_TYPES.includes(parts[0])) {
+    return { type: parts[0], value: parts.slice(1, -1).join(","), action: parts[parts.length - 1] };
+  }
+  return null;
+}
+
+function showAddCustomRule(position) {
+  document.getElementById("custom-rule-modal-title").textContent =
+    position === "pre" ? "{{ t["rule.add_pre"] }}" : "{{ t["rule.add_general"] }}";
+  document.getElementById("custom-rule-edit-id").value = "";
+  document.getElementById("custom-rule-position").value = position;
+  document.getElementById("custom-rule-raw-mode").checked = false;
+  document.getElementById("custom-rule-structured").style.display = "block";
+  document.getElementById("custom-rule-raw").style.display = "none";
+  document.getElementById("custom-rule-type").value = "DOMAIN-SUFFIX";
+  document.getElementById("custom-rule-value").value = "";
+  document.getElementById("custom-rule-action").innerHTML = buildActionOptions("");
+  document.getElementById("custom-rule-text").value = "";
+  document.getElementById("custom-rule-comment").value = "";
+  updateCustomRuleValueLabel();
+  showModal("custom-rule-modal");
+}
+
+function editCustomRule(r) {
+  document.getElementById("custom-rule-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("custom-rule-edit-id").value = r.id;
+  document.getElementById("custom-rule-position").value = r.position;
+  document.getElementById("custom-rule-comment").value = r.comment || "";
+  document.getElementById("custom-rule-text").value = r.rule_text;
+
+  const parsed = parseRuleText(r.rule_text);
+  if (parsed) {
+    document.getElementById("custom-rule-raw-mode").checked = false;
+    document.getElementById("custom-rule-structured").style.display = "block";
+    document.getElementById("custom-rule-raw").style.display = "none";
+    document.getElementById("custom-rule-type").value = parsed.type;
+    document.getElementById("custom-rule-value").value = parsed.value;
+    document.getElementById("custom-rule-action").innerHTML = buildActionOptions(parsed.action);
+    updateCustomRuleValueLabel();
+  } else {
+    document.getElementById("custom-rule-raw-mode").checked = true;
+    document.getElementById("custom-rule-structured").style.display = "none";
+    document.getElementById("custom-rule-raw").style.display = "block";
+  }
+  showModal("custom-rule-modal");
+}
+
+async function saveCustomRule() {
+  const id = document.getElementById("custom-rule-edit-id").value;
+  const position = document.getElementById("custom-rule-position").value;
+  const raw = document.getElementById("custom-rule-raw-mode").checked;
+  let rule_text;
+  if (raw) {
+    rule_text = document.getElementById("custom-rule-text").value.trim();
+  } else {
+    const type = document.getElementById("custom-rule-type").value;
+    const value = document.getElementById("custom-rule-value").value.trim();
+    const action = document.getElementById("custom-rule-action").value;
+    if (!type || !value || !action) return;
+    rule_text = `${type},${value},${action}`;
+  }
+  if (!rule_text) return;
+  const data = {
+    rule_text: rule_text,
+    position: position,
+    comment: document.getElementById("custom-rule-comment").value.trim() || null,
+  };
+  try {
+    if (id) {
+      await API.put(`/api/configs/custom-rules/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      data.sort_order = allCustomRules[data.position].length;
+      await API.post("/api/configs/custom-rules", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("custom-rule-modal");
+    loadCustomRules();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleCustomRule(id, enabled) {
+  try {
+    await API.put(`/api/configs/custom-rules/${id}`, { enabled });
+    loadCustomRules();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteCustomRule(id) {
+  if (!confirm("{{ t["rule.confirm_delete"] }}")) return;
+  try {
+    await API.del(`/api/configs/custom-rules/${id}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadCustomRules();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== 默认 Host 映射 =====
+
+let defaultDnsPresets = [];
+
+async function loadDnsPresets() {
+  try {
+    defaultDnsPresets = await API.get("/api/configs/host-presets");
+  } catch (e) { /* ignore */ }
+}
+
+async function loadHostMappings() {
+  try {
+    const mappings = await API.get("/api/configs/host-mappings");
+    document.getElementById("host-count").textContent = "{{ t["rule.total"] }}".replace("{0}", mappings.length);
+    const tbody = document.getElementById("host-list");
+    tbody.innerHTML = mappings.map(m => `
+      <tr>
+        <td><code style="font-size:12px;">${escapeHtml(m.domain)}</code></td>
+        <td><span class="badge badge-primary">${escapeHtml(m.target)}</span></td>
+        <td><span class="badge ${m.enabled ? 'badge-success' : 'badge-danger'}">${m.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
+        <td>
+          <button class="btn btn-sm btn-outline" onclick='editHost(${JSON.stringify(m)})'>{{ t["btn.edit"] }}</button>
+          <button class="btn btn-sm ${m.enabled ? 'btn-outline' : 'btn-success'}" onclick="toggleHost(${m.id}, ${!m.enabled})">${m.enabled ? '{{ t["btn.disable"] }}' : '{{ t["btn.enable"] }}'}</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteHost(${m.id})">{{ t["btn.delete"] }}</button>
+        </td>
+      </tr>
+    `).join("");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function showAddHost() {
+  document.getElementById("host-modal-title").textContent = "{{ t["profile.add_host"] }}";
+  document.getElementById("host-edit-id").value = "";
+  document.getElementById("host-domain").value = "";
+  document.getElementById("host-target").value = "";
+  const sel = document.getElementById("host-target-preset");
+  sel.innerHTML = '<option value="">{{ t["profile.host_select_preset"] }}</option>' +
+    defaultDnsPresets.map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
+  sel.value = "";
+  showModal("host-modal");
+}
+
+function editHost(m) {
+  document.getElementById("host-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("host-edit-id").value = m.id;
+  document.getElementById("host-domain").value = m.domain;
+  document.getElementById("host-target").value = m.target;
+  const sel = document.getElementById("host-target-preset");
+  sel.innerHTML = '<option value="">{{ t["profile.host_select_preset"] }}</option>' +
+    defaultDnsPresets.map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
+  sel.value = defaultDnsPresets.find(p => p.value === m.target) ? m.target : "";
+  showModal("host-modal");
+}
+
+async function saveHost() {
+  const id = document.getElementById("host-edit-id").value;
+  const domain = document.getElementById("host-domain").value.trim();
+  const presetTarget = document.getElementById("host-target-preset").value;
+  const customTarget = document.getElementById("host-target").value.trim();
+  const target = presetTarget || customTarget;
+  if (!domain || !target) return;
+  try {
+    if (id) {
+      await API.put(`/api/configs/host-mappings/${id}`, { domain, target });
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/configs/host-mappings", { domain, target, sort_order: 0 });
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("host-modal");
+    loadHostMappings();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleHost(id, enabled) {
+  try {
+    await API.put(`/api/configs/host-mappings/${id}`, { enabled });
+    loadHostMappings();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteHost(id) {
+  if (!confirm("{{ t["rule.confirm_delete"] }}")) return;
+  try {
+    await API.del(`/api/configs/host-mappings/${id}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadHostMappings();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+document.getElementById("host-target-preset").addEventListener("change", function() {
+  if (this.value) document.getElementById("host-target").value = this.value;
+});
+
+async function init() {
+  document.getElementById("rule-category").innerHTML = buildCategoryOptions();
+  await loadGroups();
+  await loadDnsPresets();
+  loadData();
+  loadCustomRules();
+  loadHostMappings();
+}
+init();
+</script>
+{% endblock %}

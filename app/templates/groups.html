@@ -1,0 +1,431 @@
+{% extends "base.html" %}
+{% block title %}{{ t["nav.groups"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["nav.groups"] }}</h1>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h3>{{ t["group.region_title"] }}</h3>
+    <button class="btn btn-primary btn-sm" onclick="showAddRegion()">{{ t["group.add_region"] }}</button>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["group.region_hint"] }}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ t["group.order"] }}</th>
+          <th>{{ t["group.name"] }}</th>
+          <th>{{ t["group.regex"] }}</th>
+          <th>{{ t["group.auto_label"] }}</th>
+          <th>{{ t["group.manual_label"] }}</th>
+          <th>{{ t["group.status"] }}</th>
+          <th>{{ t["btn.edit"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="region-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h3>{{ t["group.service_title"] }}</h3>
+    <button class="btn btn-primary btn-sm" onclick="showAddService()">{{ t["group.add_service"] }}</button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ t["group.order"] }}</th>
+          <th>{{ t["group.name"] }}</th>
+          <th>{{ t["group.type"] }}</th>
+          <th>{{ t["group.policies"] }}</th>
+          <th>{{ t["btn.edit"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="service-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal-overlay" id="region-modal">
+  <div class="modal">
+    <h3 id="region-modal-title">{{ t["group.add_region"] }}</h3>
+    <input type="hidden" id="region-edit-id">
+    <div class="form-group">
+      <label>{{ t["group.name"] }}</label>
+      <input type="text" id="region-name" placeholder="例：France">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.regex"] }}</label>
+      <input type="text" id="region-regex" placeholder="法|法国|France|FR">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.icon"] }}</label>
+      <input type="url" id="region-icon" placeholder="https://...">
+    </div>
+    <div style="display:flex;gap:12px;">
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["group.auto_enabled"] }}</label>
+        <select id="region-auto-enabled">
+          <option value="true">{{ t["btn.enable"] }}</option>
+          <option value="false">{{ t["btn.disable"] }}</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["group.manual_enabled"] }}</label>
+        <select id="region-manual-enabled">
+          <option value="true">{{ t["btn.enable"] }}</option>
+          <option value="false">{{ t["btn.disable"] }}</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.order"] }}</label>
+      <input type="number" id="region-order" value="10">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('region-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveRegion()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="service-modal">
+  <div class="modal" style="max-width:600px;">
+    <h3 id="service-modal-title">{{ t["group.add_service"] }}</h3>
+    <input type="hidden" id="service-edit-id">
+    <div class="form-group">
+      <label>{{ t["group.name"] }}</label>
+      <input type="text" id="service-name" placeholder="例：Spotify">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.type"] }}</label>
+      <select id="service-type">
+        <option value="select">{{ t["group.select_type"] }}</option>
+        <option value="url-test">{{ t["group.urltest_type"] }}</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label>{{ t["group.policies"] }}</label>
+      <div id="policy-tags" class="policy-tags"></div>
+    </div>
+
+    <div class="form-group">
+      <label style="margin-bottom:8px;">{{ t["group.click_add"] }}</label>
+      <div id="available-groups" class="available-groups"></div>
+    </div>
+
+    <div class="form-group">
+      <label>{{ t["group.icon"] }}</label>
+      <input type="url" id="service-icon" placeholder="https://...">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.order"] }}</label>
+      <input type="number" id="service-order" value="10">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('service-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveService()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let allRegions = [];
+let currentPolicies = [];
+const MANUAL_SUFFIX = "{{ t["group.manual_suffix_short"] }}";
+const VIRT_LABELS = {
+  "全部节点": "{{ t["group.virt.all_nodes"] }}",
+  "自动选择": "{{ t["group.virt.auto"] }}",
+  "代理": "{{ t["group.virt.proxy"] }}",
+  "手动选择": "{{ t["group.virt.manual_select"] }}",
+  "大陆直连": "{{ t["group.virt.mainland"] }}",
+};
+
+function translateName(name) {
+  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
+    if (name.endsWith("手动")) {
+      const region = name.slice(0, -2);
+      const enRegion = LOCALE_NAMES[region] || region;
+      return enRegion + " Manual";
+    }
+    return LOCALE_NAMES[name] || name;
+  }
+  return name;
+}
+
+function getAvailableGroups() {
+  const virtual = [
+    { name: "DIRECT", label: "DIRECT", type: "system" },
+    { name: "REJECT", label: "REJECT", type: "system" },
+    { name: "全部节点", label: VIRT_LABELS["全部节点"], type: "virtual" },
+    { name: "自动选择", label: VIRT_LABELS["自动选择"], type: "virtual" },
+    { name: "代理", label: VIRT_LABELS["代理"], type: "virtual" },
+    { name: "手动选择", label: VIRT_LABELS["手动选择"], type: "virtual" },
+    { name: "大陆直连", label: VIRT_LABELS["大陆直连"], type: "virtual" },
+  ];
+  const autoRegions = allRegions.map(r => ({ name: r.name, label: "{{ t["group.auto_suffix"] }}".replace("{0}", r.name), type: "auto" }));
+  const manualRegions = allRegions.map(r => ({ name: `${r.name}手动`, label: "{{ t["group.manual_suffix"] }}".replace("{0}", r.name), type: "manual" }));
+  return { virtual, autoRegions, manualRegions };
+}
+
+let policyDragIdx = null;
+
+function renderPolicyTags() {
+  const container = document.getElementById("policy-tags");
+  if (currentPolicies.length === 0) {
+    container.innerHTML = '<span style="color:var(--text2);font-size:12px;">{{ t["group.no_policy"] }}</span>';
+    return;
+  }
+  container.innerHTML = currentPolicies.map((p, i) => {
+    const isManual = p.endsWith("手动");
+    const badgeClass = isManual ? 'badge-warning' : p === "DIRECT" ? 'badge-success' : 'badge-primary';
+    const displayName = VIRT_LABELS[p] || translateName(p);
+    return `<span class="badge ${badgeClass}" draggable="true"
+      data-idx="${i}"
+      ondragstart="onPolicyDragStart(event,${i})"
+      ondragover="onPolicyDragOver(event)"
+      ondrop="onPolicyDrop(event,${i})"
+      ondragend="onPolicyDragEnd(event)"
+      style="cursor:grab;margin:2px;padding:4px 10px;font-size:12px;">
+      ${escapeHtml(displayName)}
+      <span style="margin-left:4px;opacity:0.6;cursor:pointer;" onclick="event.stopPropagation();removePolicy(${i})">✕</span>
+    </span>`;
+  }).join("");
+}
+
+function onPolicyDragStart(e, idx) {
+  policyDragIdx = idx;
+  e.dataTransfer.effectAllowed = "move";
+  e.target.style.opacity = "0.4";
+}
+function onPolicyDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }
+function onPolicyDrop(e, toIdx) {
+  e.preventDefault();
+  if (policyDragIdx === null || policyDragIdx === toIdx) return;
+  const [moved] = currentPolicies.splice(policyDragIdx, 1);
+  currentPolicies.splice(toIdx, 0, moved);
+  policyDragIdx = null;
+  renderPolicyTags();
+}
+function onPolicyDragEnd(e) {
+  e.target.style.opacity = "";
+  policyDragIdx = null;
+}
+
+function renderAvailableGroups() {
+  const { virtual, autoRegions, manualRegions } = getAvailableGroups();
+  const container = document.getElementById("available-groups");
+
+  const renderSection = (title, groups) => {
+    let html = `<div style="margin-bottom:8px;"><span style="font-size:11px;color:var(--text2);display:block;margin-bottom:4px;">${title}</span>`;
+    for (const g of groups) {
+      const added = currentPolicies.includes(g.name);
+      const typeBadge = g.type === "manual" ? 'badge-warning' : g.type === "auto" ? 'badge-primary' : 'badge-success';
+      html += `<span class="badge ${typeBadge}" style="cursor:${added ? 'default' : 'pointer'};margin:2px;padding:3px 8px;font-size:11px;${added ? 'opacity:0.4;' : ''}"
+        onclick="${added ? '' : `addPolicy('${escapeHtml(g.name)}')`}">${escapeHtml(g.label)}</span>`;
+    }
+    html += '</div>';
+    return html;
+  };
+
+  container.innerHTML =
+    renderSection("{{ t["group.section_basic"] }}", virtual) +
+    renderSection("{{ t["group.section_auto"] }}", autoRegions) +
+    renderSection("{{ t["group.section_manual"] }}", manualRegions);
+}
+
+function addPolicy(name) {
+  if (!currentPolicies.includes(name)) {
+    currentPolicies.push(name);
+    renderPolicyTags();
+    renderAvailableGroups();
+  }
+}
+
+function removePolicy(index) {
+  currentPolicies.splice(index, 1);
+  renderPolicyTags();
+  renderAvailableGroups();
+}
+
+async function loadData() {
+  const [regions, services] = await Promise.all([
+    API.get("/api/groups/regions"),
+    API.get("/api/groups/services"),
+  ]);
+  allRegions = regions;
+
+  document.getElementById("region-list").innerHTML = regions.map(r => {
+    const autoBadge = r.auto_enabled
+      ? '<span class="badge badge-success" style="cursor:pointer;" onclick="toggleRegionMode(' + r.id + ', \'auto_enabled\', false)">{{ t["btn.enable"] }}</span>'
+      : '<span class="badge badge-danger" style="cursor:pointer;" onclick="toggleRegionMode(' + r.id + ', \'auto_enabled\', true)">{{ t["btn.disable"] }}</span>';
+    const manualBadge = r.manual_enabled
+      ? '<span class="badge badge-success" style="cursor:pointer;" onclick="toggleRegionMode(' + r.id + ', \'manual_enabled\', false)">{{ t["btn.enable"] }}</span>'
+      : '<span class="badge badge-danger" style="cursor:pointer;" onclick="toggleRegionMode(' + r.id + ', \'manual_enabled\', true)">{{ t["btn.enable"] }}</span>';
+    const isActive = r.auto_enabled || r.manual_enabled;
+    const statusBadge = isActive
+      ? '<span class="badge badge-success">{{ t["btn.enable"] }}</span>'
+      : '<span class="badge badge-danger">{{ t["btn.disable"] }}</span>';
+    return `
+    <tr>
+      <td>${r.sort_order}</td>
+      <td><strong>${escapeHtml(translateName(r.name))}</strong></td>
+      <td><code style="font-size:11px;color:var(--warning);">${escapeHtml(r.filter_regex || '-')}</code></td>
+      <td>${autoBadge}</td>
+      <td>${manualBadge}</td>
+      <td>${statusBadge}</td>
+      <td>
+        <button class="btn btn-sm btn-outline" onclick='editRegion(${JSON.stringify(r)})'>{{ t["btn.edit"] }}</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteRegion(${r.id}, '${escapeHtml(r.name)}')">{{ t["btn.delete"] }}</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  document.getElementById("service-list").innerHTML = services.map(s => `
+    <tr>
+      <td>${s.sort_order}</td>
+      <td><strong>${escapeHtml(translateName(s.name))}</strong></td>
+      <td><span class="badge badge-primary">${s.group_type}</span></td>
+      <td>${(s.policies || []).map(p => {
+        const isManual = p.endsWith("手动");
+        const displayName = VIRT_LABELS[p] || translateName(p);
+        return `<span class="badge ${isManual ? 'badge-warning' : 'badge-success'}" style="margin:2px;">${escapeHtml(displayName)}</span>`;
+      }).join(" ")}</td>
+      <td>
+        <button class="btn btn-sm btn-outline" onclick='editService(${JSON.stringify(s)})'>{{ t["btn.edit"] }}</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteService(${s.id}, '${escapeHtml(s.name)}')">{{ t["btn.delete"] }}</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+function showAddRegion() {
+  document.getElementById("region-modal-title").textContent = "{{ t["group.add_region"] }}";
+  document.getElementById("region-edit-id").value = "";
+  document.getElementById("region-name").value = "";
+  document.getElementById("region-regex").value = "";
+  document.getElementById("region-icon").value = "";
+  document.getElementById("region-auto-enabled").value = "true";
+  document.getElementById("region-manual-enabled").value = "true";
+  document.getElementById("region-order").value = 10;
+  showModal("region-modal");
+}
+
+function editRegion(r) {
+  document.getElementById("region-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("region-edit-id").value = r.id;
+  document.getElementById("region-name").value = r.name;
+  document.getElementById("region-regex").value = r.filter_regex || "";
+  document.getElementById("region-icon").value = r.icon_url || "";
+  document.getElementById("region-auto-enabled").value = String(r.auto_enabled);
+  document.getElementById("region-manual-enabled").value = String(r.manual_enabled);
+  document.getElementById("region-order").value = r.sort_order;
+  showModal("region-modal");
+}
+
+async function saveRegion() {
+  const id = document.getElementById("region-edit-id").value;
+  const data = {
+    name: document.getElementById("region-name").value,
+    filter_regex: document.getElementById("region-regex").value || null,
+    icon_url: document.getElementById("region-icon").value || null,
+    auto_enabled: document.getElementById("region-auto-enabled").value === "true",
+    manual_enabled: document.getElementById("region-manual-enabled").value === "true",
+    sort_order: parseInt(document.getElementById("region-order").value) || 0,
+  };
+  try {
+    if (id) {
+      await API.put(`/api/groups/regions/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/groups/regions", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("region-modal");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleRegionMode(id, field, value) {
+  try {
+    await API.put(`/api/groups/regions/${id}`, { [field]: value });
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteRegion(id, name) {
+  if (!confirm("{{ t["group.confirm_delete_region"] }}".replace("{0}", name))) return;
+  try {
+    await API.del(`/api/groups/regions/${id}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function showAddService() {
+  document.getElementById("service-modal-title").textContent = "{{ t["group.add_service"] }}";
+  document.getElementById("service-edit-id").value = "";
+  document.getElementById("service-name").value = "";
+  document.getElementById("service-type").value = "select";
+  document.getElementById("service-icon").value = "";
+  document.getElementById("service-order").value = 10;
+  currentPolicies = [];
+  renderPolicyTags();
+  renderAvailableGroups();
+  showModal("service-modal");
+}
+
+function editService(s) {
+  document.getElementById("service-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("service-edit-id").value = s.id;
+  document.getElementById("service-name").value = s.name;
+  document.getElementById("service-type").value = s.group_type;
+  document.getElementById("service-icon").value = s.icon_url || "";
+  document.getElementById("service-order").value = s.sort_order;
+  currentPolicies = [...(s.policies || [])];
+  renderPolicyTags();
+  renderAvailableGroups();
+  showModal("service-modal");
+}
+
+async function saveService() {
+  const id = document.getElementById("service-edit-id").value;
+  const data = {
+    name: document.getElementById("service-name").value,
+    group_type: document.getElementById("service-type").value,
+    policies: currentPolicies,
+    icon_url: document.getElementById("service-icon").value || null,
+    sort_order: parseInt(document.getElementById("service-order").value) || 0,
+  };
+  try {
+    if (id) {
+      await API.put(`/api/groups/services/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/groups/services", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("service-modal");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteService(id, name) {
+  if (!confirm("{{ t["group.confirm_delete_service"] }}".replace("{0}", name))) return;
+  try {
+    await API.del(`/api/groups/services/${id}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+loadData();
+</script>
+{% endblock %}

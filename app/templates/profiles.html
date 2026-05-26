@@ -1,0 +1,663 @@
+{% extends "base.html" %}
+{% block title %}{{ t["profile.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["profile.title"] }}</h1>
+  <button class="btn btn-primary" onclick="showAddProfile()">{{ t["profile.new"] }}</button>
+</div>
+
+<div class="card" style="margin-bottom:16px;">
+  <p style="font-size:13px;color:var(--text2);">{{ t["profile.hint"] }}</p>
+</div>
+
+<div id="profile-list"></div>
+
+<div class="modal-overlay" id="profile-modal">
+  <div class="modal" style="max-width:640px;">
+    <h3 id="profile-modal-title">{{ t["profile.new"] }}</h3>
+    <input type="hidden" id="profile-edit-id">
+    <div class="form-group">
+      <label>{{ t["profile.name"] }}</label>
+      <input type="text" id="profile-name" placeholder="例：流媒体优化">
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.desc"] }}</label>
+      <input type="text" id="profile-desc" placeholder="{{ t["profile.desc"] }}">
+    </div>
+    <div style="display:flex;gap:16px;">
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["profile.locale_label"] }}</label>
+        <select id="profile-locale">
+          <option value="zh">{{ t["profile.locale_zh"] }}</option>
+          <option value="en">{{ t["profile.locale_en"] }}</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="checkbox" style="margin-top:28px;">
+          <input type="checkbox" id="profile-default"> {{ t["profile.set_default"] }}
+        </label>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('profile-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveProfile()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 自定义规则编辑弹窗 -->
+<div class="modal-overlay" id="profile-rule-modal">
+  <div class="modal">
+    <h3 id="profile-rule-modal-title">{{ t["rule.add_custom"] }}</h3>
+    <input type="hidden" id="profile-rule-edit-id">
+    <input type="hidden" id="profile-rule-profile-id">
+    <input type="hidden" id="profile-rule-position">
+    <div class="form-group">
+      <label class="checkbox">
+        <input type="checkbox" id="profile-rule-raw-mode" onchange="toggleProfileRuleMode()"> {{ t["rule.raw_mode"] }}
+      </label>
+    </div>
+    <!-- 结构化模式 -->
+    <div id="profile-rule-structured">
+      <div class="form-group">
+        <label>{{ t["rule.type"] }}</label>
+        <select id="profile-rule-type">
+          <option value="DOMAIN">DOMAIN</option>
+          <option value="DOMAIN-SUFFIX">DOMAIN-SUFFIX</option>
+          <option value="DOMAIN-KEYWORD">DOMAIN-KEYWORD</option>
+          <option value="IP-CIDR">IP-CIDR</option>
+          <option value="IP-CIDR6">IP-CIDR6</option>
+          <option value="URL-REGEX">URL-REGEX</option>
+          <option value="PROCESS-NAME">PROCESS-NAME</option>
+          <option value="PROTOCOL">PROTOCOL</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label id="profile-rule-value-label">{{ t["rule.value_domain"] }}</label>
+        <input type="text" id="profile-rule-value" placeholder="example.com">
+      </div>
+      <div class="form-group">
+        <label>{{ t["rule.action"] }}</label>
+        <select id="profile-rule-action"></select>
+      </div>
+    </div>
+    <!-- 原始文本模式 -->
+    <div id="profile-rule-raw" style="display:none;">
+      <div class="form-group">
+        <label>{{ t["rule.rule_text"] }}</label>
+        <input type="text" id="profile-rule-text" placeholder="DOMAIN-SUFFIX,example.com,DIRECT">
+        <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["rule.rule_text_hint"] }}</p>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["rule.comment"] }}</label>
+      <input type="text" id="profile-rule-comment" placeholder="{{ t["rule.comment_placeholder"] }}">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('profile-rule-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveProfileRule()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- Host 映射编辑弹窗 -->
+<div class="modal-overlay" id="host-modal">
+  <div class="modal">
+    <h3 id="host-modal-title">{{ t["profile.add_host"] }}</h3>
+    <input type="hidden" id="host-edit-id">
+    <input type="hidden" id="host-profile-id">
+    <div class="form-group">
+      <label>{{ t["profile.host_domain"] }}</label>
+      <input type="text" id="host-domain" placeholder="*.example.com">
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.host_target"] }}</label>
+      <select id="host-target-preset">
+        <option value="">{{ t["profile.host_select_preset"] }}</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.host_target_custom"] }}</label>
+      <input type="text" id="host-target" placeholder="server:223.5.5.5 或 IP 地址">
+      <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.host_target_hint"] }}</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('host-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveHost()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let dnsPresets = [];
+let profileRegions = [];
+let profileServices = [];
+
+const PROFILE_VIRT_LABELS = {
+  "全部节点": "{{ t["group.virt.all_nodes"] }}",
+  "自动选择": "{{ t["group.virt.auto"] }}",
+  "代理": "{{ t["group.virt.proxy"] }}",
+  "手动选择": "{{ t["group.virt.manual_select"] }}",
+  "大陆直连": "{{ t["group.virt.mainland"] }}",
+  "兜底": "{{ t["group.virt.fallback"] }}",
+};
+
+const SIMPLE_RULE_TYPES = ["DOMAIN","DOMAIN-SUFFIX","DOMAIN-KEYWORD","IP-CIDR","IP-CIDR6","URL-REGEX","PROCESS-NAME","PROTOCOL"];
+
+const RULE_TYPE_LABELS = {
+  "DOMAIN": "{{ t["rule.value_domain"] }}",
+  "DOMAIN-SUFFIX": "{{ t["rule.value_domain"] }}",
+  "DOMAIN-KEYWORD": "{{ t["rule.value_keyword"] }}",
+  "IP-CIDR": "{{ t["rule.value_ip"] }}",
+  "IP-CIDR6": "{{ t["rule.value_ipv6"] }}",
+  "URL-REGEX": "{{ t["rule.value_regex"] }}",
+  "PROCESS-NAME": "{{ t["rule.value_process"] }}",
+  "PROTOCOL": "{{ t["rule.value_protocol"] }}",
+};
+
+function profileTranslateName(name) {
+  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
+    if (name.endsWith("手动")) {
+      const region = name.slice(0, -2);
+      return (LOCALE_NAMES[region] || region) + " Manual";
+    }
+    return LOCALE_NAMES[name] || name;
+  }
+  return name;
+}
+
+function buildProfileActionOptions(selectedValue) {
+  const parts = [];
+  const sysActions = ["DIRECT", "REJECT", "REJECT-DROP", "REJECT-NO-DROP"];
+  parts.push('<optgroup label="{{ t["rule.action_system"] }}">');
+  for (const a of sysActions) {
+    parts.push(`<option value="${a}" ${a === selectedValue ? 'selected' : ''}>${a}</option>`);
+  }
+  parts.push('</optgroup>');
+  const virtGroups = ["全部节点", "自动选择", "代理", "手动选择", "大陆直连", "其他"];
+  parts.push('<optgroup label="{{ t["rule.action_virtual"] }}">');
+  for (const g of virtGroups) {
+    const label = PROFILE_VIRT_LABELS[g] || g;
+    parts.push(`<option value="${escapeHtml(g)}" ${g === selectedValue ? 'selected' : ''}>${escapeHtml(label)}</option>`);
+  }
+  parts.push('</optgroup>');
+  if (profileServices.length > 0) {
+    parts.push('<optgroup label="{{ t["rule.action_service"] }}">');
+    for (const s of profileServices) {
+      parts.push(`<option value="${escapeHtml(s.name)}" ${s.name === selectedValue ? 'selected' : ''}>${escapeHtml(profileTranslateName(s.name))}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+  if (profileRegions.length > 0) {
+    parts.push('<optgroup label="{{ t["rule.action_region_auto"] }}">');
+    for (const r of profileRegions) {
+      parts.push(`<option value="${escapeHtml(r.name)}" ${r.name === selectedValue ? 'selected' : ''}>${escapeHtml(profileTranslateName(r.name))}</option>`);
+    }
+    parts.push('</optgroup>');
+    parts.push('<optgroup label="{{ t["rule.action_region_manual"] }}">');
+    for (const r of profileRegions) {
+      const manName = r.name + "手动";
+      parts.push(`<option value="${escapeHtml(manName)}" ${manName === selectedValue ? 'selected' : ''}>${escapeHtml(profileTranslateName(r.name))} Manual</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+  return parts.join("");
+}
+
+async function loadProfileGroups() {
+  try {
+    const [regions, services] = await Promise.all([
+      API.get("/api/groups/regions"),
+      API.get("/api/groups/services"),
+    ]);
+    profileRegions = regions.filter(r => r.enabled);
+    profileServices = services.filter(s => s.enabled);
+  } catch (e) { /* ignore */ }
+}
+
+async function loadDnsPresets() {
+  try {
+    dnsPresets = await API.get("/api/configs/host-presets");
+  } catch (e) { /* ignore */ }
+}
+
+async function loadData() {
+  try {
+    const profiles = await API.get("/api/configs/profiles");
+    const container = document.getElementById("profile-list");
+    if (profiles.length === 0) {
+      container.innerHTML = '<div class="empty"><div class="icon">🔧</div><p>{{ t["profile.empty"] }}</p></div>';
+      return;
+    }
+    container.innerHTML = profiles.map(p => {
+      const localeLabel = p.locale === 'en' ? 'English' : '{{ t["settings.lang_zh"] }}';
+      return `
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-header">
+          <div>
+            <h3>${escapeHtml(p.name)} ${p.is_default ? '<span class="badge badge-warning">{{ t["profile.default"] }}</span>' : ''} <span class="badge badge-primary">${localeLabel}</span></h3>
+            ${p.description ? `<p style="font-size:12px;color:var(--text2);margin-top:2px;">${escapeHtml(p.description)}</p>` : ''}
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-sm btn-outline" onclick='editProfile(${JSON.stringify(p)})'>{{ t["btn.edit"] }}</button>
+            <button class="btn btn-sm btn-success" onclick="setAsDefault(${p.id})">{{ t["profile.set_default"] }}</button>
+            <button class="btn btn-sm btn-primary" onclick="generateForProfile(${p.id})">{{ t["btn.generate"] }}</button>
+            ${!p.is_default ? `<button class="btn btn-sm btn-danger" onclick="deleteProfile(${p.id})">{{ t["btn.delete"] }}</button>` : ''}
+          </div>
+        </div>
+        <div style="padding:0 16px 8px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-sm btn-outline" onclick="toggleSection('pre-rules-${p.id}', ${p.id}, 'pre')">
+            {{ t["rule.pre_title"] }} <span id="pre-count-${p.id}" class="badge badge-primary" style="margin-left:4px;">0</span>
+          </button>
+          <button class="btn btn-sm btn-outline" onclick="toggleSection('general-rules-${p.id}', ${p.id}, 'general')">
+            {{ t["rule.general_title"] }} <span id="general-count-${p.id}" class="badge badge-success" style="margin-left:4px;">0</span>
+          </button>
+          <button class="btn btn-sm btn-outline" onclick="toggleSection('hosts-${p.id}', ${p.id}, 'hosts')">
+            {{ t["profile.hosts"] }} <span id="hosts-count-${p.id}" class="badge badge-warning" style="margin-left:4px;">0</span>
+          </button>
+        </div>
+        <!-- 前置规则 -->
+        <div id="pre-rules-${p.id}" style="display:none;padding:0 16px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span style="font-size:12px;color:var(--text2);">{{ t["rule.pre_hint"] }}</span>
+            <button class="btn btn-sm btn-primary" onclick="showAddProfileRule(${p.id}, 'pre')">{{ t["rule.add_pre"] }}</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>{{ t["rule.rule_text"] }}</th>
+                <th>{{ t["rule.comment"] }}</th>
+                <th>{{ t["sub.status"] }}</th>
+                <th>{{ t["node.col_action"] }}</th>
+              </tr></thead>
+              <tbody id="pre-list-${p.id}"></tbody>
+            </table>
+          </div>
+        </div>
+        <!-- 通用规则 -->
+        <div id="general-rules-${p.id}" style="display:none;padding:0 16px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span style="font-size:12px;color:var(--text2);">{{ t["rule.general_hint"] }}</span>
+            <button class="btn btn-sm btn-primary" onclick="showAddProfileRule(${p.id}, 'general')">{{ t["rule.add_general"] }}</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>{{ t["rule.rule_text"] }}</th>
+                <th>{{ t["rule.comment"] }}</th>
+                <th>{{ t["sub.status"] }}</th>
+                <th>{{ t["node.col_action"] }}</th>
+              </tr></thead>
+              <tbody id="general-list-${p.id}"></tbody>
+            </table>
+          </div>
+        </div>
+        <!-- Host 映射 -->
+        <div id="hosts-${p.id}" style="display:none;padding:0 16px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span style="font-size:12px;color:var(--text2);">{{ t["profile.hosts_hint"] }}</span>
+            <button class="btn btn-sm btn-primary" onclick="showAddHost(${p.id})">{{ t["profile.add_host"] }}</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>{{ t["profile.host_domain"] }}</th>
+                <th>{{ t["profile.host_target"] }}</th>
+                <th>{{ t["sub.status"] }}</th>
+                <th>{{ t["node.col_action"] }}</th>
+              </tr></thead>
+              <tbody id="hosts-list-${p.id}"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>`;
+    }).join("");
+
+    // 加载每个 profile 的统计数据
+    for (const p of profiles) {
+      loadProfileStats(p.id);
+    }
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function loadProfileStats(profileId) {
+  try {
+    const [rules, hosts] = await Promise.all([
+      API.get(`/api/configs/custom-rules?profile_id=${profileId}`),
+      API.get(`/api/configs/host-mappings?profile_id=${profileId}`),
+    ]);
+    const preRules = rules.filter(r => r.position === "pre");
+    const generalRules = rules.filter(r => r.position === "general");
+    const el = (id) => document.getElementById(id);
+    if (el(`pre-count-${profileId}`)) el(`pre-count-${profileId}`).textContent = preRules.length;
+    if (el(`general-count-${profileId}`)) el(`general-count-${profileId}`).textContent = generalRules.length;
+    if (el(`hosts-count-${profileId}`)) el(`hosts-count-${profileId}`).textContent = hosts.length;
+  } catch (e) { /* ignore */ }
+}
+
+function toggleSection(sectionId, profileId, type) {
+  const el = document.getElementById(sectionId);
+  if (el.style.display === "none") {
+    el.style.display = "block";
+    if (type === "hosts") loadHostList(profileId);
+    else loadProfileRuleList(profileId, type);
+  } else {
+    el.style.display = "none";
+  }
+}
+
+// ===== Profile 基础 CRUD =====
+
+function showAddProfile() {
+  document.getElementById("profile-modal-title").textContent = "{{ t["profile.new"] }}";
+  document.getElementById("profile-edit-id").value = "";
+  document.getElementById("profile-name").value = "";
+  document.getElementById("profile-desc").value = "";
+  document.getElementById("profile-locale").value = "{{ locale }}";
+  document.getElementById("profile-default").checked = false;
+  showModal("profile-modal");
+}
+
+function editProfile(p) {
+  document.getElementById("profile-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("profile-edit-id").value = p.id;
+  document.getElementById("profile-name").value = p.name;
+  document.getElementById("profile-desc").value = p.description || "";
+  document.getElementById("profile-locale").value = p.locale || "zh";
+  document.getElementById("profile-default").checked = p.is_default;
+  showModal("profile-modal");
+}
+
+async function saveProfile() {
+  const id = document.getElementById("profile-edit-id").value;
+  const data = {
+    name: document.getElementById("profile-name").value,
+    description: document.getElementById("profile-desc").value || null,
+    is_default: document.getElementById("profile-default").checked,
+    locale: document.getElementById("profile-locale").value,
+  };
+  try {
+    if (id) {
+      await API.put(`/api/configs/profiles/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/configs/profiles", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("profile-modal"); loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function setAsDefault(id) {
+  try {
+    const profiles = await API.get("/api/configs/profiles");
+    for (const p of profiles) { if (p.is_default && p.id !== id) await API.put(`/api/configs/profiles/${p.id}`, { is_default: false }); }
+    await API.put(`/api/configs/profiles/${id}`, { is_default: true });
+    toast("{{ t["profile.set_default_done"] }}"); loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function generateForProfile(id) { window.open(`/api/configs/generate?profile_id=${id}`, "_blank"); }
+
+async function deleteProfile(id) {
+  if (!confirm("{{ t["profile.confirm_delete"] }}")) return;
+  try {
+    // 同时删除该 profile 的自定义规则和 host 映射
+    const [rules, hosts] = await Promise.all([
+      API.get(`/api/configs/custom-rules?profile_id=${id}`),
+      API.get(`/api/configs/host-mappings?profile_id=${id}`),
+    ]);
+    for (const r of rules) await API.del(`/api/configs/custom-rules/${r.id}`);
+    for (const h of hosts) await API.del(`/api/configs/host-mappings/${h.id}`);
+    await API.del(`/api/configs/profiles/${id}`);
+    toast("{{ t["msg.deleted"] }}"); loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== Profile 自定义规则 =====
+
+async function loadProfileRuleList(profileId, position) {
+  try {
+    const rules = await API.get(`/api/configs/custom-rules?profile_id=${profileId}&position=${position}`);
+    const tbody = document.getElementById(`${position}-list-${profileId}`);
+    tbody.innerHTML = rules.map(r => `
+      <tr>
+        <td><code style="font-size:12px;">${escapeHtml(r.rule_text)}</code></td>
+        <td style="font-size:12px;color:var(--text2);">${escapeHtml(r.comment || '-')}</td>
+        <td><span class="badge ${r.enabled ? 'badge-success' : 'badge-danger'}">${r.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
+        <td>
+          <button class="btn btn-sm btn-outline" onclick='editProfileRule(${profileId}, ${JSON.stringify(r)})'>{{ t["btn.edit"] }}</button>
+          <button class="btn btn-sm ${r.enabled ? 'btn-outline' : 'btn-success'}" onclick="toggleProfileRule(${r.id}, ${!r.enabled}, ${profileId}, '${position}')">${r.enabled ? '{{ t["btn.disable"] }}' : '{{ t["btn.enable"] }}'}</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteProfileRule(${r.id}, ${profileId}, '${position}')">{{ t["btn.delete"] }}</button>
+        </td>
+      </tr>
+    `).join("");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function toggleProfileRuleMode() {
+  const raw = document.getElementById("profile-rule-raw-mode").checked;
+  document.getElementById("profile-rule-structured").style.display = raw ? "none" : "block";
+  document.getElementById("profile-rule-raw").style.display = raw ? "block" : "none";
+}
+
+function updateProfileRuleValueLabel() {
+  const type = document.getElementById("profile-rule-type").value;
+  const label = RULE_TYPE_LABELS[type] || "{{ t["rule.value_domain"] }}";
+  document.getElementById("profile-rule-value-label").textContent = label;
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  const sel = document.getElementById("profile-rule-type");
+  if (sel) sel.addEventListener("change", updateProfileRuleValueLabel);
+});
+
+function parseRuleText(text) {
+  const parts = text.split(",");
+  if (parts.length >= 3 && SIMPLE_RULE_TYPES.includes(parts[0])) {
+    return { type: parts[0], value: parts.slice(1, -1).join(","), action: parts[parts.length - 1] };
+  }
+  return null;
+}
+
+function showAddProfileRule(profileId, position) {
+  document.getElementById("profile-rule-modal-title").textContent =
+    position === "pre" ? "{{ t["rule.add_pre"] }}" : "{{ t["rule.add_general"] }}";
+  document.getElementById("profile-rule-edit-id").value = "";
+  document.getElementById("profile-rule-profile-id").value = profileId;
+  document.getElementById("profile-rule-position").value = position;
+  document.getElementById("profile-rule-raw-mode").checked = false;
+  document.getElementById("profile-rule-structured").style.display = "block";
+  document.getElementById("profile-rule-raw").style.display = "none";
+  document.getElementById("profile-rule-type").value = "DOMAIN-SUFFIX";
+  document.getElementById("profile-rule-value").value = "";
+  document.getElementById("profile-rule-action").innerHTML = buildProfileActionOptions("");
+  document.getElementById("profile-rule-text").value = "";
+  document.getElementById("profile-rule-comment").value = "";
+  updateProfileRuleValueLabel();
+  showModal("profile-rule-modal");
+}
+
+function editProfileRule(profileId, r) {
+  document.getElementById("profile-rule-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("profile-rule-edit-id").value = r.id;
+  document.getElementById("profile-rule-profile-id").value = profileId;
+  document.getElementById("profile-rule-position").value = r.position;
+  document.getElementById("profile-rule-comment").value = r.comment || "";
+  document.getElementById("profile-rule-text").value = r.rule_text;
+
+  const parsed = parseRuleText(r.rule_text);
+  if (parsed) {
+    document.getElementById("profile-rule-raw-mode").checked = false;
+    document.getElementById("profile-rule-structured").style.display = "block";
+    document.getElementById("profile-rule-raw").style.display = "none";
+    document.getElementById("profile-rule-type").value = parsed.type;
+    document.getElementById("profile-rule-value").value = parsed.value;
+    document.getElementById("profile-rule-action").innerHTML = buildProfileActionOptions(parsed.action);
+    updateProfileRuleValueLabel();
+  } else {
+    document.getElementById("profile-rule-raw-mode").checked = true;
+    document.getElementById("profile-rule-structured").style.display = "none";
+    document.getElementById("profile-rule-raw").style.display = "block";
+  }
+  showModal("profile-rule-modal");
+}
+
+async function saveProfileRule() {
+  const id = document.getElementById("profile-rule-edit-id").value;
+  const profileId = parseInt(document.getElementById("profile-rule-profile-id").value);
+  const position = document.getElementById("profile-rule-position").value;
+  const raw = document.getElementById("profile-rule-raw-mode").checked;
+  let rule_text;
+  if (raw) {
+    rule_text = document.getElementById("profile-rule-text").value.trim();
+  } else {
+    const type = document.getElementById("profile-rule-type").value;
+    const value = document.getElementById("profile-rule-value").value.trim();
+    const action = document.getElementById("profile-rule-action").value;
+    if (!type || !value || !action) return;
+    rule_text = `${type},${value},${action}`;
+  }
+  if (!rule_text) return;
+  const data = {
+    rule_text: rule_text,
+    position: position,
+    comment: document.getElementById("profile-rule-comment").value.trim() || null,
+  };
+  try {
+    if (id) {
+      await API.put(`/api/configs/custom-rules/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      data.profile_id = profileId;
+      data.sort_order = 0;
+      await API.post("/api/configs/custom-rules", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("profile-rule-modal");
+    loadProfileRuleList(profileId, position);
+    loadProfileStats(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleProfileRule(ruleId, enabled, profileId, position) {
+  try {
+    await API.put(`/api/configs/custom-rules/${ruleId}`, { enabled });
+    loadProfileRuleList(profileId, position);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteProfileRule(ruleId, profileId, position) {
+  if (!confirm("{{ t["rule.confirm_delete"] }}")) return;
+  try {
+    await API.del(`/api/configs/custom-rules/${ruleId}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadProfileRuleList(profileId, position);
+    loadProfileStats(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== Profile Host 映射 =====
+
+async function loadHostList(profileId) {
+  try {
+    const mappings = await API.get(`/api/configs/host-mappings?profile_id=${profileId}`);
+    const tbody = document.getElementById(`hosts-list-${profileId}`);
+    tbody.innerHTML = mappings.map(m => `
+      <tr>
+        <td><code style="font-size:12px;">${escapeHtml(m.domain)}</code></td>
+        <td><span class="badge badge-primary">${escapeHtml(m.target)}</span></td>
+        <td><span class="badge ${m.enabled ? 'badge-success' : 'badge-danger'}">${m.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
+        <td>
+          <button class="btn btn-sm btn-outline" onclick='editHost(${profileId}, ${JSON.stringify(m)})'>{{ t["btn.edit"] }}</button>
+          <button class="btn btn-sm ${m.enabled ? 'btn-outline' : 'btn-success'}" onclick="toggleHost(${m.id}, ${!m.enabled}, ${profileId})">${m.enabled ? '{{ t["btn.disable"] }}' : '{{ t["btn.enable"] }}'}</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteHost(${m.id}, ${profileId})">{{ t["btn.delete"] }}</button>
+        </td>
+      </tr>
+    `).join("");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function showAddHost(profileId) {
+  document.getElementById("host-modal-title").textContent = "{{ t["profile.add_host"] }}";
+  document.getElementById("host-edit-id").value = "";
+  document.getElementById("host-profile-id").value = profileId;
+  document.getElementById("host-domain").value = "";
+  document.getElementById("host-target").value = "";
+  // 填充预置选项
+  const sel = document.getElementById("host-target-preset");
+  sel.innerHTML = '<option value="">{{ t["profile.host_select_preset"] }}</option>' +
+    dnsPresets.map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
+  sel.value = "";
+  showModal("host-modal");
+}
+
+function editHost(profileId, m) {
+  document.getElementById("host-modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("host-edit-id").value = m.id;
+  document.getElementById("host-profile-id").value = profileId;
+  document.getElementById("host-domain").value = m.domain;
+  document.getElementById("host-target").value = m.target;
+  const sel = document.getElementById("host-target-preset");
+  sel.innerHTML = '<option value="">{{ t["profile.host_select_preset"] }}</option>' +
+    dnsPresets.map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
+  // 检查 target 是否匹配预置
+  sel.value = dnsPresets.find(p => p.value === m.target) ? m.target : "";
+  showModal("host-modal");
+}
+
+async function saveHost() {
+  const id = document.getElementById("host-edit-id").value;
+  const profileId = parseInt(document.getElementById("host-profile-id").value);
+  const domain = document.getElementById("host-domain").value.trim();
+  const presetTarget = document.getElementById("host-target-preset").value;
+  const customTarget = document.getElementById("host-target").value.trim();
+  const target = presetTarget || customTarget;
+  if (!domain || !target) return;
+  try {
+    if (id) {
+      await API.put(`/api/configs/host-mappings/${id}`, { domain, target });
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/configs/host-mappings", { profile_id: profileId, domain, target, sort_order: 0 });
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("host-modal");
+    loadHostList(profileId);
+    loadProfileStats(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleHost(mappingId, enabled, profileId) {
+  try {
+    await API.put(`/api/configs/host-mappings/${mappingId}`, { enabled });
+    loadHostList(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteHost(mappingId, profileId) {
+  if (!confirm("{{ t["rule.confirm_delete"] }}")) return;
+  try {
+    await API.del(`/api/configs/host-mappings/${mappingId}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadHostList(profileId);
+    loadProfileStats(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// 预置选项联动：选择预置后自动填入 target
+document.getElementById("host-target-preset").addEventListener("change", function() {
+  if (this.value) {
+    document.getElementById("host-target").value = this.value;
+  }
+});
+
+async function init() {
+  await Promise.all([loadDnsPresets(), loadProfileGroups()]);
+  loadData();
+}
+init();
+</script>
+{% endblock %}

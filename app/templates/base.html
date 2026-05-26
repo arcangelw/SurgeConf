@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="{% if locale == 'en' %}en{% else %}zh-CN{% endif %}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}SurgeConf{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="logo">Surge<span>Conf</span></div>
+      <nav>
+        <a href="/">{{ t["nav.dashboard"] }}</a>
+
+        <div class="nav-section">{{ t["nav.section_general"] }}</div>
+        <a href="/general">{{ t["nav.general"] }}</a>
+
+        <div class="nav-section">{{ t["nav.section_proxy"] }}</div>
+        <a href="/subscriptions">{{ t["nav.subscriptions"] }}</a>
+        <a href="/nodes">{{ t["nav.nodes"] }}</a>
+
+        <div class="nav-section">{{ t["nav.section_proxy_group"] }}</div>
+        <a href="/groups">{{ t["nav.groups"] }}</a>
+
+        <div class="nav-section">{{ t["nav.section_rule"] }}</div>
+        <a href="/rules">{{ t["nav.rules"] }}</a>
+
+        <div class="nav-section">{{ t["nav.section_output"] }}</div>
+        <a href="/profiles">{{ t["nav.profiles"] }}</a>
+        <a href="/generator">{{ t["nav.generator"] }}</a>
+
+        <div class="nav-section" style="margin-top:auto;border-top:1px solid var(--border);padding-top:8px;">{{ t["nav.section_system"] }}</div>
+        <a href="/settings">{{ t["nav.settings"] }}</a>
+      </nav>
+    </aside>
+    <main class="main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <div class="toast-container"></div>
+  <script>const LOCALE_NAMES = {{ locale_names | tojson }};</script>
+  <script src="/static/js/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

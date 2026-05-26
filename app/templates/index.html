@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}{{ t["dashboard.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["dashboard.title"] }}</h1>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-outline" onclick="refreshStats()">{{ t["btn.refresh"] }}</button>
+    <button class="btn btn-success" onclick="syncAll()">{{ t["btn.sync_all"] }}</button>
+  </div>
+</div>
+
+<div class="stats" id="stats">
+  <div class="stat-card">
+    <div class="value" id="stat-subs">-</div>
+    <div class="label">{{ t["dashboard.subs"] }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="value" id="stat-nodes">-</div>
+    <div class="label">{{ t["dashboard.nodes"] }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="value" id="stat-regions">-</div>
+    <div class="label">{{ t["dashboard.regions"] }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="value" id="stat-services">-</div>
+    <div class="label">{{ t["dashboard.services"] }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="value" id="stat-rules">-</div>
+    <div class="label">{{ t["dashboard.rules"] }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="value" id="stat-profiles">-</div>
+    <div class="label">{{ t["dashboard.profiles"] }}</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h3>{{ t["dashboard.quick"] }}</h3>
+  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;">
+    <a href="/subscriptions" class="btn btn-primary">{{ t["dashboard.add_sub"] }}</a>
+    <a href="/nodes" class="btn btn-outline">{{ t["dashboard.manage_nodes"] }}</a>
+    <button class="btn btn-outline" onclick="autoAssign()">{{ t["btn.auto_assign"] }}</button>
+    <a href="/generator" class="btn btn-success">{{ t["dashboard.generate"] }}</a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h3>{{ t["dashboard.distribution"] }}</h3>
+  </div>
+  <div id="region-chart" style="display:flex;gap:12px;flex-wrap:wrap;"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function refreshStats() {
+  try {
+    const [subs, nodesByRegion, regions, services, rules, profiles] = await Promise.all([
+      API.get("/api/subscriptions"),
+      API.get("/api/nodes/by-region"),
+      API.get("/api/groups/regions"),
+      API.get("/api/groups/services"),
+      API.get("/api/configs/rules"),
+      API.get("/api/configs/profiles"),
+    ]);
+
+    document.getElementById("stat-subs").textContent = subs.length;
+    document.getElementById("stat-regions").textContent = regions.length;
+    document.getElementById("stat-services").textContent = services.length;
+    document.getElementById("stat-rules").textContent = rules.length;
+    document.getElementById("stat-profiles").textContent = profiles.length;
+
+    const groups = nodesByRegion.groups || {};
+    let totalNodes = 0;
+    const chartEl = document.getElementById("region-chart");
+    chartEl.innerHTML = "";
+
+    for (const [region, nodes] of Object.entries(groups)) {
+      totalNodes += nodes.length;
+      const bar = document.createElement("div");
+      bar.style.cssText = "background:var(--surface2);border-radius:6px;padding:10px;min-width:100px;text-align:center;";
+      bar.innerHTML = `<div style="font-size:20px;font-weight:700;">${nodes.length}</div><div style="font-size:11px;color:var(--text2);margin-top:4px;">${escapeHtml(region)}</div>`;
+      chartEl.appendChild(bar);
+    }
+
+    totalNodes += (nodesByRegion.unassigned || []).length;
+    document.getElementById("stat-nodes").textContent = totalNodes;
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function syncAll() {
+  try {
+    toast("{{ t["dashboard.syncing"] }}");
+    const result = await API.post("/api/subscriptions/sync-all");
+    toast("{{ t["dashboard.sync_done"] }}".replace("{0}", result.results.length));
+    refreshStats();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+async function autoAssign() {
+  try {
+    toast("{{ t["dashboard.assigning"] }}");
+    const result = await API.post("/api/nodes/auto-assign");
+    toast("{{ t["dashboard.assigned"] }}".replace("{0}", result.assigned));
+    refreshStats();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+refreshStats();
+</script>
+{% endblock %}

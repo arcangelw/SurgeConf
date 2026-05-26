@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}{{ t["settings.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["settings.title"] }}</h1>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3>{{ t["settings.language"] }}</h3></div>
+  <div style="display:flex;gap:12px;">
+    <button class="btn {% if locale == 'zh' %}btn-primary{% else %}btn-outline{% endif %}" onclick="setLocale('zh')">
+      {{ t["settings.lang_zh"] }}
+    </button>
+    <button class="btn {% if locale == 'en' %}btn-primary{% else %}btn-outline{% endif %}" onclick="setLocale('en')">
+      {{ t["settings.lang_en"] }}
+    </button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3>{{ t["settings.data_management"] }}</h3></div>
+  <div style="display:flex;gap:10px;">
+    <button class="btn btn-danger" onclick="resetData()">{{ t["settings.reset_data"] }}</button>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-top:8px;">{{ t["settings.reset_hint"] }}</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function setLocale(locale) {
+  try {
+    await fetch("/api/settings/locale", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locale }),
+    });
+    window.location.reload();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function resetData() {
+  if (!confirm("{{ t["settings.confirm_reset"] }}")) return;
+  try {
+    const resp = await fetch("/api/settings/reset", { method: "POST" });
+    if (resp.ok) {
+      toast("{{ t["settings.reset_done"] }}");
+      setTimeout(() => window.location.reload(), 1000);
+    }
+  } catch (e) { toast(e.message, "error"); }
+}
+
+</script>
+{% endblock %}

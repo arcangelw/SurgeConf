@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% block title %}{{ t["generator.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["generator.title"] }}</h1>
+</div>
+
+<div class="card gen-section">
+  <div style="display:flex;gap:16px;align-items:flex-end;">
+    <div class="form-group" style="margin-bottom:0;flex:1;">
+      <label>{{ t["generator.profile"] }}</label>
+      <select id="profile-select">
+        <option value="">{{ t["generator.default"] }}</option>
+      </select>
+    </div>
+    <div class="form-group" style="margin-bottom:0;">
+      <label>{{ t["settings.language"] }}</label>
+      <select id="locale-select">
+        <option value="">{{ t["generator.locale_auto"] }}</option>
+        <option value="zh">{{ t["settings.lang_zh"] }}</option>
+        <option value="en">{{ t["settings.lang_en"] }}</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+<div class="card gen-section">
+  <h3 class="gen-card-title">{{ t["generator.download"] }}</h3>
+  <div class="gen-row">
+    <input type="text" id="filename-input" placeholder="Surge.conf" value="Surge.conf" class="gen-filename-input">
+    <button class="btn btn-success" onclick="downloadConfig()">{{ t["generator.btn_download"] }}</button>
+  </div>
+  <p class="gen-hint">{{ t["generator.download_hint"] }}</p>
+</div>
+
+<div class="card gen-section">
+  <h3 class="gen-card-title">{{ t["generator.subscribe"] }}</h3>
+  <div class="form-group">
+    <label>{{ t["generator.server_ip"] }}</label>
+    <select id="ip-select" class="gen-ip-select"></select>
+  </div>
+  <div class="form-group" style="margin-bottom:0;">
+    <label>{{ t["generator.subscribe_url"] }}</label>
+    <div class="gen-row">
+      <input type="text" id="subscribe-url" readonly class="gen-sub-url">
+      <button class="btn btn-outline" onclick="copySubscribeUrl()">{{ t["generator.copy"] }}</button>
+    </div>
+  </div>
+  <p class="gen-hint">{{ t["generator.subscribe_hint"] }}</p>
+</div>
+
+<div class="card gen-section">
+  <div class="gen-row" style="justify-content:flex-start;">
+    <button class="btn btn-primary" onclick="previewConfig()">{{ t["generator.btn_preview"] }}</button>
+    <span style="font-size:12px;color:var(--text2);margin-left:8px;" id="config-size"></span>
+  </div>
+</div>
+
+<div class="fullscreen-overlay" id="fullscreen-overlay" onclick="closeFullscreen(event)">
+  <div class="fullscreen-bar">
+    <span style="font-size:14px;font-weight:600;">{{ t["generator.preview"] }}</span>
+    <div class="fullscreen-bar-right">
+      <span style="font-size:12px;color:var(--text2);" id="fullscreen-size"></span>
+      <button class="btn btn-outline btn-sm" onclick="toggleFullscreen()">{{ t["generator.exit_fullscreen"] }}</button>
+    </div>
+  </div>
+  <pre class="fullscreen-content" id="fullscreen-content" onclick="event.stopPropagation()"></pre>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SERVER_PORT = location.port || (location.protocol === "https:" ? "443" : "80");
+
+function getLocaleParam() {
+  const val = document.getElementById("locale-select").value;
+  return val ? `&locale=${val}` : "";
+}
+
+function getProfileParam() {
+  const val = document.getElementById("profile-select").value;
+  return val ? `&profile_id=${val}` : "";
+}
+
+async function loadServerIps() {
+  const select = document.getElementById("ip-select");
+  try {
+    const data = await API.get("/api/configs/server-ips");
+    const ips = data.ips || [];
+    const loOpt = document.createElement("option");
+    loOpt.value = "127.0.0.1";
+    loOpt.textContent = "{{ t["generator.localhost"] }}";
+    select.appendChild(loOpt);
+    ips.forEach(ip => {
+      const opt = document.createElement("option");
+      opt.value = ip;
+      opt.textContent = "{{ t["generator.lan_ip"] }}".replace("{0}", ip);
+      select.appendChild(opt);
+    });
+    if (ips.length > 0) select.value = ips[0];
+  } catch (e) {
+    const opt = document.createElement("option");
+    opt.value = location.hostname;
+    opt.textContent = location.hostname;
+    select.appendChild(opt);
+  }
+  updateSubscribeUrl();
+}
+
+function buildBaseUrl(ip) {
+  const port = SERVER_PORT === "80" || SERVER_PORT === "443" ? "" : `:${SERVER_PORT}`;
+  return `${location.protocol}//${ip}${port}`;
+}
+
+function updateSubscribeUrl() {
+  const ip = document.getElementById("ip-select").value;
+  const base = buildBaseUrl(ip);
+  let url = `${base}/api/configs/subscribe?`;
+  const profileId = document.getElementById("profile-select").value;
+  const locale = document.getElementById("locale-select").value;
+  if (profileId) url += `profile_id=${profileId}&`;
+  if (locale) url += `locale=${locale}&`;
+  document.getElementById("subscribe-url").value = url.replace(/[?&]$/, "");
+}
+
+async function loadProfiles() {
+  try {
+    const profiles = await API.get("/api/configs/profiles");
+    const select = document.getElementById("profile-select");
+    profiles.forEach(p => {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `${p.name}${p.is_default ? ' {{ t["msg.default"] }}' : ''}`;
+      select.appendChild(opt);
+    });
+  } catch (e) { /* ignore */ }
+}
+
+document.getElementById("profile-select").addEventListener("change", updateSubscribeUrl);
+document.getElementById("ip-select").addEventListener("change", updateSubscribeUrl);
+document.getElementById("locale-select").addEventListener("change", updateSubscribeUrl);
+
+async function previewConfig() {
+  const params = new URLSearchParams();
+  const profileId = document.getElementById("profile-select").value;
+  const locale = document.getElementById("locale-select").value;
+  if (profileId) params.set("profile_id", profileId);
+  if (locale) params.set("locale", locale);
+  const url = "/api/configs/preview?" + params.toString();
+  try {
+    const result = await API.get(url);
+    const sizeLabel = `${(result.size / 1024).toFixed(1)} KB`;
+    document.getElementById("config-size").textContent = sizeLabel;
+    document.getElementById("fullscreen-content").textContent = result.content;
+    document.getElementById("fullscreen-size").textContent = sizeLabel;
+    document.getElementById("fullscreen-overlay").classList.add("show");
+    document.body.style.overflow = "hidden";
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+function downloadConfig() {
+  const filename = document.getElementById("filename-input").value.trim() || "Surge.conf";
+  let url = "/api/configs/generate?filename=" + encodeURIComponent(filename);
+  url += getProfileParam() + getLocaleParam();
+  window.open(url, "_blank");
+}
+
+function copySubscribeUrl() {
+  const input = document.getElementById("subscribe-url");
+  navigator.clipboard.writeText(input.value).then(() => {
+    toast("{{ t["generator.copied"] }}");
+  }).catch(() => {
+    input.select();
+    document.execCommand("copy");
+    toast("{{ t["generator.copied"] }}");
+  });
+}
+
+function toggleFullscreen() {
+  const overlay = document.getElementById("fullscreen-overlay");
+  if (overlay.classList.contains("show")) {
+    overlay.classList.remove("show");
+    document.body.style.overflow = "";
+  }
+}
+
+function closeFullscreen(e) {
+  if (e.target === document.getElementById("fullscreen-overlay")) {
+    toggleFullscreen();
+  }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") toggleFullscreen();
+});
+
+Promise.all([loadProfiles(), loadServerIps()]);
+</script>
+{% endblock %}

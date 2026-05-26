@@ -1,0 +1,287 @@
+{% extends "base.html" %}
+{% block title %}{{ t["node.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["node.title"] }}</h1>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-primary" onclick="autoAssign()">{{ t["btn.auto_assign"] }}</button>
+    <button class="btn btn-outline" onclick="loadData()">{{ t["btn.refresh"] }}</button>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px;">
+  <p style="font-size:13px;color:var(--text2);">{{ t["node.desc"] }}</p>
+</div>
+
+<!-- 筛选栏 -->
+<div class="card" style="margin-bottom:16px;padding:12px 20px;">
+  <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+    <span style="font-size:12px;color:var(--text2);">{{ t["node.filter"] }}</span>
+    <select id="filter-region" onchange="loadData()" style="width:130px;">
+      <option value="">{{ t["node.all_regions"] }}</option>
+    </select>
+    <select id="filter-sub" onchange="loadData()" style="width:130px;">
+      <option value="">{{ t["node.all_subs"] }}</option>
+    </select>
+    <select id="filter-pinned" onchange="loadData()" style="width:130px;">
+      <option value="">{{ t["node.pin_status"] }}</option>
+      <option value="__none__">{{ t["node.not_pinned"] }}</option>
+      <option value="__any__">{{ t["node.has_pinned"] }}</option>
+    </select>
+    <span id="node-total" style="font-size:12px;color:var(--text2);margin-left:auto;"></span>
+  </div>
+</div>
+
+<!-- 节点表格 -->
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:30px;"><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
+          <th>{{ t["node.col_name"] }}</th>
+          <th>{{ t["node.col_sub"] }}</th>
+          <th>{{ t["node.col_type"] }}</th>
+          <th>{{ t["node.col_region"] }}</th>
+          <th>{{ t["node.col_pinned"] }} <span class="help-tip" data-tip="{{ t['node.col_pinned_tip'] }}">?</span></th>
+          <th>{{ t["node.col_action"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="node-table"></tbody>
+    </table>
+  </div>
+  <div id="empty-state" class="empty" style="display:none;">
+    <div class="icon">🌐</div>
+    <p>{{ t["node.empty"] }}</p>
+  </div>
+</div>
+
+<!-- 批量操作栏 -->
+<div id="batch-bar" style="display:none;position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  background:var(--surface);border:1px solid var(--primary);border-radius:12px;padding:12px 20px;
+  display:none;align-items:center;gap:12px;z-index:100;box-shadow:0 4px 20px rgba(0,0,0,0.4);">
+  <span id="batch-count" style="font-size:13px;font-weight:600;"></span>
+  <span style="color:var(--text2);font-size:12px;">{{ t["node.batch_action"] }}</span>
+  <select id="batch-target" style="width:120px;"></select>
+  <button class="btn btn-primary btn-sm" onclick="batchMove()">{{ t["node.batch_move"] }}</button>
+  <button class="btn btn-success btn-sm" onclick="batchPin()">{{ t["node.batch_pin"] }}</button>
+  <button class="btn btn-danger btn-sm" onclick="batchUnpin()">{{ t["node.batch_unpin"] }}</button>
+  <button class="btn btn-outline btn-sm" onclick="clearSelection()">{{ t["node.batch_cancel"] }}</button>
+</div>
+
+<!-- 节点详情弹窗 -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal" style="max-width:560px;">
+    <h3>{{ t["node.detail_title"] }}</h3>
+    <div id="detail-content"></div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('detail-modal')">{{ t["btn.close"] }}</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let selectedNodes = new Set();
+let allServices = [];
+let allRegions = [];
+
+async function loadFilters() {
+  const [regions, services, subs] = await Promise.all([
+    API.get("/api/groups/regions"),
+    API.get("/api/groups/services"),
+    API.get("/api/subscriptions"),
+  ]);
+  allServices = services;
+  allRegions = regions;
+
+  const rSel = document.getElementById("filter-region");
+  rSel.innerHTML = '<option value="">{{ t["node.all_regions"] }}</option>' +
+    regions.map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.display_name || r.name)}</option>`).join("") +
+    '<option value="__unassigned__">{{ t["node.no_region"] }}</option>';
+
+  const sSel = document.getElementById("filter-sub");
+  sSel.innerHTML = '<option value="">{{ t["node.all_subs"] }}</option>' +
+    subs.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join("");
+
+  const bSel = document.getElementById("batch-target");
+  bSel.innerHTML = regions.map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.name)}</option>`).join("") +
+    `<option disabled>{{ t["node.pin_service_sep"] }}</option>` +
+    services.map(s => `<option value="pin:${escapeHtml(s.name)}">${"{{ t["node.pin_to"] }}".replace("{0}", "${escapeHtml(s.name)}")}</option>`).join("");
+}
+
+async function loadData() {
+  const region = document.getElementById("filter-region").value;
+  const subId = document.getElementById("filter-sub").value;
+  const pinned = document.getElementById("filter-pinned").value;
+
+  let url = "/api/nodes?";
+  if (region) url += region === "__unassigned__" ? "unassigned=true&" : `region=${encodeURIComponent(region)}&`;
+  if (subId) url += `subscription_id=${subId}&`;
+
+  try {
+    const nodes = await API.get(url);
+    let filtered = nodes;
+    if (pinned === "__none__") filtered = nodes.filter(n => !n.pinned_services || n.pinned_services.length === 0);
+    if (pinned === "__any__") filtered = nodes.filter(n => n.pinned_services && n.pinned_services.length > 0);
+
+    document.getElementById("node-total").textContent = "{{ t["node.total_count"] }}".replace("{0}", filtered.length);
+    const tbody = document.getElementById("node-table");
+    const empty = document.getElementById("empty-state");
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = "";
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+
+    tbody.innerHTML = filtered.map(n => {
+      const regionBadge = n.region_manual
+        ? '<span class="badge badge-warning">' + "{{ t["node.manual_label"] }}".replace("{0}", escapeHtml(n.region_manual)) + '</span>'
+        : n.region_auto
+          ? '<span class="badge badge-primary">' + "{{ t["node.auto_label"] }}".replace("{0}", escapeHtml(n.region_auto)) + '</span>'
+          : '<span style="color:var(--text2)">-</span>';
+      const pinnedBadges = (n.pinned_services || []).map(s =>
+        `<span class="badge badge-success" style="margin:1px;">${escapeHtml(s)}</span>`
+      ).join("") || '<span style="color:var(--text2)">-</span>';
+      const subColor = n.subscription_color || '#6c5ce7';
+      const subTag = n.subscription_tag || n.subscription_name || '';
+
+      return `<tr>
+        <td><input type="checkbox" class="node-check" data-id="${n.id}" ${selectedNodes.has(n.id) ? 'checked' : ''}></td>
+        <td>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="width:6px;height:6px;border-radius:50%;background:${subColor};flex-shrink:0;"></span>
+            <a href="javascript:void(0)" onclick="showDetail(${n.id})" style="color:var(--primary);text-decoration:none;">${escapeHtml(n.name)}</a>
+          </div>
+        </td>
+        <td><span style="font-size:11px;color:${subColor};">${escapeHtml(subTag)}</span></td>
+        <td><span class="badge badge-primary" style="font-size:10px;">${n.node_type}</span></td>
+        <td>${regionBadge}</td>
+        <td>${pinnedBadges}</td>
+        <td>
+          <button class="btn btn-sm btn-outline" onclick="pinToService(${n.id})">{{ t["node.pin_btn"] }}</button>
+        </td>
+      </tr>`;
+    }).join("");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function showDetail(nodeId) {
+  try {
+    const n = await API.get(`/api/nodes/${nodeId}`);
+    const pinned = (n.pinned_services || []).join(", ") || "-";
+    document.getElementById("detail-content").innerHTML = `
+      <table style="width:100%;">
+        <tr><td style="color:var(--text2);width:100px;">{{ t["node.detail_name"] }}</td><td><strong>${escapeHtml(n.name)}</strong></td></tr>
+        <tr><td style="color:var(--text2);">{{ t["node.detail_type"] }}</td><td>${n.node_type}</td></tr>
+        <tr><td style="color:var(--text2);">{{ t["node.detail_server"] }}</td><td>${escapeHtml(n.server)}:${n.port}</td></tr>
+        <tr><td style="color:var(--text2);">{{ t["node.detail_sub"] }}</td><td>${escapeHtml(n.subscription_name || '-')}</td></tr>
+        <tr><td style="color:var(--text2);">{{ t["node.detail_auto_region"] }}</td><td>${n.region_auto || '-'}</td></tr>
+        <tr><td style="color:var(--text2);">{{ t["node.detail_manual_region"] }}</td><td>${n.region_manual || '-'}</td></tr>
+        <tr><td style="color:var(--text2);">{{ t["node.detail_pinned"] }}</td><td>${escapeHtml(pinned)}</td></tr>
+      </table>
+    `;
+    showModal("detail-modal");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function toggleAll(el) {
+  const checked = el.checked;
+  document.querySelectorAll(".node-check").forEach(cb => {
+    const id = parseInt(cb.dataset.id);
+    cb.checked = checked;
+    if (checked) selectedNodes.add(id);
+    else selectedNodes.delete(id);
+  });
+  updateBatchBar();
+}
+
+function updateBatchBar() {
+  const bar = document.getElementById("batch-bar");
+  if (selectedNodes.size > 0) {
+    bar.style.display = "flex";
+    document.getElementById("batch-count").textContent = "{{ t["node.selected_count"] }}".replace("{0}", selectedNodes.size);
+  } else {
+    bar.style.display = "none";
+  }
+}
+
+function clearSelection() {
+  selectedNodes.clear();
+  document.getElementById("select-all").checked = false;
+  document.querySelectorAll(".node-check").forEach(cb => cb.checked = false);
+  updateBatchBar();
+}
+
+async function batchMove() {
+  const target = document.getElementById("batch-target").value;
+  if (!target || selectedNodes.size === 0 || target.startsWith("pin:")) return;
+  try {
+    await API.put("/api/nodes/batch/region", { node_ids: Array.from(selectedNodes), region_manual: target });
+    toast("{{ t["node.moved"] }}".replace("{0}", selectedNodes.size).replace("{1}", target));
+    clearSelection(); loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function batchPin() {
+  const target = document.getElementById("batch-target").value;
+  if (!target.startsWith("pin:") || selectedNodes.size === 0) {
+    toast("{{ t["node.pin_hint"] }}", "error"); return;
+  }
+  const serviceName = target.replace("pin:", "");
+  try {
+    await API.put("/api/nodes/batch/pin", { node_ids: Array.from(selectedNodes), service_name: serviceName, pinned: true });
+    toast("{{ t["node.pinned_to"] }}".replace("{0}", serviceName));
+    clearSelection(); loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function batchUnpin() {
+  if (selectedNodes.size === 0) return;
+  const service = prompt("{{ t["node.unpin_prompt"] }}");
+  if (service === null) return;
+  try {
+    for (const id of selectedNodes) {
+      const node = await API.get(`/api/nodes/${id}`);
+      const current = node.pinned_services || [];
+      const updated = service ? current.filter(s => s !== service) : [];
+      await API.put(`/api/nodes/${id}`, { pinned_services: updated });
+    }
+    toast("{{ t["node.unpinned"] }}".replace("{0}", selectedNodes.size));
+    clearSelection(); loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function pinToService(nodeId) {
+  const services = allServices.map(s => `${s.name}`).join("\n");
+  const name = prompt("{{ t["node.pin_prompt"] }}".replace("{0}", services));
+  if (!name) return;
+  try {
+    const node = await API.get(`/api/nodes/${nodeId}`);
+    const current = node.pinned_services || [];
+    if (!current.includes(name)) current.push(name);
+    await API.put(`/api/nodes/${nodeId}`, { pinned_services: current });
+    toast("{{ t["node.pinned_to"] }}".replace("{0}", name));
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function autoAssign() {
+  try {
+    toast("{{ t["node.assigning"] }}");
+    const result = await API.post("/api/nodes/auto-assign");
+    toast("{{ t["node.assigned"] }}".replace("{0}", result.assigned));
+    loadData();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function init() {
+  await loadFilters();
+  await loadData();
+}
+init();
+</script>
+{% endblock %}

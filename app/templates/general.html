@@ -1,0 +1,248 @@
+{% extends "base.html" %}
+{% block title %}{{ t["general.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["general.title"] }}</h1>
+  <div style="display:flex;gap:8px;align-items:center;">
+    <label style="font-size:13px;color:var(--text2);">{{ t["general.profile"] }}</label>
+    <select id="profile-select" onchange="loadValues()" style="width:160px;"></select>
+    <button class="btn btn-primary" onclick="saveAll()">{{ t["btn.save"] }}</button>
+  </div>
+</div>
+
+<div id="groups-container"></div>
+
+<details style="margin-top:16px;">
+  <summary style="cursor:pointer;font-size:13px;color:var(--primary);">{{ t["general.json_override"] }}</summary>
+  <div class="card" style="margin-top:8px;">
+    <div class="form-group" style="margin-bottom:0;">
+      <textarea id="custom-json" rows="4" placeholder='{"key": "value"}'></textarea>
+      <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["general.json_hint"] }}</p>
+    </div>
+  </div>
+</details>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let fieldMeta = [];
+let currentLocale = "{{ locale }}";
+
+function label(f) {
+  return currentLocale === "en" ? (f.label_en || f.label_zh) : f.label_zh;
+}
+
+function hint(f) {
+  return currentLocale === "en" ? (f.hint_en || f.hint_zh) : f.hint_zh;
+}
+
+function optLabel(opt) {
+  return currentLocale === "en" ? (opt.label_en || opt.label_zh) : opt.label_zh;
+}
+
+function groupTitle(g) {
+  return currentLocale === "en" ? (g.label_en || g.label_zh) : g.label_zh;
+}
+
+async function loadFields() {
+  try {
+    fieldMeta = await API.get("/api/general/fields");
+    renderForm();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderForm() {
+  const container = document.getElementById("groups-container");
+  container.innerHTML = fieldMeta.map(g => {
+    const groupId = `group-${g.key}`;
+    return `
+    <div class="card gen-section">
+      <div class="card-header" style="cursor:pointer;" onclick="toggleGroup('${groupId}')">
+        <h3 class="gen-card-title">${groupTitle(g)}</h3>
+        <span class="gen-toggle" id="${groupId}-arrow">▼</span>
+      </div>
+      <div id="${groupId}-body">
+        <div class="gen-grid">
+          ${g.fields.map(f => renderField(f)).join("")}
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderField(f) {
+  const id = `field-${f.key}`;
+  const hintText = hint(f) ? `<p class="gen-hint">${hint(f)}</p>` : "";
+
+  if (f.type === "bool") {
+    return `
+    <div class="gen-field">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <label class="toggle-wrap">
+        <input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool">
+        <span class="toggle-slider"></span>
+      </label>
+      ${hintText}
+    </div>`;
+  }
+
+  if (f.type === "select") {
+    const opts = f.options.map(o =>
+      `<option value="${o.value}">${optLabel(o)}</option>`
+    ).join("");
+    return `
+    <div class="gen-field">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <select id="${id}" data-key="${f.key}" data-type="select">${opts}</select>
+      ${hintText}
+    </div>`;
+  }
+
+  if (f.type === "tags") {
+    return `
+    <div class="gen-field gen-field-wide">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <div class="tags-input-wrap">
+        <textarea id="${id}" data-key="${f.key}" data-type="tags" rows="2"
+          placeholder="${hint(f) || '{{ t["general.tags_placeholder"] }}'}"></textarea>
+      </div>
+      ${hintText}
+    </div>`;
+  }
+
+  if (f.type === "int") {
+    return `
+    <div class="gen-field">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <input type="number" id="${id}" data-key="${f.key}" data-type="int">
+      ${hintText}
+    </div>`;
+  }
+
+  // text
+  return `
+  <div class="gen-field${f.key.includes("url") || f.key.includes("skip") ? " gen-field-wide" : ""}">
+    <label class="gen-label" for="${id}">${label(f)}</label>
+    <input type="text" id="${id}" data-key="${f.key}" data-type="text">
+    ${hintText}
+  </div>`;
+}
+
+function toggleGroup(groupId) {
+  const body = document.getElementById(`${groupId}-body`);
+  const arrow = document.getElementById(`${groupId}-arrow`);
+  if (body.style.display === "none") {
+    body.style.display = "";
+    arrow.textContent = "▼";
+  } else {
+    body.style.display = "none";
+    arrow.textContent = "▶";
+  }
+}
+
+async function loadProfiles() {
+  try {
+    const profiles = await API.get("/api/configs/profiles");
+    const select = document.getElementById("profile-select");
+    select.innerHTML = "";
+    profiles.forEach(p => {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `${p.name}${p.is_default ? " {{ t["msg.default"] }}" : ""}`;
+      select.appendChild(opt);
+    });
+  } catch (e) { /* ignore */ }
+}
+
+async function loadValues() {
+  const profileId = document.getElementById("profile-select").value;
+  try {
+    const data = await API.get(`/api/general/values?profile_id=${profileId}`);
+    fillForm(data.values);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function fillForm(values) {
+  document.querySelectorAll("[data-key]").forEach(el => {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+    const val = values[key];
+
+    if (type === "bool") {
+      el.checked = bool(val);
+    } else if (type === "tags") {
+      if (typeof val === "string" && val) {
+        el.value = val.split(",").map(s => s.trim()).join("\n");
+      } else {
+        el.value = "";
+      }
+    } else if (type === "int") {
+      el.value = val ?? "";
+    } else if (type === "select") {
+      el.value = val ?? "";
+    } else {
+      el.value = val ?? "";
+    }
+  });
+}
+
+function bool(v) {
+  if (v === true || v === "true") return true;
+  return false;
+}
+
+function collectValues() {
+  const values = {};
+  document.querySelectorAll("[data-key]").forEach(el => {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+
+    if (type === "bool") {
+      values[key] = el.checked;
+    } else if (type === "tags") {
+      const raw = el.value.trim();
+      if (raw) {
+        values[key] = raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean).join(", ");
+      }
+    } else if (type === "int") {
+      const n = parseInt(el.value);
+      if (!isNaN(n)) values[key] = n;
+    } else {
+      values[key] = el.value;
+    }
+  });
+
+  const jsonStr = document.getElementById("custom-json").value.trim();
+  if (jsonStr) {
+    try {
+      const custom = JSON.parse(jsonStr);
+      Object.assign(values, custom);
+    } catch {
+      toast("{{ t["general.json_error"] }}", "error");
+      return null;
+    }
+  }
+  return values;
+}
+
+async function saveAll() {
+  const profileId = parseInt(document.getElementById("profile-select").value);
+  if (!profileId) { toast("{{ t["general.select_profile"] }}", "error"); return; }
+
+  const values = collectValues();
+  if (!values) return;
+
+  try {
+    await API.put(`/api/general/values?profile_id=${profileId}`, values);
+    toast("{{ t["msg.saved"] }}");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function init() {
+  await loadProfiles();
+  await loadFields();
+  await loadValues();
+}
+init();
+</script>
+{% endblock %}

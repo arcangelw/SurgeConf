@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block title %}{{ t["sub.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["sub.title"] }}</h1>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-primary" onclick="showAddModal()">{{ t["btn.add"] }}</button>
+    <button class="btn btn-success" onclick="syncAll()">{{ t["btn.sync_all"] }}</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>{{ t["sub.name"] }}</th>
+          <th>{{ t["sub.tag"] }}</th>
+          <th>{{ t["sub.url"] }}</th>
+          <th>{{ t["sub.status"] }}</th>
+          <th>{{ t["sub.last_update"] }}</th>
+          <th>{{ t["sub.status"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="sub-list"></tbody>
+    </table>
+  </div>
+  <div id="empty-state" class="empty" style="display:none;">
+    <div class="icon">🔗</div>
+    <p>{{ t["sub.empty"] }}</p>
+  </div>
+</div>
+
+<div class="modal-overlay" id="sub-modal">
+  <div class="modal">
+    <h3 id="modal-title">{{ t["btn.add"] }}</h3>
+    <input type="hidden" id="edit-id">
+    <div class="form-group">
+      <label>{{ t["sub.name"] }}</label>
+      <input type="text" id="sub-name" placeholder="例：机场A">
+    </div>
+    <div style="display:flex;gap:12px;">
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["sub.tag"] }}</label>
+        <input type="text" id="sub-tag" placeholder="例：主力">
+      </div>
+      <div class="form-group" style="width:100px;">
+        <label>{{ t["sub.color"] }}</label>
+        <input type="color" id="sub-color" value="#6c5ce7" style="height:36px;padding:2px;">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["sub.url"] }}</label>
+      <input type="url" id="sub-url" placeholder="https://...">
+    </div>
+    <div style="display:flex;gap:16px;">
+      <div class="form-group">
+        <label class="checkbox"><input type="checkbox" id="sub-enabled" checked> {{ t["sub.enabled"] }}</label>
+      </div>
+      <div class="form-group">
+        <label class="checkbox"><input type="checkbox" id="sub-auto-update" checked> {{ t["sub.auto_update"] }}</label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["sub.interval"] }}</label>
+      <input type="number" id="sub-interval" value="86400">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('sub-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveSubscription()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadList() {
+  try {
+    const subs = await API.get("/api/subscriptions");
+    const tbody = document.getElementById("sub-list");
+    const empty = document.getElementById("empty-state");
+
+    if (subs.length === 0) {
+      tbody.innerHTML = "";
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+
+    tbody.innerHTML = subs.map(s => `
+      <tr>
+        <td>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="width:10px;height:10px;border-radius:50%;background:${s.color};flex-shrink:0;"></span>
+            <strong>${escapeHtml(s.name)}</strong>
+          </div>
+        </td>
+        <td>
+          ${s.tag ? `<span class="badge" style="background:${s.color}22;color:${s.color};border:1px solid ${s.color}44;">${escapeHtml(s.tag)}</span>` : '<span style="color:var(--text2);">-</span>'}
+        </td>
+        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+          <span title="${escapeHtml(s.url)}" style="font-size:12px;color:var(--text2);">${escapeHtml(s.url)}</span>
+        </td>
+        <td><span class="badge ${s.enabled ? 'badge-success' : 'badge-danger'}">${s.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
+        <td style="color:var(--text2);font-size:12px;">${s.last_update || '{{ t["sub.not_synced"] }}'}</td>
+        <td>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-sm btn-outline" onclick="syncOne(${s.id})">{{ t["btn.sync"] }}</button>
+            <button class="btn btn-sm btn-outline" onclick='editSub(${JSON.stringify(s)})'>{{ t["btn.edit"] }}</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteSub(${s.id}, '${escapeHtml(s.name)}')">{{ t["btn.delete"] }}</button>
+          </div>
+        </td>
+      </tr>
+    `).join("");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+function showAddModal() {
+  document.getElementById("modal-title").textContent = "{{ t["btn.add"] }}";
+  document.getElementById("edit-id").value = "";
+  document.getElementById("sub-name").value = "";
+  document.getElementById("sub-tag").value = "";
+  document.getElementById("sub-color").value = "#6c5ce7";
+  document.getElementById("sub-url").value = "";
+  document.getElementById("sub-enabled").checked = true;
+  document.getElementById("sub-auto-update").checked = true;
+  document.getElementById("sub-interval").value = 86400;
+  showModal("sub-modal");
+}
+
+function editSub(s) {
+  document.getElementById("modal-title").textContent = "{{ t["btn.edit"] }}";
+  document.getElementById("edit-id").value = s.id;
+  document.getElementById("sub-name").value = s.name;
+  document.getElementById("sub-tag").value = s.tag || "";
+  document.getElementById("sub-color").value = s.color || "#6c5ce7";
+  document.getElementById("sub-url").value = s.url;
+  document.getElementById("sub-enabled").checked = s.enabled;
+  showModal("sub-modal");
+}
+
+async function saveSubscription() {
+  const id = document.getElementById("edit-id").value;
+  const data = {
+    name: document.getElementById("sub-name").value,
+    tag: document.getElementById("sub-tag").value || null,
+    color: document.getElementById("sub-color").value,
+    url: document.getElementById("sub-url").value,
+    enabled: document.getElementById("sub-enabled").checked,
+    auto_update: document.getElementById("sub-auto-update").checked,
+    update_interval: parseInt(document.getElementById("sub-interval").value) || 86400,
+  };
+
+  try {
+    if (id) {
+      await API.put(`/api/subscriptions/${id}`, data);
+      toast("{{ t["msg.updated"] }}");
+    } else {
+      await API.post("/api/subscriptions", data);
+      toast("{{ t["msg.added"] }}");
+    }
+    hideModal("sub-modal");
+    loadList();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function syncOne(id) {
+  try {
+    toast("{{ t["sub.syncing"] }}");
+    const result = await API.post(`/api/subscriptions/${id}/sync`);
+    toast("{{ t["sub.sync_done"] }}".replace("{0}", result.subscription).replace("{1}", result.node_count));
+    loadList();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function syncAll() {
+  try {
+    toast("{{ t["sub.sync_all_msg"] }}");
+    const result = await API.post("/api/subscriptions/sync-all");
+    toast("{{ t["sub.sync_all_done"] }}".replace("{0}", result.results.length));
+    loadList();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteSub(id, name) {
+  if (!confirm("{{ t["sub.confirm_delete"] }}".replace("{0}", name))) return;
+  try {
+    await API.del(`/api/subscriptions/${id}`);
+    toast("{{ t["msg.deleted"] }}");
+    loadList();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+loadList();
+</script>
+{% endblock %}
