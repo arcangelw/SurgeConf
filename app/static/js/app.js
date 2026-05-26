@@ -70,6 +70,18 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+/** 翻译名称：在 LOCALE_NAMES 存在时（英文模式）翻译中文组名 */
+function translateName(name) {
+  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
+    if (name.endsWith("手动")) {
+      const region = name.slice(0, -2);
+      return (LOCALE_NAMES[region] || region) + " Manual";
+    }
+    return LOCALE_NAMES[name] || name;
+  }
+  return name;
+}
+
 /** 侧边栏导航高亮 */
 document.addEventListener("DOMContentLoaded", () => {
   const path = window.location.pathname;

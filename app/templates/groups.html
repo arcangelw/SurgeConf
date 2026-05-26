@@ -148,18 +148,6 @@ const VIRT_LABELS = {
   "大陆直连": "{{ t["group.virt.mainland"] }}",
 };
 
-function translateName(name) {
-  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
-    if (name.endsWith("手动")) {
-      const region = name.slice(0, -2);
-      const enRegion = LOCALE_NAMES[region] || region;
-      return enRegion + " Manual";
-    }
-    return LOCALE_NAMES[name] || name;
-  }
-  return name;
-}
-
 function getAvailableGroups() {
   const virtual = [
     { name: "DIRECT", label: "DIRECT", type: "system" },

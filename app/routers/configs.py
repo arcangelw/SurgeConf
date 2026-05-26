@@ -217,10 +217,10 @@ async def generate_config(
 ):
     content = await generate_surge_config(db, profile_id, locale)
 
-    # 保存到 data 目录
+    # 保存到 data 目录（过滤路径遍历）
     output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     os.makedirs(output_dir, exist_ok=True)
-    save_name = filename or "Surge.conf"
+    save_name = (filename or "Surge.conf").replace("/", "").replace("\\", "").replace("..", "")
     output_path = os.path.join(output_dir, save_name)
     with open(output_path, "w") as f:
         f.write(content)

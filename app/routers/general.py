@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.database import get_db
 from app.models import ConfigProfile
 from app.general_fields import GENERAL_GROUPS
+from app.default_config import DEFAULT_GENERAL
 
 router = APIRouter(prefix="/api/general", tags=["General 设置"])
 
@@ -40,8 +41,6 @@ async def get_fields():
 @router.get("/values")
 async def get_values(profile_id: int | None = None, db: AsyncSession = Depends(get_db)):
     """返回当前生效的 General 值"""
-    from app.default_config import DEFAULT_GENERAL
-
     profile = None
     if profile_id:
         result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))

@@ -4,7 +4,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from pydantic import BaseModel
-from datetime import datetime
 from typing import Optional
 
 from app.database import get_db
@@ -84,7 +83,6 @@ async def update_subscription(sub_id: int, data: SubscriptionUpdate, db: AsyncSe
     update_data = data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(sub, key, value)
-    sub.updated_at = datetime.now()
     await db.commit()
     return {"id": sub.id, "name": sub.name}
 

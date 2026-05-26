@@ -8,15 +8,43 @@ Surge 配置管理工具 — 提供 Web 界面管理 Surge 配置文件，支持
 
 ## 快速开始
 
+### 前置要求
+
+- Python 3.10+
+
+#### 方式 A：使用 mise（推荐）
+
+[mise](https://mise.jdx.dev) 自动管理 Python 版本，进入项目目录即生效：
+
 ```bash
-# 开发模式（热重载）
+mise install python@3.13
+cd SurgeConf  # 自动读取 .mise.toml 切换版本
+```
+
+#### 方式 B：不使用 mise
+
+确保系统已安装 Python 3.10+：
+
+```bash
+python3 --version  # 确认 >= 3.10
+```
+
+### 克隆并启动
+
+```bash
+# 克隆项目
+git clone https://github.com/arcangelw/SurgeConf.git
+cd SurgeConf
+
+# 方式一：一步到位（自动创建 venv + 安装依赖 + 启动）
 ./start.sh
 
-# 或使用管理脚本
+# 方式二：使用管理脚本（自动创建 venv + 前台运行）
 ./surgeconf.sh run
 
-# 守护模式（后台运行）
-./surgeconf.sh start
+# 方式三：守护模式（后台运行，需先启动一次以创建 venv）
+./start.sh                # 首次运行自动创建 venv
+./surgeconf.sh start      # launchd 后台运行
 ```
 
 访问 http://127.0.0.1:61830
@@ -73,10 +101,24 @@ Surge 配置管理工具 — 提供 Web 界面管理 Surge 配置文件，支持
 |------|--------|------|
 | `SURGE_HOST` | `127.0.0.1` | 监听地址 |
 | `SURGE_PORT` | `61830` | 监听端口 |
+| `SURGE_API_TOKEN` | — | API 认证 Token（留空不启用认证） |
+| `SURGE_CONTROLLER_ACCESS` | `arcangelw@0.0.0.0:6160` | Surge 外部控制器访问凭据 |
+| `SURGE_HTTP_API` | `arcangelw@0.0.0.0:6166` | Surge HTTP API 访问凭据 |
 
 ## API 文档
 
 http://127.0.0.1:61830/docs
+
+## API 认证
+
+默认情况下所有 API 无需认证即可访问。如需保护 API 端点，设置环境变量即可启用 Bearer Token 认证：
+
+```bash
+export SURGE_API_TOKEN=your_token_here
+./surgeconf.sh run
+```
+
+启用后，API 请求需要携带 `Authorization: Bearer your_token_here` 头，页面和静态资源不受影响。
 
 ---
 

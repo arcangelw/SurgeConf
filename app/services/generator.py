@@ -8,7 +8,10 @@ from app.models import (
     ConfigProfile, RuleSource, Subscription,
     CustomRule, HostMapping,
 )
-from app.default_config import DEFAULT_GENERAL, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
+from app.default_config import DEFAULT_GENERAL, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
+
+# 节点名称过滤关键词（与 subscription.py 同步）
+FILTER_PATTERN = r"Remain|Expired|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量"
 
 
 def _quote(name: str) -> str:
@@ -146,7 +149,6 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # URL Rewrite
     sections.append("[URL Rewrite]")
-    from app.default_config import DEFAULT_URL_REWRITES
     rewrites = profile.url_rewrites if (profile and profile.url_rewrites) else DEFAULT_URL_REWRITES
     for rule in rewrites:
         sections.append(rule)
@@ -154,7 +156,6 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # Header Rewrite
     sections.append("[Header Rewrite]")
-    from app.default_config import DEFAULT_HEADER_REWRITES
     header_rewrites = profile.header_rewrites if (profile and profile.header_rewrites) else DEFAULT_HEADER_REWRITES
     for rule in header_rewrites:
         sections.append(rule)
@@ -162,7 +163,6 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # MITM
     sections.append("[MITM]")
-    from app.default_config import DEFAULT_MITM
     mitm = {**DEFAULT_MITM, **(profile.mitm or {})} if profile else DEFAULT_MITM
     for key, value in mitm.items():
         if isinstance(value, bool):
@@ -171,7 +171,6 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
             sections.append(f"{key} = {value}")
     sections.append("")
 
-    sections.append("[Script]")
     return "\n".join(sections)
 
 
@@ -185,7 +184,7 @@ def _build_proxy_groups(
     lines = []
 
     # 全部节点组
-    sub_filter = "^((?!Remain|Expired|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量).)+$"
+    sub_filter = f"^((?!{FILTER_PATTERN}).)+$"
     lines.append(
         f'{_quote(t("全部节点"))} = select, '
         f'policy-regex-filter={sub_filter}, '
@@ -214,7 +213,7 @@ def _build_proxy_groups(
     # 其他地区（自动）— 仅在有自动地区时生成
     if auto_regions:
         all_filters = "|".join(rg.filter_regex for rg in active_regions)
-        other_filter = f"^((?!{all_filters}|Remain|Expired|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量).)+$"
+        other_filter = f"^((?!{all_filters}|{FILTER_PATTERN}).)+$"
         lines.append(
             f'{_quote(t("其他"))} = url-test, '
             f'policy-regex-filter={other_filter}, '

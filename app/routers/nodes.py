@@ -81,7 +81,8 @@ async def list_nodes(
     if unassigned:
         query = query.where(ProxyNode.region_manual == None, ProxyNode.region_auto == None)
     if pinned_to:
-        query = query.where(ProxyNode.pinned_services.contains(f'["{pinned_to}"]'))
+        import json
+        query = query.where(ProxyNode.pinned_services.contains(json.dumps(pinned_to)))
 
     query = query.order_by(ProxyNode.name)
     result = await db.execute(query)

@@ -2,12 +2,15 @@
 
 import re
 import base64
+import logging
 import httpx
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from app.models import Subscription, ProxyNode
+
+logger = logging.getLogger(__name__)
 
 
 # 节点名称中需要过滤的关键词
@@ -86,8 +89,8 @@ def _parse_uri(uri: str) -> dict | None:
             return _parse_hysteria2(rest, name)
         elif scheme == "tuic":
             return _parse_tuic(rest, name)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("解析节点失败 [%s]: %s", name, e)
 
     return None
 
@@ -124,7 +127,10 @@ def _parse_ss(rest: str, name: str) -> dict | None:
     try:
         if "@" in rest:
             encoded, host_port = rest.split("@", 1)
-            decoded = base64.b64decode(encoded + "==").decode()
+            padding = 4 - len(encoded) % 4
+            if padding != 4:
+                encoded += "=" * padding
+            decoded = base64.b64decode(encoded).decode()
             method, password = decoded.split(":", 1)
         else:
             return None
@@ -146,7 +152,12 @@ def _parse_ss(rest: str, name: str) -> dict | None:
 def _parse_vmess(rest: str, name: str) -> dict | None:
     """解析 VMess URI"""
     try:
-        decoded = base64.b64decode(rest + "==").decode()
+        padding = 4 - len(rest) % 4
+        if padding != 4:
+            rest_padded = rest + "=" * padding
+        else:
+            rest_padded = rest
+        decoded = base64.b64decode(rest_padded).decode()
         import json
         info = json.loads(decoded)
 
@@ -224,7 +235,9 @@ def _parse_tuic(rest: str, name: str) -> dict | None:
             password = ""
 
         sni = params.get("sni", host)
-        config = f"{name} = tuic, {host}, {port}, uuid={uuid}, password={password}, sni={sni}"
+        config = f"{name} = tuic, {host}, {port}, uuid={uuid}, sni={sni}"
+        if password:
+            config += f", password={password}"
 
         return {"name": name, "node_type": "tuic", "server": host, "port": port, "config": config}
     except Exception:
@@ -256,8 +269,35 @@ def parse_subscription_content(content: str) -> list[dict]:
     return nodes
 
 
+def _validate_url(url: str) -> str:
+    """验证 URL 防止 SSRF，只允许 http/https 协议和常见代理订阅域名"""
+    import urllib.parse
+    import ipaddress
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"不支持的协议: {parsed.scheme}")
+    host = parsed.hostname or ""
+
+    # 禁止内网域名
+    if host in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+        raise ValueError("不允许的地址: 内网地址")
+
+    # 尝试 IP 检测
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return url  # 域名而非 IP，放行
+
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+        raise ValueError("不允许的地址: 内网/保留地址")
+
+    return url
+
+
 async def fetch_subscription(sub: Subscription) -> list[dict]:
     """拉取订阅链接并解析节点"""
+    _validate_url(sub.url)
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(sub.url)
         resp.raise_for_status()

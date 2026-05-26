@@ -20,6 +20,10 @@ case "${1:-help}" in
     echo "SurgeConf 已重启"
     ;;
   run)
+    if [ ! -d "$PROJECT_DIR/venv" ]; then
+      echo "首次运行，正在创建虚拟环境..."
+      cd "$PROJECT_DIR" && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+    fi
     echo "SurgeConf 独立启动中 (前台模式)..."
     echo "访问地址: http://127.0.0.1:61830/"
     cd "$PROJECT_DIR" && exec "$PROJECT_DIR/venv/bin/python" -m uvicorn app.main:app \

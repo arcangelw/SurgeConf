@@ -1,5 +1,10 @@
 """默认数据种子 - 中文命名，arcangelw 控制器"""
 
+# 控制器凭据可通过环境变量覆盖
+import os as _os
+_CONTROLLER_ACCESS = _os.environ.get("SURGE_CONTROLLER_ACCESS") or "arcangelw@0.0.0.0:6160"
+_HTTP_API = _os.environ.get("SURGE_HTTP_API") or "arcangelw@0.0.0.0:6166"
+
 # 完整的中英文名称映射表
 # 数据库中统一存储中文名（左侧），生成英文配置时替换为右侧
 LOCALE_NAMES = {
@@ -316,8 +321,8 @@ DEFAULT_GENERAL = {
     "http-listen": "0.0.0.0",
     "socks5-listen": "0.0.0.0",
     "allow-hotspot-access": True,
-    "external-controller-access": "arcangelw@0.0.0.0:6160",
-    "http-api": "arcangelw@0.0.0.0:6166",
+    "external-controller-access": _CONTROLLER_ACCESS,
+    "http-api": _HTTP_API,
     "http-api-tls": True,
     "http-api-web-dashboard": True,
     "compatibility-mode": 1,

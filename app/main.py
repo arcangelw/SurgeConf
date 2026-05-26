@@ -6,9 +6,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.database import init_db
+from app.database import init_db, DB_PATH
 from app.models import RegionGroup, ServiceGroup, RuleSource, ConfigProfile, CustomRule, HostMapping
 from app.default_config import (
     DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
@@ -94,6 +94,26 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# 可选的静态 API Token 认证（通过环境变量 SURGE_API_TOKEN 启用）
+_API_TOKEN = os.environ.get("SURGE_API_TOKEN") or ""
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if _API_TOKEN:
+        # 跳过静态文件和页面路由的认证
+        path = request.url.path
+        if path.startswith("/static/") or path in ("/", "/subscriptions", "/nodes", "/groups",
+                                                     "/rules", "/profiles", "/generator",
+                                                     "/general", "/settings", "/api/settings/locale",
+                                                     "/docs", "/openapi.json"):
+            return await call_next(request)
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {_API_TOKEN}":
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
 
 app.include_router(subscriptions.router)
 app.include_router(nodes.router)
@@ -182,7 +202,6 @@ async def set_locale(request: Request):
 @app.post("/api/settings/reset")
 async def reset_data():
     """重置所有数据：删除数据库文件并重新初始化"""
-    import os
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     await init_db()

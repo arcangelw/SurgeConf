@@ -157,17 +157,6 @@ const RULE_TYPE_LABELS = {
   "PROTOCOL": "{{ t["rule.value_protocol"] }}",
 };
 
-function profileTranslateName(name) {
-  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
-    if (name.endsWith("手动")) {
-      const region = name.slice(0, -2);
-      return (LOCALE_NAMES[region] || region) + " Manual";
-    }
-    return LOCALE_NAMES[name] || name;
-  }
-  return name;
-}
-
 function buildProfileActionOptions(selectedValue) {
   const parts = [];
   const sysActions = ["DIRECT", "REJECT", "REJECT-DROP", "REJECT-NO-DROP"];
@@ -186,20 +175,20 @@ function buildProfileActionOptions(selectedValue) {
   if (profileServices.length > 0) {
     parts.push('<optgroup label="{{ t["rule.action_service"] }}">');
     for (const s of profileServices) {
-      parts.push(`<option value="${escapeHtml(s.name)}" ${s.name === selectedValue ? 'selected' : ''}>${escapeHtml(profileTranslateName(s.name))}</option>`);
+      parts.push(`<option value="${escapeHtml(s.name)}" ${s.name === selectedValue ? 'selected' : ''}>${escapeHtml(translateName(s.name))}</option>`);
     }
     parts.push('</optgroup>');
   }
   if (profileRegions.length > 0) {
     parts.push('<optgroup label="{{ t["rule.action_region_auto"] }}">');
     for (const r of profileRegions) {
-      parts.push(`<option value="${escapeHtml(r.name)}" ${r.name === selectedValue ? 'selected' : ''}>${escapeHtml(profileTranslateName(r.name))}</option>`);
+      parts.push(`<option value="${escapeHtml(r.name)}" ${r.name === selectedValue ? 'selected' : ''}>${escapeHtml(translateName(r.name))}</option>`);
     }
     parts.push('</optgroup>');
     parts.push('<optgroup label="{{ t["rule.action_region_manual"] }}">');
     for (const r of profileRegions) {
       const manName = r.name + "手动";
-      parts.push(`<option value="${escapeHtml(manName)}" ${manName === selectedValue ? 'selected' : ''}>${escapeHtml(profileTranslateName(r.name))} Manual</option>`);
+      parts.push(`<option value="${escapeHtml(manName)}" ${manName === selectedValue ? 'selected' : ''}>${escapeHtml(translateName(r.name))} Manual</option>`);
     }
     parts.push('</optgroup>');
   }

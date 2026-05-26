@@ -278,17 +278,6 @@ const CATEGORY_MAP = {
   lan: "{{ t["rule.cat.lan"] }}",
 };
 
-function translateName(name) {
-  if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
-    if (name.endsWith("手动")) {
-      const region = name.slice(0, -2);
-      return (LOCALE_NAMES[region] || region) + " Manual";
-    }
-    return LOCALE_NAMES[name] || name;
-  }
-  return name;
-}
-
 function displayAction(name) {
   return VIRT_LABELS[name] || translateName(name);
 }
@@ -483,7 +472,32 @@ async function resetDefaultOrder() {
   if (!confirm("{{ t["rule.confirm_reset"] }}")) return;
   try {
     const rules = await API.get("/api/configs/rules");
-    const updates = rules.map((r, i) => ({ id: r.id, sort_order: r.sort_order }));
+    const defaultOrder = [
+      "Unbreak", "Reject DomainSet", "Reject-Drop (non_ip)", "Reject (non_ip)", "Reject (ip)",
+      "WeChat", "NetEaseMusic (non_ip)", "NetEaseMusic (ip)", "Bilibili", "Weibo", "XiaoHongShu",
+      "AppStore", "AppleNews", "Apple CDN", "AppleTV", "Apple",
+      "GitHub",
+      "OpenAI", "Claude", "Gemini", "Bing", "AI 综合", "AI 兜底",
+      "Google",
+      "Disney+", "Netflix", "TikTok", "YouTube", "Emby",
+      "Stream US (non_ip)", "Stream US (ip)", "Stream EU (non_ip)", "Stream EU (ip)",
+      "Stream JP (non_ip)", "Stream JP (ip)", "Stream KR (non_ip)", "Stream KR (ip)",
+      "Stream HK (non_ip)", "Stream HK (ip)", "Stream TW (non_ip)", "Stream TW (ip)",
+      "Twitter", "Telegram (non_ip)", "Telegram (ip)", "Telegram ASN",
+      "Facebook", "Instagram", "Threads", "Discord",
+      "OneDrive", "Microsoft", "Speedtest", "Riot",
+      "Direct", "Domestic (non_ip)", "Domestic (ip)", "ChinaMax", "ASN China",
+      "Download (domainset)", "Download (non_ip)",
+      "CDN (domainset)", "CDN (non_ip)", "Global Plus", "Global",
+      "LAN",
+    ];
+    const updates = rules
+      .filter(r => defaultOrder.includes(r.name))
+      .map(r => ({ id: r.id, sort_order: defaultOrder.indexOf(r.name) }))
+      .concat(
+        rules.filter(r => !defaultOrder.includes(r.name))
+          .map((r, i) => ({ id: r.id, sort_order: defaultOrder.length + i }))
+      );
     await API.put("/api/configs/rules/reorder", updates);
     toast("{{ t["rule.reset_done"] }}");
     loadData();

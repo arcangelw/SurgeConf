@@ -1,13 +1,28 @@
 """策略分组管理 API"""
 
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional
 
 from app.database import get_db
 from app.models import RegionGroup, ServiceGroup
+
+_RE_DOS_LIMIT = 200
+
+
+def _validate_regex(v: str | None) -> str | None:
+    if not v:
+        return v
+    if len(v) > _RE_DOS_LIMIT:
+        raise ValueError(f"正则表达式过长（最大 {_RE_DOS_LIMIT} 字符）")
+    try:
+        re.compile(v)
+    except re.error as e:
+        raise ValueError(f"正则表达式无效: {e}")
+    return v
 
 router = APIRouter(prefix="/api/groups", tags=["策略分组"])
 
@@ -23,6 +38,8 @@ class RegionGroupCreate(BaseModel):
     auto_enabled: bool = True
     manual_enabled: bool = True
 
+    _validate_regex = field_validator("filter_regex")(_validate_regex)
+
 
 class RegionGroupUpdate(BaseModel):
     name: Optional[str] = None
@@ -33,6 +50,8 @@ class RegionGroupUpdate(BaseModel):
     enabled: Optional[bool] = None
     auto_enabled: Optional[bool] = None
     manual_enabled: Optional[bool] = None
+
+    _validate_regex = field_validator("filter_regex")(_validate_regex)
 
 
 @router.get("/regions")
