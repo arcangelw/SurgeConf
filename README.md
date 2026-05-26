@@ -99,11 +99,13 @@ cd SurgeConf
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SURGE_HOST` | `127.0.0.1` | 监听地址 |
+| `SURGE_HOST` | `127.0.0.1` | 监听地址（前台运行）；开机自启（plist）固定为 `0.0.0.0` 以支持局域网访问 |
 | `SURGE_PORT` | `61830` | 监听端口 |
 | `SURGE_API_TOKEN` | — | API 认证 Token（留空不启用认证） |
 | `SURGE_CONTROLLER_ACCESS` | `arcangelw@0.0.0.0:6160` | Surge 外部控制器访问凭据 |
 | `SURGE_HTTP_API` | `arcangelw@0.0.0.0:6166` | Surge HTTP API 访问凭据 |
+
+> 监听地址说明：前台运行（`run`）默认 `127.0.0.1` 仅本机访问；注册开机自启（`enable`）生成的 plist 中固定使用 `0.0.0.0` 以支持局域网访问。如需在前台运行时也暴露到局域网：`SURGE_HOST=0.0.0.0 ./surgeconf.sh run`。
 
 ## API 文档
 

@@ -2,6 +2,8 @@
 # SurgeConf 服务管理脚本
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SURGE_HOST="${SURGE_HOST:-127.0.0.1}"
+SURGE_PORT="${SURGE_PORT:-61830}"
 PLIST="$HOME/Library/LaunchAgents/com.surgeconf.plist"
 
 case "${1:-help}" in
@@ -25,9 +27,9 @@ case "${1:-help}" in
       cd "$PROJECT_DIR" && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
     fi
     echo "SurgeConf 独立启动中 (前台模式)..."
-    echo "访问地址: http://127.0.0.1:61830/"
+    echo "访问地址: http://${SURGE_HOST}:${SURGE_PORT}/"
     cd "$PROJECT_DIR" && exec "$PROJECT_DIR/venv/bin/python" -m uvicorn app.main:app \
-      --host "${SURGE_HOST:-127.0.0.1}" --port "${SURGE_PORT:-61830}"
+      --host "${SURGE_HOST}" --port "${SURGE_PORT}"
     ;;
   enable)
     cat > "$PLIST" << EOF
@@ -52,9 +54,9 @@ case "${1:-help}" in
     <key>EnvironmentVariables</key>
     <dict>
         <key>SURGE_HOST</key>
-        <string>127.0.0.1</string>
+        <string>0.0.0.0</string>
         <key>SURGE_PORT</key>
-        <string>61830</string>
+        <string>${SURGE_PORT}</string>
     </dict>
 </dict>
 </plist>
@@ -72,7 +74,7 @@ EOF
       PID=$(launchctl list | grep com.surgeconf | awk '{print $1}')
       if [ "$PID" != "-" ]; then
         echo "SurgeConf 运行中 (PID: $PID)"
-        echo "访问地址: http://127.0.0.1:61830/"
+        echo "访问地址: http://${SURGE_HOST}:${SURGE_PORT}/"
       else
         echo "SurgeConf 已注册但未运行"
       fi
