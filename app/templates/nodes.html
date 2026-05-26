@@ -121,6 +121,7 @@ async function loadData() {
   if (subId) url += `subscription_id=${subId}&`;
 
   try {
+    showLoading();
     const nodes = await API.get(url);
     let filtered = nodes;
     if (pinned === "__none__") filtered = nodes.filter(n => !n.pinned_services || n.pinned_services.length === 0);
@@ -166,7 +167,9 @@ async function loadData() {
         </td>
       </tr>`;
     }).join("");
-  } catch (e) { toast(e.message, "error"); }
+      compactActions();
+    hideLoading();
+  } catch (e) { toast(e.message, "error"); hideLoading(); }
 }
 
 async function showDetail(nodeId) {

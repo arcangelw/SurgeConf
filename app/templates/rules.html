@@ -249,8 +249,6 @@ let allRules = [];
 let allRegions = [];
 let allServices = [];
 let allCustomRules = {pre: [], general: []};
-let dragRow = null;
-let dragType = null; // "rule" | "custom-pre" | "custom-general"
 
 const VIRT_LABELS = {
   "全部节点": "{{ t["group.virt.all_nodes"] }}",
@@ -352,6 +350,10 @@ async function loadData() {
     allRules = await API.get("/api/configs/rules");
     document.getElementById("rule-count").textContent = "{{ t["rule.total"] }}".replace("{0}", allRules.length);
     renderTable();
+    enableSortable("rule-list", (items) => {
+      allRules = items.map(item => allRules.find(r => r.id === item.id) || item);
+      saveReorder(items);
+    });
   } catch (e) { toast(e.message, "error"); }
 }
 
@@ -362,6 +364,14 @@ async function loadCustomRules() {
     allCustomRules.general = rules.filter(r => r.position === "general");
     renderCustomRuleTable("pre");
     renderCustomRuleTable("general");
+    enableSortable("pre-rule-list", (items) => {
+      allCustomRules.pre = items.map(item => allCustomRules.pre.find(r => r.id === item.id) || item);
+      saveCustomReorder(items);
+    });
+    enableSortable("general-rule-list", (items) => {
+      allCustomRules.general = items.map(item => allCustomRules.general.find(r => r.id === item.id) || item);
+      saveCustomReorder(items);
+    });
     document.getElementById("pre-count").textContent = "{{ t["rule.total"] }}".replace("{0}", allCustomRules.pre.length);
     document.getElementById("general-count").textContent = "{{ t["rule.total"] }}".replace("{0}", allCustomRules.general.length);
   } catch (e) { toast(e.message, "error"); }
@@ -370,9 +380,7 @@ async function loadCustomRules() {
 function renderTable() {
   const tbody = document.getElementById("rule-list");
   tbody.innerHTML = allRules.map((r, idx) => `
-    <tr draggable="true" data-idx="${idx}" data-id="${r.id}"
-        ondragstart="onDragStart(event,'rule')" ondragover="onDragOver(event)" ondrop="onDrop(event,'rule')"
-        style="cursor:grab;">
+    <tr data-id="${r.id}">
       <td style="cursor:grab;color:var(--text2);font-size:14px;">⠿</td>
       <td><strong>${escapeHtml(r.name)}</strong></td>
       <td><span class="badge badge-primary">${r.rule_type}</span></td>
@@ -387,15 +395,14 @@ function renderTable() {
       </td>
     </tr>
   `).join("");
+  compactActions();
 }
 
 function renderCustomRuleTable(position) {
   const rules = allCustomRules[position];
   const tbody = document.getElementById(position + "-rule-list");
   tbody.innerHTML = rules.map((r, idx) => `
-    <tr draggable="true" data-idx="${idx}" data-id="${r.id}"
-        ondragstart="onDragStart(event,'custom-${position}')" ondragover="onDragOver(event)" ondrop="onDrop(event,'custom-${position}')"
-        style="cursor:grab;">
+    <tr data-id="${r.id}">
       <td style="cursor:grab;color:var(--text2);font-size:14px;">⠿</td>
       <td><code style="font-size:12px;">${escapeHtml(r.rule_text)}</code></td>
       <td style="font-size:12px;color:var(--text2);">${escapeHtml(r.comment || '-')}</td>
@@ -407,51 +414,11 @@ function renderCustomRuleTable(position) {
       </td>
     </tr>
   `).join("");
+  compactActions();
 }
 
 function categoryLabel(cat) {
   return CATEGORY_MAP[cat] || cat || "-";
-}
-
-function onDragStart(e, type) {
-  dragRow = e.target.closest("tr");
-  dragType = type;
-  e.dataTransfer.effectAllowed = "move";
-  e.target.closest("tr").style.opacity = "0.4";
-}
-
-function onDragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-}
-
-function onDrop(e, type) {
-  e.preventDefault();
-  const targetRow = e.target.closest("tr");
-  if (!dragRow || !targetRow || dragRow === targetRow || dragType !== type) {
-    if (dragRow) dragRow.style.opacity = "";
-    return;
-  }
-
-  const fromIdx = parseInt(dragRow.dataset.idx);
-  const toIdx = parseInt(targetRow.dataset.idx);
-  dragRow.style.opacity = "";
-
-  if (type === "rule") {
-    const [moved] = allRules.splice(fromIdx, 1);
-    allRules.splice(toIdx, 0, moved);
-    const updates = allRules.map((r, i) => ({ id: r.id, sort_order: i }));
-    saveReorder(updates);
-    renderTable();
-  } else {
-    const position = type === "custom-pre" ? "pre" : "general";
-    const rules = allCustomRules[position];
-    const [moved] = rules.splice(fromIdx, 1);
-    rules.splice(toIdx, 0, moved);
-    const updates = rules.map((r, i) => ({ id: r.id, sort_order: i }));
-    saveCustomReorder(updates);
-    renderCustomRuleTable(position);
-  }
 }
 
 async function saveReorder(updates) {
@@ -727,6 +694,7 @@ async function loadHostMappings() {
         </td>
       </tr>
     `).join("");
+      compactActions();
   } catch (e) { toast(e.message, "error"); }
 }
 

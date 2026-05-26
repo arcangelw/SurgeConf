@@ -148,6 +148,7 @@ async function previewConfig() {
   if (locale) params.set("locale", locale);
   const url = "/api/configs/preview?" + params.toString();
   try {
+    showLoading();
     const result = await API.get(url);
     const sizeLabel = `${(result.size / 1024).toFixed(1)} KB`;
     document.getElementById("config-size").textContent = sizeLabel;
@@ -157,6 +158,8 @@ async function previewConfig() {
     document.body.style.overflow = "hidden";
   } catch (e) {
     toast(e.message, "error");
+  } finally {
+    hideLoading();
   }
 }
 
@@ -169,11 +172,19 @@ function downloadConfig() {
 
 function copySubscribeUrl() {
   const input = document.getElementById("subscribe-url");
+  input.select();
+  input.setSelectionRange(0, 99999);
+  // 先尝试同步 execCommand（HTTP 局域网环境可用，需在用户手势内执行）
+  try {
+    if (document.execCommand("copy")) {
+      toast("{{ t["generator.copied"] }}");
+      return;
+    }
+  } catch (e) {}
+  // 再尝试异步 Clipboard API（HTTPS 环境）
   navigator.clipboard.writeText(input.value).then(() => {
     toast("{{ t["generator.copied"] }}");
   }).catch(() => {
-    input.select();
-    document.execCommand("copy");
     toast("{{ t["generator.copied"] }}");
   });
 }

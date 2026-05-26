@@ -22,6 +22,19 @@ body {
   line-height: 1.6;
 }
 
+/* 汉堡菜单按钮（桌面端隐藏） */
+.hamburger { display: none; }
+
+/* 侧边栏遮罩（移动端） */
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 901;
+}
+.sidebar-overlay.show { display: block; }
+
 /* 布局 */
 .layout {
   display: flex;
@@ -246,7 +259,15 @@ textarea {
   align-items: center;
 }
 
-.modal-overlay.show { display: flex; }
+.modal-overlay.show {
+  display: flex;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 
 .modal {
   background: var(--surface);
@@ -257,6 +278,15 @@ textarea {
   max-height: 80vh;
   overflow-y: auto;
   padding: 24px;
+}
+
+.modal-overlay.show .modal {
+  animation: modalSlideUp 0.25s ease;
+}
+
+@keyframes modalSlideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .modal h3 {
@@ -579,6 +609,45 @@ textarea {
   accent-color: var(--primary);
 }
 
+/* 节点 table 中的复选框 - 触控优化 */
+.node-check,
+#select-all {
+  width: 20px;
+  height: 20px;
+  transform: scale(1.2);
+  cursor: pointer;
+}
+
+/* Loading 指示器 */
+.loading-spinner {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.3);
+  z-index: 2001;
+  justify-content: center;
+  align-items: center;
+}
+.loading-overlay.show { display: flex; }
+.loading-overlay .loading-spinner {
+  width: 36px;
+  height: 36px;
+  border-width: 3px;
+}
+
 
 .help-tip {
   position: relative;
@@ -627,4 +696,409 @@ textarea {
 .help-tip:hover::after {
   opacity: 1;
   visibility: visible;
+}
+
+/* ===== 响应式 / 移动端适配 ===== */
+/* ===== 移动端触屏优化 ===== */
+@media (max-width: 768px) {
+  .layout { flex-direction: column; }
+
+  .sidebar {
+    width: 100%;
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 48px;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    z-index: 903;
+    overflow: visible;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar .logo {
+    padding: 0;
+    font-size: 16px;
+    border-bottom: none;
+    margin-bottom: 0;
+    flex-shrink: 0;
+  }
+
+  .sidebar nav {
+    display: none;
+    position: fixed;
+    top: 48px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: var(--surface);
+    padding: 8px 0;
+    overflow-y: auto;
+    z-index: 902;
+  }
+
+  .sidebar nav.open { display: block; animation: slideDown 0.2s ease; }
+
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sidebar .nav-section { padding: 12px 16px 4px; }
+
+  .sidebar nav a { padding: 12px 16px; font-size: 15px; }
+
+  /* 汉堡菜单按钮 - 44x44 触控区域 */
+  .hamburger {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    gap: 5px;
+    width: 44px;
+    height: 44px;
+    margin-left: auto;
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .hamburger:active { opacity: 0.7; }
+
+  .hamburger span {
+    display: block;
+    width: 22px;
+    height: 2.5px;
+    background: var(--text);
+    border-radius: 2px;
+    transition: 0.25s;
+  }
+
+  .hamburger.open span:nth-child(1) { transform: rotate(45deg) translate(5px, 5px); }
+  .hamburger.open span:nth-child(2) { opacity: 0; }
+  .hamburger.open span:nth-child(3) { transform: rotate(-45deg) translate(5px, -5px); }
+
+  .main {
+    margin-left: 0;
+    padding: 60px 12px 20px;
+  }
+
+  /* 页面头部 */
+  .page-header {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .page-header h1 { font-size: 18px; }
+  .page-header .btn { min-height: 36px; }
+
+  /* 卡片 */
+  .card { padding: 14px; }
+
+  /* 卡片头部 */
+  .card-header {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .card-header h3 { font-size: 14px; }
+  .card-header > div:last-child .btn-sm {
+    min-height: 34px;
+  }
+
+  /* ===== 移动端表格 → 卡片列表 ===== */
+  table { font-size: 12px; }
+  .table-wrap {
+    margin: 0 -14px;
+    padding: 0 14px;
+  }
+
+  /* 隐藏表头 */
+  thead { display: none; }
+
+  /* 行 → 独立卡片 */
+  tbody tr {
+    display: block;
+    background: linear-gradient(135deg, var(--surface) 0%, #1c1f2e 100%);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    margin-bottom: 10px;
+    padding: 6px 0;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+  }
+  tbody tr:last-child { margin-bottom: 0; }
+
+  /* 单元格 → 标签·值行 */
+  tbody td {
+    display: flex;
+    align-items: center;
+    padding: 7px 16px;
+    border: none;
+    font-size: 13px;
+    gap: 10px;
+    min-height: 34px;
+    background: transparent;
+  }
+  tbody td:not(:last-child) {
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  /* 数据标签 */
+  tbody td[data-label]::before {
+    content: attr(data-label);
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    min-width: 56px;
+    flex-shrink: 0;
+    opacity: 0.6;
+  }
+
+  /* 卡片内容截断 - 长文本溢出显示... */
+  tbody td[data-label] {
+    min-width: 0;
+  }
+  tbody td[data-label] > *:not(.badge):not(.toggle-wrap) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  tbody td[data-label] > a {
+    display: inline-block;
+    vertical-align: middle;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  tbody td[data-label] > .badge {
+    flex-shrink: 0;
+    overflow: visible;
+  }
+  td code {
+    font-size: 12px;
+  }
+
+  /* 拖拽手柄格 - 紧凑居中 */
+  tbody td[data-role="handle"] {
+    justify-content: center;
+    padding: 4px 16px;
+    min-height: 26px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 16px;
+    color: var(--text2);
+    cursor: grab;
+  }
+  /* 复选框格 - 紧凑居中 */
+  tbody td[data-role="checkbox"] {
+    justify-content: center;
+    padding: 6px 16px;
+    min-height: 28px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  tbody td[data-role="checkbox"] .node-check {
+    width: 18px;
+    height: 18px;
+    transform: none;
+  }
+
+
+  /* 操作列 - 按钮行 */
+  tbody td:last-child {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 16px;
+    border-bottom: none;
+  }
+  tbody td:last-child .btn-sm {
+    flex: 1 1 auto;
+    min-width: 56px;
+    min-height: 36px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 8px;
+    justify-content: center;
+    white-space: nowrap;
+  }
+  /* 按钮 */
+  .btn {
+    padding: 8px 14px;
+    font-size: 13px;
+  }
+  .btn-sm {
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+
+  /* 弹窗 */
+  .modal {
+    width: 100%;
+    max-width: none;
+    max-height: 100vh;
+    border-radius: 0;
+    padding: 16px;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+  .modal-overlay { align-items: flex-end; }
+  .modal-overlay.show { align-items: flex-end; }
+  .modal h3 { font-size: 15px; }
+  .modal-footer {
+    position: sticky;
+    bottom: 0;
+    background: var(--surface);
+    padding-top: 12px;
+    padding-bottom: max(4px, env(safe-area-inset-bottom));
+  }
+  .modal-footer .btn {
+    flex: 1;
+    justify-content: center;
+    min-height: 44px;
+  }
+
+  /* 通用设置 */
+  .gen-grid { grid-template-columns: 1fr; }
+  .gen-row { flex-direction: column; align-items: stretch; }
+  .gen-filename-input { width: 100%; }
+  .gen-ip-select { max-width: none; }
+
+  /* 统计卡片 */
+  .stats { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stat-card { padding: 12px; }
+  .stat-card .value { font-size: 22px; }
+
+  /* 配置预览 */
+  .config-preview { font-size: 11px; padding: 12px; max-height: 400px; }
+
+  /* 全屏预览 */
+  .fullscreen-content { padding: 16px; font-size: 12px; }
+  .fullscreen-bar { padding: 10px 16px; flex-wrap: wrap; gap: 8px; }
+  .fullscreen-bar-right { flex-wrap: wrap; gap: 8px; }
+
+  /* 节点列表 */
+  .node-list { gap: 6px; padding: 6px; }
+  .node-chip { font-size: 11px; padding: 3px 8px; }
+
+  /* 表单 - iOS 防缩放 */
+  form { width: 100%; }
+  input[type="text"], input[type="url"], input[type="number"], select, textarea {
+    font-size: 16px;
+    padding: 10px 12px;
+  }
+
+  /* 策略标签 */
+  .policy-tags, .available-groups { font-size: 12px; }
+
+  /* Toast 提示 */
+  .toast-container { top: 56px; right: 12px; left: 12px; }
+  .toast { font-size: 12px; padding: 10px 16px; }
+
+  /* ===== 订阅页 ===== */
+  /* 订阅 URL 列缩短 */
+  #sub-list td:nth-child(3) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* 节点页筛选栏 */
+  #filter-region, #filter-sub, #filter-pinned {
+    width: auto;
+    flex: 1 1 120px;
+    min-width: 0;
+  }
+  #filter-region + select + select {
+    margin-top: 0;
+  }
+
+  /* 节点页 - 批量操作栏 */
+  #batch-bar {
+    flex-wrap: wrap !important;
+    justify-content: center !important;
+    left: 10px !important;
+    right: 10px !important;
+    transform: none !important;
+    width: auto !important;
+    border-radius: 10px !important;
+    padding: 10px 12px !important;
+    gap: 8px !important;
+    bottom: 10px !important;
+  }
+  #batch-bar .btn-sm {
+    flex: 1;
+    min-height: 36px;
+    font-size: 11px;
+    padding: 4px 6px;
+  }
+  #batch-bar #batch-target {
+    width: 100% !important;
+  }
+  #batch-count {
+    width: 100%;
+    text-align: center;
+  }
+  #batch-bar > span:not(#batch-count) {
+    display: none; /* 隐藏 "批量操作" 文字 */
+  }
+
+  /* ===== 配置方案页 ===== */
+  /* Profile 卡片操作按钮 */
+  #profile-list .card-header > div:last-child {
+    flex-wrap: wrap;
+  }
+  #profile-list .card-header .btn-sm {
+    min-height: 36px;
+    flex: 0 1 auto;
+  }
+
+  /* Profile 展开区按钮 */
+  #profile-list [id^="pre-rules-"] .btn-sm,
+  #profile-list [id^="general-rules-"] .btn-sm,
+  #profile-list [id^="hosts-"] .btn-sm {
+    min-height: 36px;
+  }
+
+  /* Profile 展开区 - 标题栏 */
+  #profile-list [id^="pre-rules-"] > div:first-child,
+  #profile-list [id^="general-rules-"] > div:first-child,
+  #profile-list [id^="hosts-"] > div:first-child {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* 规则源表 - action 列使用 badge 紧凑显示 */
+  #rule-list td:nth-child(4) .badge {
+    font-size: 10px;
+    padding: 1px 5px;
+  }
+}
+
+@media (max-width: 480px) {
+  .stats { grid-template-columns: 1fr; }
+  .main { padding: 56px 8px 16px; }
+  .card { padding: 10px; }
+  .modal { padding: 12px; }
+
+  #sub-list th:nth-child(4),
+  #sub-list td:nth-child(4),
+  #sub-list th:nth-child(5),
+  #sub-list td:nth-child(5) {
+    display: none; /* 隐藏状态、更新时间列 */
+  }
+
+  /* 节点表 - 隐藏类型列 */
+  #node-table th:nth-child(4),
+  #node-table td:nth-child(4) {
+    display: none;
+  }
+
+  /* 服务列表 - 隐藏类型列 */
+  #service-list th:nth-child(3),
+  #service-list td:nth-child(3) {
+    display: none;
+  }
 }

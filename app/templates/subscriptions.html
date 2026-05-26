@@ -113,6 +113,7 @@ async function loadList() {
         </td>
       </tr>
     `).join("");
+      compactActions();
   } catch (e) {
     toast(e.message, "error");
   }
@@ -169,20 +170,22 @@ async function saveSubscription() {
 
 async function syncOne(id) {
   try {
-    toast("{{ t["sub.syncing"] }}");
+    showLoading();
     const result = await API.post(`/api/subscriptions/${id}/sync`);
     toast("{{ t["sub.sync_done"] }}".replace("{0}", result.subscription).replace("{1}", result.node_count));
     loadList();
   } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
 }
 
 async function syncAll() {
   try {
-    toast("{{ t["sub.sync_all_msg"] }}");
+    showLoading();
     const result = await API.post("/api/subscriptions/sync-all");
     toast("{{ t["sub.sync_all_done"] }}".replace("{0}", result.results.length));
     loadList();
   } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
 }
 
 async function deleteSub(id, name) {

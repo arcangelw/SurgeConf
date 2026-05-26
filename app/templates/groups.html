@@ -163,49 +163,53 @@ function getAvailableGroups() {
   return { virtual, autoRegions, manualRegions };
 }
 
-let policyDragIdx = null;
+let policySortable = null;
 
 function renderPolicyTags() {
   const container = document.getElementById("policy-tags");
   if (currentPolicies.length === 0) {
+    if (policySortable) { policySortable.destroy(); policySortable = null; }
     container.innerHTML = '<span style="color:var(--text2);font-size:12px;">{{ t["group.no_policy"] }}</span>';
     return;
   }
+  if (policySortable) policySortable.destroy();
   container.innerHTML = currentPolicies.map((p, i) => {
     const isManual = p.endsWith("手动");
     const badgeClass = isManual ? 'badge-warning' : p === "DIRECT" ? 'badge-success' : 'badge-primary';
     const displayName = VIRT_LABELS[p] || translateName(p);
-    return `<span class="badge ${badgeClass}" draggable="true"
-      data-idx="${i}"
-      ondragstart="onPolicyDragStart(event,${i})"
-      ondragover="onPolicyDragOver(event)"
-      ondrop="onPolicyDrop(event,${i})"
-      ondragend="onPolicyDragEnd(event)"
+    return `<span class="badge ${badgeClass}"
+      data-policy="${escapeHtml(p)}"
       style="cursor:grab;margin:2px;padding:4px 10px;font-size:12px;">
       ${escapeHtml(displayName)}
-      <span style="margin-left:4px;opacity:0.6;cursor:pointer;" onclick="event.stopPropagation();removePolicy(${i})">✕</span>
+      <span class="policy-remove" style="margin-left:4px;opacity:0.6;cursor:pointer;">✕</span>
     </span>`;
   }).join("");
+  if (typeof Sortable !== "undefined") {
+    policySortable = new Sortable(container, {
+      animation: 150,
+      ghostClass: "sortable-ghost",
+      onEnd(evt) {
+        const [moved] = currentPolicies.splice(evt.oldIndex, 1);
+        currentPolicies.splice(evt.newIndex, 0, moved);
+        renderPolicyTags();
+      },
+    });
+  }
 }
 
-function onPolicyDragStart(e, idx) {
-  policyDragIdx = idx;
-  e.dataTransfer.effectAllowed = "move";
-  e.target.style.opacity = "0.4";
-}
-function onPolicyDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }
-function onPolicyDrop(e, toIdx) {
-  e.preventDefault();
-  if (policyDragIdx === null || policyDragIdx === toIdx) return;
-  const [moved] = currentPolicies.splice(policyDragIdx, 1);
-  currentPolicies.splice(toIdx, 0, moved);
-  policyDragIdx = null;
-  renderPolicyTags();
-}
-function onPolicyDragEnd(e) {
-  e.target.style.opacity = "";
-  policyDragIdx = null;
-}
+// 政策标签移除按钮的事件委托（只绑定一次）
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("policy-tags")?.addEventListener("click", (e) => {
+    if (e.target.classList.contains("policy-remove")) {
+      const span = e.target.closest("[data-policy]");
+      if (span) {
+        const i = currentPolicies.indexOf(span.dataset.policy);
+        if (i !== -1) removePolicy(i);
+        // re-render happens inside removePolicy
+      }
+    }
+  });
+});
 
 function renderAvailableGroups() {
   const { virtual, autoRegions, manualRegions } = getAvailableGroups();
@@ -275,6 +279,7 @@ async function loadData() {
       </td>
     </tr>`;
   }).join("");
+  compactActions();
 
   document.getElementById("service-list").innerHTML = services.map(s => `
     <tr>

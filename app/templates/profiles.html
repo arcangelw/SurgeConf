@@ -423,6 +423,7 @@ async function loadProfileRuleList(profileId, position) {
         </td>
       </tr>
     `).join("");
+      compactActions();
   } catch (e) { toast(e.message, "error"); }
 }
 
@@ -566,6 +567,7 @@ async function loadHostList(profileId) {
         </td>
       </tr>
     `).join("");
+      compactActions();
   } catch (e) { toast(e.message, "error"); }
 }
 

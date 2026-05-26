@@ -57,7 +57,13 @@ function toast(message, type = "success") {
 }
 
 function showModal(id) {
-  document.getElementById(id)?.classList.add("show");
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.add("show");
+  // 点击遮罩关闭
+  el.onclick = function(e) {
+    if (e.target === el) hideModal(id);
+  };
 }
 
 function hideModal(id) {
@@ -70,6 +76,88 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+/** 侧边栏切换（移动端） */
+function toggleSidebar() {
+  const nav = document.getElementById("sidebar-nav");
+  const btn = document.getElementById("hamburger");
+  const overlay = document.getElementById("sidebar-overlay");
+  const isOpen = nav.classList.toggle("open");
+  btn.classList.toggle("open");
+  if (overlay) overlay.classList.toggle("show", isOpen);
+  document.body.style.overflow = isOpen ? "hidden" : "";
+}
+
+function closeSidebar() {
+  const nav = document.getElementById("sidebar-nav");
+  const btn = document.getElementById("hamburger");
+  const overlay = document.getElementById("sidebar-overlay");
+  nav.classList.remove("open");
+  btn.classList.remove("open");
+  if (overlay) overlay.classList.remove("show");
+  document.body.style.overflow = "";
+}
+
+/** Loading 指示器 */
+function showLoading() {
+  document.getElementById("loading-overlay")?.classList.add("show");
+}
+function hideLoading() {
+  document.getElementById("loading-overlay")?.classList.remove("show");
+}
+
+/** 点击导航链接后自动关闭侧边栏（移动端） */
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll("#sidebar-nav a").forEach(a => {
+    a.addEventListener("click", () => {
+      if (window.innerWidth <= 768) closeSidebar();
+    });
+  });
+  compactActions();
+});
+
+/** 移动端：注入卡片列表标签 + 显式显示操作按钮 */
+function compactActions() {
+  if (window.innerWidth > 768) return;
+  addTableLabels();
+  // 确保操作按钮可见（不受之前可能设置的 display:none 影响）
+  document.querySelectorAll('td:last-child .btn-sm').forEach(btn => {
+    btn.style.display = '';
+  });
+}
+
+/** 为卡片列表模式注入 data-label / data-role */
+function addTableLabels() {
+  document.querySelectorAll('tbody').forEach(tbody => {
+    const table = tbody.closest('table');
+    if (!table) return;
+    const headers = [];
+    table.querySelectorAll('thead th').forEach(th => {
+      headers.push(th.textContent.trim().replace(/\s*\?\s*$/, ''));
+    });
+    if (headers.length === 0) return;
+    tbody.querySelectorAll('tr').forEach(tr => {
+      const tds = tr.querySelectorAll('td');
+      tds.forEach((td, i) => {
+        if (i >= headers.length) return;
+        if (i === tds.length - 1) return;
+        if (i === 0 && (td.textContent.includes('⠿') || td.textContent.includes('␿'))) {
+          td.dataset.role = 'handle';
+          return;
+        }
+        // 复选框格
+        if (td.querySelector('input[type="checkbox"]')) {
+          td.dataset.role = 'checkbox';
+          return;
+        }
+        const label = headers[i];
+        if (label) td.dataset.label = label;
+      });
+    });
+  });
+}
+
+
+
 /** 翻译名称：在 LOCALE_NAMES 存在时（英文模式）翻译中文组名 */
 function translateName(name) {
   if (LOCALE_NAMES && Object.keys(LOCALE_NAMES).length > 0) {
@@ -80,6 +168,26 @@ function translateName(name) {
     return LOCALE_NAMES[name] || name;
   }
   return name;
+}
+
+/** 用 SortableJS 初始化可拖拽表格（支持触屏） */
+function enableSortable(tbodyId, onUpdate) {
+  const el = document.getElementById(tbodyId);
+  if (!el || typeof Sortable === "undefined") return;
+  return new Sortable(el, {
+    animation: 200,
+    handle: "td:first-child, tr",
+    ghostClass: "sortable-ghost",
+    onEnd: function (evt) {
+      if (typeof onUpdate === "function") {
+        const items = [...el.children].map(tr => ({
+          id: parseInt(tr.dataset.id),
+          sort_order: Array.from(el.children).indexOf(tr),
+        }));
+        onUpdate(items);
+      }
+    },
+  });
 }
 
 /** 侧边栏导航高亮 */
