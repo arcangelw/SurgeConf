@@ -246,6 +246,9 @@ async function loadData() {
           <button class="btn btn-sm btn-outline" onclick="toggleSection('hosts-${p.id}', ${p.id}, 'hosts')">
             {{ t["profile.hosts"] }} <span id="hosts-count-${p.id}" class="badge badge-warning" style="margin-left:4px;">0</span>
           </button>
+          <button class="btn btn-sm btn-outline" onclick="toggleMitm(${p.id})">
+            {{ t["profile.mitm"] }}
+          </button>
         </div>
         <!-- 前置规则 -->
         <div id="pre-rules-${p.id}" style="display:none;padding:0 16px 16px;">
@@ -299,6 +302,38 @@ async function loadData() {
               </tr></thead>
               <tbody id="hosts-list-${p.id}"></tbody>
             </table>
+          </div>
+        </div>
+        <!-- MITM 配置 -->
+        <div id="mitm-${p.id}" style="display:none;padding:0 16px 16px;">
+          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;">
+            <label class="checkbox"><input type="checkbox" id="mitm-skip-${p.id}"> skip-server-cert-verify</label>
+            <label class="checkbox"><input type="checkbox" id="mitm-tcp-${p.id}"> tcp-connection</label>
+            <label class="checkbox"><input type="checkbox" id="mitm-h2-${p.id}"> h2</label>
+          </div>
+          <div class="form-group">
+            <label>{{ t["profile.mitm_passphrase"] }}</label>
+            <input type="password" id="mitm-passphrase-${p.id}" placeholder="{{ t["profile.mitm_passphrase_placeholder"] }}" style="max-width:300px;">
+          </div>
+          <div class="form-group">
+            <label>{{ t["profile.mitm_cap12"] }}</label>
+            <div style="font-size:12px;color:var(--text2);margin-bottom:4px;">{{ t["profile.mitm_cap12_manual"] }}</div>
+            <input type="text" id="mitm-cap12-${p.id}" placeholder="{{ t["profile.mitm_cap12_placeholder"] }}" style="width:100%;max-width:500px;margin-bottom:8px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="font-size:12px;color:var(--text2);">{{ t["profile.mitm_cap12_upload"] }}</span>
+              <label class="btn btn-sm btn-outline" style="cursor:pointer;margin:0;">
+                {{ t["btn.upload"] }}
+                <input type="file" accept=".p12" style="display:none;" onchange="uploadMitmCert(${p.id}, this)">
+              </label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>{{ t["profile.mitm_hostname"] }}</label>
+            <textarea id="mitm-hostname-${p.id}" rows="3" placeholder="{{ t["profile.mitm_hostname_placeholder"] }}"></textarea>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px;">
+            <button class="btn btn-sm btn-primary" onclick="saveMitm(${p.id})">{{ t["profile.mitm_save"] }}</button>
+            <button class="btn btn-sm btn-outline" onclick="resetMitm(${p.id})">{{ t["profile.mitm_reset"] }}</button>
           </div>
         </div>
       </div>`;
@@ -636,6 +671,79 @@ async function deleteHost(mappingId, profileId) {
     loadHostList(profileId);
     loadProfileStats(profileId);
   } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== MITM 配置管理 =====
+
+function toggleMitm(profileId) {
+  const el = document.getElementById(`mitm-${profileId}`);
+  if (el.style.display === "none") {
+    el.style.display = "block";
+    loadMitm(profileId);
+  } else {
+    el.style.display = "none";
+  }
+}
+
+async function loadMitm(profileId) {
+  try {
+    const profiles = await API.get("/api/configs/profiles");
+    const p = profiles.find(x => x.id === profileId);
+    if (!p) return;
+    const mitm = p.mitm || {};
+    document.getElementById(`mitm-skip-${profileId}`).checked = mitm['skip-server-cert-verify'] !== false;
+    document.getElementById(`mitm-tcp-${profileId}`).checked = mitm['tcp-connection'] !== false;
+    document.getElementById(`mitm-h2-${profileId}`).checked = mitm['h2'] !== false;
+    document.getElementById(`mitm-passphrase-${profileId}`).value = mitm['ca-passphrase'] || '';
+    document.getElementById(`mitm-cap12-${profileId}`).value = mitm['ca-p12'] || '';
+    document.getElementById(`mitm-hostname-${profileId}`).value = mitm['hostname'] || '';
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function saveMitm(profileId) {
+  const mitm = {};
+  mitm['skip-server-cert-verify'] = document.getElementById(`mitm-skip-${profileId}`).checked;
+  mitm['tcp-connection'] = document.getElementById(`mitm-tcp-${profileId}`).checked;
+  mitm['h2'] = document.getElementById(`mitm-h2-${profileId}`).checked;
+  const passphrase = document.getElementById(`mitm-passphrase-${profileId}`).value.trim();
+  if (passphrase) mitm['ca-passphrase'] = passphrase;
+  const cap12 = document.getElementById(`mitm-cap12-${profileId}`).value.trim();
+  if (cap12) mitm['ca-p12'] = cap12;
+  const hostname = document.getElementById(`mitm-hostname-${profileId}`).value.trim();
+  if (hostname) mitm['hostname'] = hostname;
+  try {
+    await API.put(`/api/configs/profiles/${profileId}`, { mitm });
+    toast("{{ t["profile.mitm_save"] }}");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function resetMitm(profileId) {
+  if (!confirm("{{ t["profile.mitm_reset"] }}？")) return;
+  try {
+    await API.put(`/api/configs/profiles/${profileId}`, { mitm: {} });
+    toast("{{ t["profile.mitm_reset"] }}");
+    loadMitm(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function uploadMitmCert(profileId, input) {
+  const file = input.files[0];
+  if (!file) return;
+  try {
+    showLoading();
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    document.getElementById(`mitm-cap12-${profileId}`).value = base64;
+    toast("{{ t["profile.mitm_cert_uploaded"] }}");
+  } catch (e) { toast(e.message, "error"); }
+  finally {
+    hideLoading();
+    input.value = "";
+  }
 }
 
 // 预置选项联动：选择预置后自动填入 target
