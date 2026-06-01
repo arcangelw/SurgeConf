@@ -11,7 +11,7 @@ from app.models import (
 from app.default_config import DEFAULT_GENERAL, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
 
 # 默认排除关键词（优先使用系统配置）
-DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
+DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
 
 
 async def _get_sys_config(db: AsyncSession) -> dict:
@@ -231,12 +231,15 @@ def _build_proxy_groups(
     has_other = False
     other_region_quoted = _quote(t("其他"))
     other_manual_quoted = _quote(t("其他手动"))
+    # 计算其他组过滤正则（排除所有活跃地区的匹配）
+    other_filter = ""
+    if auto_regions:
+        all_filters = "|".join(rg.filter_regex for rg in active_regions)
+        other_filter = f"^((?!{all_filters}|{exclusion_keywords}).)+$"
 
     # 其他地区（自动）— 仅在有自动地区时生成
     if auto_regions and other_auto_enabled:
         has_other = True
-        all_filters = "|".join(rg.filter_regex for rg in active_regions)
-        other_filter = f"^((?!{all_filters}|{exclusion_keywords}).)+$"
         lines.append(
             f'{other_region_quoted} = url-test, '
             f'policy-regex-filter={other_filter}, '
@@ -246,16 +249,6 @@ def _build_proxy_groups(
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
         )
 
-    # 其他手动选择 — 独立开关
-    other_manual_names = []
-    if auto_regions and other_manual_enabled:
-        has_other = True
-        lines.append(
-            f'{other_manual_quoted} = select, '
-            f'include-other-group={_quote(t("全部节点"))}, '
-            f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
-        )
-        other_manual_names.append(other_manual_quoted)
     lines.append("")
 
     # ── 手动地区分组 ──
@@ -270,6 +263,17 @@ def _build_proxy_groups(
             f'{icon}'
         )
         manual_region_names.append(_quote(t(manual_name)))
+    # 其他手动选择 — 独立开关（放在手动地区组之后）
+    other_manual_names = []
+    if auto_regions and other_manual_enabled:
+        has_other = True
+        lines.append(
+            f'{other_manual_quoted} = select, '
+            f'policy-regex-filter={other_filter}, '
+            f'include-other-group={_quote(t("全部节点"))}, '
+            f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
+        )
+        other_manual_names.append(other_manual_quoted)
     lines.append("")
 
     # ── 组合策略 ──

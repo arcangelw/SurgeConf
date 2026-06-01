@@ -79,7 +79,7 @@ async def seed_defaults():
         missing = sys_config_keys - existing_configs
         if "exclusion_keywords" in missing:
             db.add(SystemConfig(key="exclusion_keywords",
-                                value="Remain|Expired|Expire|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"))
+                                value="Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"))
         if "other_auto_enabled" in missing:
             db.add(SystemConfig(key="other_auto_enabled", value="true"))
         if "other_manual_enabled" in missing:
