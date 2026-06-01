@@ -7,11 +7,12 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 
 from app.database import Base
 from app.models import (ProxyNode, RegionGroup, ServiceGroup, ConfigProfile,
-                        RuleSource, CustomRule, HostMapping)
+                        RuleSource, CustomRule, HostMapping, SystemConfig)
 from app.default_config import (DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
                                 DEFAULT_RULE_SOURCES, DEFAULT_GENERAL,
                                 DEFAULT_PRE_RULES, DEFAULT_GENERAL_RULES,
                                 DEFAULT_HOST_MAPPINGS)
+from app.services.generator import DEFAULT_EXCLUSION_KEYWORDS
 
 
 @pytest.fixture(scope="session")
@@ -46,6 +47,10 @@ async def db():
             session.add(CustomRule(**r))
         for h in DEFAULT_HOST_MAPPINGS[:3]:
             session.add(HostMapping(**h))
+        # 系统级配置
+        session.add(SystemConfig(key="exclusion_keywords", value=DEFAULT_EXCLUSION_KEYWORDS))
+        session.add(SystemConfig(key="other_auto_enabled", value="true"))
+        session.add(SystemConfig(key="other_manual_enabled", value="true"))
         await session.commit()
         yield session
 

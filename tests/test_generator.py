@@ -155,6 +155,35 @@ class TestProxyGroupBasicStructure:
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
         assert not any("其他 = url-test," in l for l in lines)
 
+    def test_other_manual_generated_when_enabled(self):
+        """other_manual_enabled=True 时生成「其他手动 = select」"""
+        regions = [_make_region("香港", "港|HK")]
+        lines = _build_proxy_groups([], regions, [], _t_zh, {}, other_manual_enabled=True)
+        assert any(l.startswith("其他手动 = select,") for l in lines)
+
+    def test_other_manual_not_generated_when_disabled(self):
+        """other_manual_enabled=False 时不生成「其他手动」"""
+        regions = [_make_region("香港", "港|HK")]
+        lines = _build_proxy_groups([], regions, [], _t_zh, {}, other_manual_enabled=False)
+        assert not any("其他手动" in l for l in lines)
+
+    def test_other_auto_disabled_still_has_manual(self):
+        """关闭其他自动测速（url-test），仍可生成手动选择（select）"""
+        regions = [_make_region("香港", "港|HK")]
+        lines = _build_proxy_groups([], regions, [], _t_zh, {},
+                                    other_auto_enabled=False, other_manual_enabled=True)
+        assert not any("其他 = url-test," in l for l in lines)
+        assert any(l.startswith("其他手动 = select,") for l in lines)
+
+    def test_auto_select_excludes_other(self):
+        """自动选择组不包含「其他」兜底组"""
+        regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
+        lines = _build_proxy_groups([], regions, [], _t_zh, {})
+        auto_select = [l for l in lines if l.startswith("自动选择 = select,")][0]
+        assert "香港" in auto_select
+        assert "美国" in auto_select
+        assert "其他" not in auto_select
+
     def test_manual_group_uses_include_other_group(self):
         """手动组通过 include-other-group 引用全部节点，不逐个列举节点名"""
         regions = [_make_region("香港", "港|HK")]
@@ -216,7 +245,7 @@ class TestCompositeGroups:
         auto_select = [l for l in lines if l.startswith("自动选择 = select,")][0]
         assert "香港" in auto_select
         assert "美国" in auto_select
-        assert "其他" in auto_select
+        assert "其他" not in auto_select  # 自动选择排除兜底的"其他"组
         assert "手动" not in auto_select
 
     def test_proxy_has_auto_and_manual(self):
@@ -325,9 +354,10 @@ class TestProxyGroupEnglishLocale:
         regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
         lines = _build_proxy_groups([], regions, [], _t_en, {})
         manual = [l for l in lines if 'Manual" = select,' in l]
-        assert len(manual) == 2
+        assert len(manual) == 3  # 香港手动 + 美国手动 + 其他手动
         assert any('"Hong Kong Manual"' in l for l in manual)
         assert any('"United States Manual"' in l for l in manual)
+        assert any('"Other Manual"' in l for l in manual)
 
     def test_composite_groups_translated(self):
         regions = [_make_region("香港", "港|HK")]

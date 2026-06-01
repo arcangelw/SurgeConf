@@ -6,12 +6,20 @@ from sqlalchemy import select
 from app.models import (
     ProxyNode, RegionGroup, ServiceGroup,
     ConfigProfile, RuleSource, Subscription,
-    CustomRule, HostMapping,
+    CustomRule, HostMapping, SystemConfig,
 )
 from app.default_config import DEFAULT_GENERAL, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
 
-# 节点名称过滤关键词（与 subscription.py 同步）
-FILTER_PATTERN = r"Remain|Expired|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量"
+# 默认排除关键词（优先使用系统配置）
+DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
+
+
+async def _get_sys_config(db: AsyncSession) -> dict:
+    """读取系统级配置"""
+    from app.models import SystemConfig
+    result = await db.execute(select(SystemConfig))
+    configs = {row.key: row.value for row in result.scalars().all()}
+    return configs
 
 
 def _quote(name: str) -> str:
@@ -78,6 +86,12 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     subs_result = await db.execute(select(Subscription))
     sub_map = {s.id: s.name for s in subs_result.scalars().all()}
 
+    # 系统级配置
+    sys_config = await _get_sys_config(db)
+    exclusion_keywords = sys_config.get("exclusion_keywords", DEFAULT_EXCLUSION_KEYWORDS)
+    other_auto_enabled = sys_config.get("other_auto_enabled", "true") == "true"
+    other_manual_enabled = sys_config.get("other_manual_enabled", "true") == "true"
+
     # General
     general = dict(DEFAULT_GENERAL)
     if profile and profile.general:
@@ -111,7 +125,8 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # Proxy Group
     sections.append("[Proxy Group]")
-    sections.extend(_build_proxy_groups(all_nodes, region_groups, service_groups, t, sub_map))
+    sections.extend(_build_proxy_groups(all_nodes, region_groups, service_groups, t, sub_map,
+                                        exclusion_keywords, other_auto_enabled, other_manual_enabled))
     sections.append("")
 
     # Rule
@@ -180,11 +195,14 @@ def _build_proxy_groups(
     service_groups: list[ServiceGroup],
     t,
     sub_map: dict,
+    exclusion_keywords: str = DEFAULT_EXCLUSION_KEYWORDS,
+    other_auto_enabled: bool = True,
+    other_manual_enabled: bool = True,
 ) -> list[str]:
     lines = []
 
     # 全部节点组
-    sub_filter = f"^((?!{FILTER_PATTERN}).)+$"
+    sub_filter = f"^((?!{exclusion_keywords}).)+$"
     lines.append(
         f'{_quote(t("全部节点"))} = select, '
         f'policy-regex-filter={sub_filter}, '
@@ -210,18 +228,34 @@ def _build_proxy_groups(
             f'{icon}'
         )
 
+    has_other = False
+    other_region_quoted = _quote(t("其他"))
+    other_manual_quoted = _quote(t("其他手动"))
+
     # 其他地区（自动）— 仅在有自动地区时生成
-    if auto_regions:
+    if auto_regions and other_auto_enabled:
+        has_other = True
         all_filters = "|".join(rg.filter_regex for rg in active_regions)
-        other_filter = f"^((?!{all_filters}|{FILTER_PATTERN}).)+$"
+        other_filter = f"^((?!{all_filters}|{exclusion_keywords}).)+$"
         lines.append(
-            f'{_quote(t("其他"))} = url-test, '
+            f'{other_region_quoted} = url-test, '
             f'policy-regex-filter={other_filter}, '
             f'include-other-group={_quote(t("全部节点"))}, '
             f'url=http://cp.cloudflare.com/generate_204, '
             f'interval=300, tolerance=50, timeout=3, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
         )
+
+    # 其他手动选择 — 独立开关
+    other_manual_names = []
+    if auto_regions and other_manual_enabled:
+        has_other = True
+        lines.append(
+            f'{other_manual_quoted} = select, '
+            f'include-other-group={_quote(t("全部节点"))}, '
+            f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
+        )
+        other_manual_names.append(other_manual_quoted)
     lines.append("")
 
     # ── 手动地区分组 ──
@@ -240,10 +274,10 @@ def _build_proxy_groups(
 
     # ── 组合策略 ──
     auto_region_names = [_quote(t(rg.name)) for rg in auto_regions]
-    all_region_names = auto_region_names + manual_region_names
+    all_region_names = auto_region_names + manual_region_names + other_manual_names
 
-    # 自动选择：包含所有自动地区组
-    auto_select_members = auto_region_names + ([_quote(t("其他"))] if auto_regions else [])
+    # 自动选择：仅包含明确分区的自动测速组（排除「其他」兜底组）
+    auto_select_members = list(auto_region_names)
     if auto_select_members:
         lines.append(
             f'{_quote(t("自动选择"))} = select, {", ".join(auto_select_members)}, '
@@ -264,8 +298,8 @@ def _build_proxy_groups(
     manual_select_members = [_quote(t("大陆直连"))]
     if auto_select_members:
         manual_select_members.append(_quote(t("自动选择")))
-    manual_select_members.extend(manual_region_names)
-    if manual_region_names or auto_select_members:
+    manual_select_members.extend(manual_region_names + other_manual_names)
+    if manual_region_names or other_manual_names or auto_select_members:
         lines.append(
             f'{_quote(t("手动选择"))} = select, {", ".join(manual_select_members)}, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/05icon/lightning.png'

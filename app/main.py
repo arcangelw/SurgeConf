@@ -3,13 +3,14 @@
 import os
 import sys
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
-from app.database import init_db, DB_PATH
-from app.models import RegionGroup, ServiceGroup, RuleSource, ConfigProfile, CustomRule, HostMapping
+from app.database import init_db, DB_PATH, get_db
+from app.models import RegionGroup, ServiceGroup, RuleSource, ConfigProfile, CustomRule, HostMapping, SystemConfig
 from app.default_config import (
     DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
     DEFAULT_RULE_SOURCES, DEFAULT_GENERAL,
@@ -35,37 +36,56 @@ async def seed_defaults():
     async with async_session() as db:
         result = await db.execute(select(RegionGroup).limit(1))
         if result.scalar_one_or_none():
-            return
+            # 已有数据，仅确保系统配置存在
+            pass
+        else:
+            for rg in DEFAULT_REGION_GROUPS:
+                db.add(RegionGroup(**rg))
 
-        for rg in DEFAULT_REGION_GROUPS:
-            db.add(RegionGroup(**rg))
+            for sg in DEFAULT_SERVICE_GROUPS:
+                db.add(ServiceGroup(**sg))
 
-        for sg in DEFAULT_SERVICE_GROUPS:
-            db.add(ServiceGroup(**sg))
+            for rs in DEFAULT_RULE_SOURCES:
+                db.add(RuleSource(**rs))
 
-        for rs in DEFAULT_RULE_SOURCES:
-            db.add(RuleSource(**rs))
+            db.add(ConfigProfile(
+                name="默认配置",
+                description="基于原始 Surge.conf 的默认配置",
+                is_default=True,
+                locale="zh",
+                final_action="兜底",
+                general=dict(DEFAULT_GENERAL),
+                url_rewrites=list(DEFAULT_URL_REWRITES),
+                header_rewrites=list(DEFAULT_HEADER_REWRITES),
+                mitm=dict(DEFAULT_MITM),
+            ))
 
-        db.add(ConfigProfile(
-            name="默认配置",
-            description="基于原始 Surge.conf 的默认配置",
-            is_default=True,
-            locale="zh",
-            final_action="兜底",
-            general=dict(DEFAULT_GENERAL),
-            url_rewrites=list(DEFAULT_URL_REWRITES),
-            header_rewrites=list(DEFAULT_HEADER_REWRITES),
-            mitm=dict(DEFAULT_MITM),
-        ))
+            for r in DEFAULT_PRE_RULES:
+                db.add(CustomRule(profile_id=None, **r))
+            for r in DEFAULT_GENERAL_RULES:
+                db.add(CustomRule(profile_id=None, **r))
+            for h in DEFAULT_HOST_MAPPINGS:
+                db.add(HostMapping(profile_id=None, **h))
 
-        for r in DEFAULT_PRE_RULES:
-            db.add(CustomRule(profile_id=None, **r))
-        for r in DEFAULT_GENERAL_RULES:
-            db.add(CustomRule(profile_id=None, **r))
-        for h in DEFAULT_HOST_MAPPINGS:
-            db.add(HostMapping(profile_id=None, **h))
+            await db.commit()
 
-        await db.commit()
+    # 确保系统级配置存在（首次启动或数据库已有旧数据时）
+    sys_config_keys = {"exclusion_keywords", "other_auto_enabled", "other_manual_enabled"}
+    existing_configs = set()
+    async with async_session() as db:
+        result = await db.execute(select(SystemConfig))
+        for row in result.scalars().all():
+            existing_configs.add(row.key)
+        missing = sys_config_keys - existing_configs
+        if "exclusion_keywords" in missing:
+            db.add(SystemConfig(key="exclusion_keywords",
+                                value="Remain|Expired|Expire|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"))
+        if "other_auto_enabled" in missing:
+            db.add(SystemConfig(key="other_auto_enabled", value="true"))
+        if "other_manual_enabled" in missing:
+            db.add(SystemConfig(key="other_manual_enabled", value="true"))
+        if missing:
+            await db.commit()
 
 
 @asynccontextmanager
@@ -207,3 +227,34 @@ async def reset_data():
     await init_db()
     await seed_defaults()
     return {"reset": True}
+
+
+# ===== 系统级配置（排除关键词、其他分组等） =====
+
+@app.get("/api/settings/config")
+async def get_sys_config(db=Depends(get_db)):
+    """获取所有系统级配置"""
+    from sqlalchemy import select
+    result = await db.execute(select(SystemConfig))
+    configs = {row.key: row.value for row in result.scalars().all()}
+    return configs
+
+
+class SysConfigUpdate(BaseModel):
+    key: str
+    value: str
+
+
+@app.put("/api/settings/config")
+async def update_sys_config(data: SysConfigUpdate, db=Depends(get_db)):
+    """更新单条系统配置"""
+    from sqlalchemy import select
+    result = await db.execute(select(SystemConfig).where(SystemConfig.key == data.key))
+    cfg = result.scalar_one_or_none()
+    if not cfg:
+        cfg = SystemConfig(key=data.key, value=data.value)
+        db.add(cfg)
+    else:
+        cfg.value = data.value
+    await db.commit()
+    return {data.key: data.value}

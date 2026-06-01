@@ -14,6 +14,7 @@ LOCALE_NAMES = {
     "代理": "Proxy",
     "手动选择": "NoAuto",
     "其他": "Other",
+    "其他手动": "Other Manual",
     # 地区分组
     "香港": "Hong Kong",
     "台湾": "Taiwan",

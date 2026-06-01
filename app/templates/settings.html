@@ -18,6 +18,25 @@
 </div>
 
 <div class="card">
+  <div class="card-header"><h3>{{ t["settings.node_filter"] }}</h3></div>
+  <div class="form-group">
+    <label>{{ t["settings.exclusion_keywords"] }}</label>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:6px;">{{ t["settings.exclusion_keywords_hint"] }}</p>
+    <textarea id="exclusion-keywords" rows="5" style="width:100%;max-width:500px;font-family:monospace;font-size:13px;"></textarea>
+  </div>
+  <div class="form-group" style="margin-top:16px;">
+    <label>{{ t["settings.other_group"] }}</label>
+    <div style="display:flex;gap:20px;margin-top:6px;">
+      <label class="checkbox"><input type="checkbox" id="other-auto-enabled" checked> {{ t["settings.other_auto"] }}</label>
+      <label class="checkbox"><input type="checkbox" id="other-manual-enabled" checked> {{ t["settings.other_manual"] }}</label>
+    </div>
+  </div>
+  <div style="margin-top:12px;">
+    <button class="btn btn-primary" onclick="saveSysConfig()">{{ t["btn.save"] }}</button>
+  </div>
+</div>
+
+<div class="card">
   <div class="card-header"><h3>{{ t["settings.data_management"] }}</h3></div>
   <div style="display:flex;gap:10px;">
     <button class="btn btn-danger" onclick="resetData()">{{ t["settings.reset_data"] }}</button>
@@ -50,5 +69,31 @@ async function resetData() {
   } catch (e) { toast(e.message, "error"); }
 }
 
+// ===== 系统级配置 =====
+
+async function loadSysConfig() {
+  try {
+    const config = await API.get("/api/settings/config");
+    const keywords = config.exclusion_keywords || "Remain|Expired|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed";
+    document.getElementById("exclusion-keywords").value = keywords.replace(/\|/g, "\n");
+    document.getElementById("other-auto-enabled").checked = config.other_auto_enabled !== "false";
+    document.getElementById("other-manual-enabled").checked = config.other_manual_enabled !== "false";
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function saveSysConfig() {
+  try {
+    const keywords = document.getElementById("exclusion-keywords").value
+      .split("\n").map(s => s.trim()).filter(Boolean).join("|");
+    await API.put("/api/settings/config", { key: "exclusion_keywords", value: keywords });
+    const autoChecked = document.getElementById("other-auto-enabled").checked;
+    const manualChecked = document.getElementById("other-manual-enabled").checked;
+    await API.put("/api/settings/config", { key: "other_auto_enabled", value: autoChecked ? "true" : "false" });
+    await API.put("/api/settings/config", { key: "other_manual_enabled", value: manualChecked ? "true" : "false" });
+    toast("{{ t["settings.saved"] }}");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+loadSysConfig();
 </script>
 {% endblock %}

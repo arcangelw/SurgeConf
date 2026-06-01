@@ -118,3 +118,11 @@ class RuleSource(Base):
     enabled = Column(Boolean, default=True)
     sort_order = Column(Integer, default=0)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(100), unique=True, nullable=False, comment="配置键")
+    value = Column(Text, nullable=True, comment="配置值")
