@@ -352,6 +352,31 @@ async def sync_all_subscriptions(db: AsyncSession) -> list[dict]:
     return results
 
 
+async def cleanup_orphan_nodes(db: AsyncSession) -> int:
+    """清理孤儿节点：删除 subscription_id 指向已不存在订阅的节点。
+
+    用于修复旧版本删除订阅时未级联删除节点而残留在库中的数据，
+    升级后在启动流程（seed_defaults）中调用一次即可完成存量修复。
+    subscription_id 为 NULL 的手动节点不受影响。
+    返回被删除的节点数量。
+    """
+    result = await db.execute(select(Subscription.id))
+    valid_ids = [row[0] for row in result.all()]
+
+    if valid_ids:
+        stmt = delete(ProxyNode).where(
+            ProxyNode.subscription_id.isnot(None),
+            ProxyNode.subscription_id.notin_(valid_ids),
+        )
+    else:
+        # 没有任何订阅时，所有带 subscription_id 的节点都是孤儿
+        stmt = delete(ProxyNode).where(ProxyNode.subscription_id.isnot(None))
+
+    result = await db.execute(stmt)
+    await db.commit()
+    return result.rowcount or 0
+
+
 def auto_detect_region(name: str, region_groups: list[dict]) -> str | None:
     """根据节点名称自动检测地区"""
     for group in region_groups:

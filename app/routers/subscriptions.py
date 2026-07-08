@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from app.database import get_db
-from app.models import Subscription
+from app.models import Subscription, ProxyNode
 from app.services.subscription import sync_subscription, sync_all_subscriptions
 
 router = APIRouter(prefix="/api/subscriptions", tags=["订阅管理"])
@@ -94,6 +94,8 @@ async def delete_subscription(sub_id: int, db: AsyncSession = Depends(get_db)):
     if not sub:
         raise HTTPException(404, "订阅不存在")
 
+    # 级联删除该订阅下的所有节点（与同步时清旧节点的逻辑保持一致）
+    await db.execute(delete(ProxyNode).where(ProxyNode.subscription_id == sub_id))
     await db.execute(delete(Subscription).where(Subscription.id == sub_id))
     await db.commit()
     return {"deleted": sub_id}
