@@ -392,6 +392,7 @@ class HostMappingCreate(BaseModel):
     target: str
     sort_order: int = 0
     enabled: bool = True
+    skip_proxy: bool = True
 
 
 class HostMappingUpdate(BaseModel):
@@ -399,6 +400,7 @@ class HostMappingUpdate(BaseModel):
     target: Optional[str] = None
     sort_order: Optional[int] = None
     enabled: Optional[bool] = None
+    skip_proxy: Optional[bool] = None
 
 
 @router.get("/host-mappings")
@@ -421,6 +423,7 @@ async def list_host_mappings(
             "target": m.target,
             "sort_order": m.sort_order,
             "enabled": m.enabled,
+            "skip_proxy": m.skip_proxy,
         }
         for m in mappings
     ]

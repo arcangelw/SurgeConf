@@ -93,8 +93,6 @@ GENERAL_GROUPS = [
                               ("notify", "通知", "Notify"), ("warning", "警告", "Warning"),
                               ("error", "错误", "Error")]),
             FieldDef("show-error-page-for-reject", "拒绝时显示错误页", "Show Error Page for Reject", BOOL),
-            FieldDef("skip-proxy", "跳过代理", "Skip Proxy", TAGS,
-                     "这些地址不走代理", "Addresses that bypass proxy"),
             FieldDef("exclude-simple-hostnames", "排除简单主机名", "Exclude Simple Hostnames", BOOL),
             FieldDef("read-etc-hosts", "读取 hosts 文件", "Read /etc/hosts", BOOL),
             FieldDef("use-local-host-item-for-proxy", "代理使用本地 Host", "Use Local Host for Proxy", BOOL),

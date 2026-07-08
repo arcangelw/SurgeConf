@@ -70,7 +70,7 @@ async def seed_defaults():
             await db.commit()
 
     # 确保系统级配置存在（首次启动或数据库已有旧数据时）
-    sys_config_keys = {"exclusion_keywords", "other_auto_enabled", "other_manual_enabled"}
+    sys_config_keys = {"exclusion_keywords", "other_auto_enabled", "other_manual_enabled", "skip_proxy_custom"}
     existing_configs = set()
     async with async_session() as db:
         result = await db.execute(select(SystemConfig))
@@ -84,8 +84,17 @@ async def seed_defaults():
             db.add(SystemConfig(key="other_auto_enabled", value="true"))
         if "other_manual_enabled" in missing:
             db.add(SystemConfig(key="other_manual_enabled", value="true"))
+        if "skip_proxy_custom" in missing:
+            db.add(SystemConfig(key="skip_proxy_custom", value="[]"))
         if missing:
             await db.commit()
+
+    # 数据维护：清理孤儿节点（修复旧版本删除订阅时未级联删除节点导致的残留）
+    from app.services.subscription import cleanup_orphan_nodes
+    async with async_session() as db:
+        removed = await cleanup_orphan_nodes(db)
+        if removed:
+            print(f"[数据维护] 已清理 {removed} 个孤儿节点（归属订阅已删除的残留节点）", file=sys.stderr)
 
 
 @asynccontextmanager

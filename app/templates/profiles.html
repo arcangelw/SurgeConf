@@ -121,6 +121,12 @@
       <input type="text" id="host-target" placeholder="server:223.5.5.5 或 IP 地址">
       <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.host_target_hint"] }}</p>
     </div>
+    <div class="form-group">
+      <label class="checkbox">
+        <input type="checkbox" id="host-skip-proxy" checked> {{ t["profile.host_skip_proxy"] }}
+      </label>
+      <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.host_skip_proxy_hint"] }}</p>
+    </div>
     <div class="modal-footer">
       <button class="btn btn-outline" onclick="hideModal('host-modal')">{{ t["btn.cancel"] }}</button>
       <button class="btn btn-primary" onclick="saveHost()">{{ t["btn.save"] }}</button>
@@ -297,6 +303,7 @@ async function loadData() {
               <thead><tr>
                 <th>{{ t["profile.host_domain"] }}</th>
                 <th>{{ t["profile.host_target"] }}</th>
+                <th>{{ t["profile.host_skip_proxy_col"] }}</th>
                 <th>{{ t["sub.status"] }}</th>
                 <th>{{ t["node.col_action"] }}</th>
               </tr></thead>
@@ -594,6 +601,7 @@ async function loadHostList(profileId) {
       <tr>
         <td><code style="font-size:12px;">${escapeHtml(m.domain)}</code></td>
         <td><span class="badge badge-primary">${escapeHtml(m.target)}</span></td>
+        <td><span class="badge ${m.skip_proxy ? 'badge-success' : ''}">${m.skip_proxy ? '✓' : '—'}</span></td>
         <td><span class="badge ${m.enabled ? 'badge-success' : 'badge-danger'}">${m.enabled ? '{{ t["btn.enable"] }}' : '{{ t["btn.disable"] }}'}</span></td>
         <td>
           <button class="btn btn-sm btn-outline" onclick='editHost(${profileId}, ${JSON.stringify(m)})'>{{ t["btn.edit"] }}</button>
@@ -617,6 +625,7 @@ function showAddHost(profileId) {
   sel.innerHTML = '<option value="">{{ t["profile.host_select_preset"] }}</option>' +
     dnsPresets.map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
   sel.value = "";
+  document.getElementById("host-skip-proxy").checked = true;
   showModal("host-modal");
 }
 
@@ -631,6 +640,7 @@ function editHost(profileId, m) {
     dnsPresets.map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
   // 检查 target 是否匹配预置
   sel.value = dnsPresets.find(p => p.value === m.target) ? m.target : "";
+  document.getElementById("host-skip-proxy").checked = m.skip_proxy !== false;
   showModal("host-modal");
 }
 
@@ -641,13 +651,14 @@ async function saveHost() {
   const presetTarget = document.getElementById("host-target-preset").value;
   const customTarget = document.getElementById("host-target").value.trim();
   const target = presetTarget || customTarget;
+  const skipProxy = document.getElementById("host-skip-proxy").checked;
   if (!domain || !target) return;
   try {
     if (id) {
-      await API.put(`/api/configs/host-mappings/${id}`, { domain, target });
+      await API.put(`/api/configs/host-mappings/${id}`, { domain, target, skip_proxy: skipProxy });
       toast("{{ t["msg.updated"] }}");
     } else {
-      await API.post("/api/configs/host-mappings", { profile_id: profileId, domain, target, sort_order: 0 });
+      await API.post("/api/configs/host-mappings", { profile_id: profileId, domain, target, skip_proxy: skipProxy, sort_order: 0 });
       toast("{{ t["msg.added"] }}");
     }
     hideModal("host-modal");

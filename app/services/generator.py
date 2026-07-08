@@ -8,7 +8,7 @@ from app.models import (
     ConfigProfile, RuleSource, Subscription,
     CustomRule, HostMapping, SystemConfig,
 )
-from app.default_config import DEFAULT_GENERAL, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
+from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
 
 # 默认排除关键词（优先使用系统配置）
 DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
@@ -92,10 +92,20 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     other_auto_enabled = sys_config.get("other_auto_enabled", "true") == "true"
     other_manual_enabled = sys_config.get("other_manual_enabled", "true") == "true"
 
+    # Host 映射（提前查询：[Host] 段与 skip-proxy 合并共用）
+    host_result = await db.execute(
+        select(HostMapping)
+        .where(HostMapping.enabled == True)
+        .order_by(HostMapping.sort_order)
+    )
+    host_mappings = host_result.scalars().all()
+
     # General
     general = dict(DEFAULT_GENERAL)
     if profile and profile.general:
         general.update(profile.general)
+    # skip-proxy：默认条目 + 旧残留 + 系统级自定义 + host 勾选域名，合并去重
+    general["skip-proxy"] = ", ".join(_build_skip_proxy(profile, sys_config, host_mappings))
 
     sections = [
         "# ============================================================",
@@ -152,12 +162,6 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # Host
     sections.append("[Host]")
-    host_result = await db.execute(
-        select(HostMapping)
-        .where(HostMapping.enabled == True)
-        .order_by(HostMapping.sort_order)
-    )
-    host_mappings = host_result.scalars().all()
     for m in host_mappings:
         sections.append(f"{m.domain} = {m.target}")
     sections.append("")
@@ -174,6 +178,10 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     header_rewrites = profile.header_rewrites if (profile and profile.header_rewrites) else DEFAULT_HEADER_REWRITES
     for rule in header_rewrites:
         sections.append(rule)
+    sections.append("")
+
+    # Script
+    sections.append("[Script]")
     sections.append("")
 
     # MITM
@@ -373,3 +381,42 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
     lines.append(f"FINAL,{_quote(t('兜底'))},dns-failed")
 
     return lines
+
+
+def _build_skip_proxy(profile, sys_config: dict, host_mappings) -> list[str]:
+    """构建 skip-proxy 列表：默认条目 + 旧 profile 残留 + 系统级自定义 + host 勾选域名，去重保序。"""
+    import json
+
+    items = list(DEFAULT_SKIP_PROXY)
+
+    # 旧版 profile.general 中残留的 skip-proxy（升级兼容）
+    if profile and profile.general:
+        legacy = profile.general.get("skip-proxy")
+        if isinstance(legacy, str):
+            items.extend(x.strip() for x in legacy.split(",") if x.strip())
+
+    # 系统级自定义条目
+    try:
+        custom = json.loads(sys_config.get("skip_proxy_custom", "[]"))
+        if isinstance(custom, list):
+            items.extend(str(x).strip() for x in custom if str(x).strip())
+    except (ValueError, TypeError):
+        pass
+
+    # 仅「当前配置方案」中勾选的自定义 host 参与联动；
+    # 规则管理的默认 host（profile_id 为空）与其他方案的 host 都不并入
+    current_pid = profile.id if profile else None
+    for m in host_mappings:
+        if m.profile_id is not None and m.profile_id == current_pid and getattr(m, "skip_proxy", True):
+            domain = (m.domain or "").strip()
+            if domain:
+                items.append(domain)
+
+    # 去重保序
+    seen = set()
+    result = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            result.append(x)
+    return result

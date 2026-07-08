@@ -4,10 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from pydantic import BaseModel
 from app.database import get_db
-from app.models import ConfigProfile
+from app.models import ConfigProfile, SystemConfig
 from app.general_fields import GENERAL_GROUPS
-from app.default_config import DEFAULT_GENERAL
+from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY
 
 router = APIRouter(prefix="/api/general", tags=["General 设置"])
 
@@ -73,3 +74,38 @@ async def save_values(profile_id: int, values: dict, db: AsyncSession = Depends(
     profile.general = dict(current)
     await db.commit()
     return {"saved": True}
+
+
+# ===== Skip-Proxy 自定义条目（全局，存于 SystemConfig） =====
+
+@router.get("/skip-proxy")
+async def get_skip_proxy(db: AsyncSession = Depends(get_db)):
+    """返回自定义 skip-proxy 条目 + 内置默认条目"""
+    import json
+    result = await db.execute(select(SystemConfig).where(SystemConfig.key == "skip_proxy_custom"))
+    cfg = result.scalar_one_or_none()
+    try:
+        custom = json.loads(cfg.value) if (cfg and cfg.value) else []
+    except (ValueError, TypeError):
+        custom = []
+    return {"custom": custom, "defaults": list(DEFAULT_SKIP_PROXY)}
+
+
+class SkipProxyUpdate(BaseModel):
+    items: list[str]
+
+
+@router.put("/skip-proxy")
+async def save_skip_proxy(data: SkipProxyUpdate, db: AsyncSession = Depends(get_db)):
+    """保存自定义 skip-proxy 条目（覆盖式）"""
+    import json
+    items = [str(x).strip() for x in data.items if str(x).strip()]
+    value = json.dumps(items, ensure_ascii=False)
+    result = await db.execute(select(SystemConfig).where(SystemConfig.key == "skip_proxy_custom"))
+    cfg = result.scalar_one_or_none()
+    if cfg:
+        cfg.value = value
+    else:
+        db.add(SystemConfig(key="skip_proxy_custom", value=value))
+    await db.commit()
+    return {"saved": True, "items": items}

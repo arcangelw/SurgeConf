@@ -29,6 +29,14 @@ async def init_db():
             except Exception:
                 pass  # 列已存在
 
+        # 迁移：为已有 host_mappings 表添加 skip_proxy 列
+        try:
+            await conn.execute(text(
+                "ALTER TABLE host_mappings ADD COLUMN skip_proxy BOOLEAN NOT NULL DEFAULT 1"
+            ))
+        except Exception:
+            pass  # 列已存在
+
 
 async def get_db():
     async with async_session() as session:

@@ -10,6 +10,22 @@
   </div>
 </div>
 
+<div class="card gen-section" style="margin-bottom:16px;">
+  <div class="card-header">
+    <h3 class="gen-card-title">{{ t["general.skip_proxy_title"] }}</h3>
+  </div>
+  <p class="gen-hint" style="margin:0 0 12px;">{{ t["general.skip_proxy_hint"] }}</p>
+  <div style="display:flex;gap:8px;margin-bottom:12px;">
+    <input type="text" id="skip-proxy-input" placeholder="{{ t["general.skip_proxy_placeholder"] }}" style="flex:1;" onkeydown="if(event.key==='Enter'){event.preventDefault();addSkipProxyItem();}">
+    <button class="btn btn-primary" onclick="addSkipProxyItem()">{{ t["general.skip_proxy_add"] }}</button>
+  </div>
+  <div id="skip-proxy-list" style="display:flex;flex-wrap:wrap;gap:6px;min-height:8px;"></div>
+  <details style="margin-top:12px;">
+    <summary style="cursor:pointer;font-size:12px;color:var(--primary);">{{ t["general.skip_proxy_defaults"] }}</summary>
+    <div id="skip-proxy-defaults" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;"></div>
+  </details>
+</div>
+
 <div id="groups-container"></div>
 
 <details style="margin-top:16px;">
@@ -238,10 +254,65 @@ async function saveAll() {
   } catch (e) { toast(e.message, "error"); }
 }
 
+// ===== 自定义 Skip-Proxy（全局） =====
+let skipProxyItems = [];
+
+function escapeHtmlSimple(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function loadSkipProxy() {
+  try {
+    const data = await API.get("/api/general/skip-proxy");
+    skipProxyItems = data.custom || [];
+    renderSkipProxy();
+    const defaultsEl = document.getElementById("skip-proxy-defaults");
+    defaultsEl.innerHTML = (data.defaults || []).map(d =>
+      `<span class="badge">${escapeHtmlSimple(d)}</span>`
+    ).join("");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderSkipProxy() {
+  const el = document.getElementById("skip-proxy-list");
+  if (!skipProxyItems.length) {
+    el.innerHTML = `<span style="font-size:12px;color:var(--text2);">{{ t["general.skip_proxy_empty"] }}</span>`;
+    return;
+  }
+  el.innerHTML = skipProxyItems.map((item, i) =>
+    `<span class="badge badge-primary" style="display:inline-flex;align-items:center;gap:4px;">${escapeHtmlSimple(item)} <a style="cursor:pointer;margin-left:2px;color:var(--text2);" onclick="removeSkipProxyItem(${i})">✕</a></span>`
+  ).join("");
+}
+
+async function addSkipProxyItem() {
+  const input = document.getElementById("skip-proxy-input");
+  const val = input.value.trim();
+  if (!val) return;
+  if (skipProxyItems.includes(val)) { toast("{{ t["general.skip_proxy_dup"] }}", "error"); return; }
+  skipProxyItems.push(val);
+  input.value = "";
+  renderSkipProxy();
+  await saveSkipProxy();
+}
+
+async function removeSkipProxyItem(i) {
+  skipProxyItems.splice(i, 1);
+  renderSkipProxy();
+  await saveSkipProxy();
+}
+
+async function saveSkipProxy() {
+  try {
+    await API.put("/api/general/skip-proxy", { items: skipProxyItems });
+    toast("{{ t["msg.saved"] }}");
+  } catch (e) { toast(e.message, "error"); }
+}
+
 async function init() {
   await loadProfiles();
   await loadFields();
   await loadValues();
+  await loadSkipProxy();
 }
 init();
 </script>

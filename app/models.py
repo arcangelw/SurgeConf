@@ -104,6 +104,7 @@ class HostMapping(Base):
     target = Column(String(200), nullable=False, comment="目标，如 server:223.5.5.5 或 IP地址")
     sort_order = Column(Integer, default=0, comment="排序")
     enabled = Column(Boolean, default=True, comment="是否启用")
+    skip_proxy = Column(Boolean, default=True, server_default="1", comment="是否同时加入 skip-proxy")
 
 
 class RuleSource(Base):
