@@ -27,9 +27,8 @@ async def auth_middleware(request: Request, call_next):
     if _API_TOKEN:
         # 跳过静态文件和页面路由的认证
         path = request.url.path
-        if path.startswith("/static/") or path in ("/", "/subscriptions", "/nodes", "/groups",
-                                                     "/rules", "/profiles", "/generator",
-                                                     "/general", "/settings", "/api/settings/locale",
+        if path.startswith("/static/") or path in ("/", "/proxies", "/rules", "/profiles",
+                                                     "/settings", "/api/settings/locale",
                                                      "/docs", "/openapi.json"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")

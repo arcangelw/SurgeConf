@@ -1,4 +1,4 @@
-"""页面路由：渲染 9 个 Jinja2 模板页（路径与原 main.py 完全一致）。"""
+"""页面路由：渲染 5 个 Jinja2 模板页（按 Surge 功能模块组织）。"""
 
 import os
 
@@ -38,20 +38,6 @@ async def index(request: Request):
     return _render(request, "index.html")
 
 
-@router.get("/subscriptions", response_class=HTMLResponse)
-async def page_subscriptions(request: Request):
-    return _render(request, "subscriptions.html")
-
-
-@router.get("/nodes", response_class=HTMLResponse)
-async def page_nodes(request: Request):
-    return _render(request, "nodes.html")
-
-
-@router.get("/groups", response_class=HTMLResponse)
-async def page_groups(request: Request):
-    return _render(request, "groups.html")
-
 @router.get("/proxies", response_class=HTMLResponse)
 async def page_proxies(request: Request):
     return _render(request, "proxies.html")
@@ -65,16 +51,6 @@ async def page_rules(request: Request):
 @router.get("/profiles", response_class=HTMLResponse)
 async def page_profiles(request: Request):
     return _render(request, "profiles.html")
-
-
-@router.get("/generator", response_class=HTMLResponse)
-async def page_generator(request: Request):
-    return _render(request, "generator.html")
-
-
-@router.get("/general", response_class=HTMLResponse)
-async def page_general(request: Request):
-    return _render(request, "general.html")
 
 
 @router.get("/settings", response_class=HTMLResponse)
