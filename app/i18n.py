@@ -138,6 +138,11 @@ TRANSLATIONS = {
         "node.assigned": "已分配 {0} 个节点",
         "node.no_region": "未分配",
         "node.pin_btn": "绑定",
+        "node.pin_modal_title": "绑定到服务分组",
+        "node.unpin_modal_title": "解除服务绑定",
+        "node.pin_modal_hint": "勾选要操作的服务分组：",
+        "node.unpin_all": "解除全部绑定",
+        "node.no_service_selected": "请至少勾选一个服务分组",
         # 分组
         "group.region_title": "地区分组",
         "group.region_hint": "每个地区可独立开启「自动测速」和「手动选择」模式。两个都关闭则该地区停用。",
@@ -478,6 +483,11 @@ TRANSLATIONS = {
         "node.assigned": "Assigned {0} nodes",
         "node.no_region": "Unassigned",
         "node.pin_btn": "Bind",
+        "node.pin_modal_title": "Pin to Service Groups",
+        "node.unpin_modal_title": "Unpin Services",
+        "node.pin_modal_hint": "Select service groups:",
+        "node.unpin_all": "Unpin all services",
+        "node.no_service_selected": "Select at least one service group",
         # 分组
         "group.region_title": "Region Groups",
         "group.region_hint": "Each region can independently enable Auto Test and Manual Selection. Disabling both effectively disables the region.",
