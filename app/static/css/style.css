@@ -1117,3 +1117,64 @@ textarea {
     display: none;
   }
 }
+
+/* ===== 策略页双栏布局 ===== */
+.proxies-layout { display: flex; gap: 16px; align-items: flex-start; }
+.proxies-sidebar { width: 240px; flex-shrink: 0; position: sticky; top: 30px; }
+.proxies-sidebar .card { padding: 10px; }
+.proxies-main { flex: 1; min-width: 0; }
+
+.px-section { padding: 4px 0; }
+.px-section-title {
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text2); opacity: 0.6; padding: 8px 8px 4px;
+}
+.px-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; border-radius: 6px; cursor: pointer;
+  color: var(--text2); font-size: 13px; user-select: none;
+}
+.px-item:hover { background: var(--surface2); color: var(--text); }
+.px-item.active { background: var(--surface2); color: var(--primary); font-weight: 600; }
+.px-item .px-count {
+  margin-left: auto; font-size: 10px; color: var(--text2);
+  background: var(--surface2); border-radius: 8px; padding: 0 6px; flex-shrink: 0;
+}
+.px-item .px-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.px-item .px-grip { color: var(--text2); opacity: 0; cursor: grab; font-size: 12px; flex-shrink: 0; }
+.px-item:hover .px-grip { opacity: 0.6; }
+.px-add {
+  display: block; width: 100%; text-align: left; background: none; border: 1px dashed var(--border);
+  color: var(--text2); font-size: 12px; padding: 6px 8px; border-radius: 6px; cursor: pointer; margin-top: 4px;
+}
+.px-add:hover { color: var(--primary); border-color: var(--primary); }
+
+/* ===== Tab 条（策略/方案/规则页复用） ===== */
+.tab-bar {
+  display: flex; gap: 4px; border-bottom: 1px solid var(--border);
+  margin-bottom: 16px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+.tab-bar .tab-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text2); font-size: 13px; font-weight: 500;
+  padding: 8px 14px; border-bottom: 2px solid transparent;
+  white-space: nowrap; flex-shrink: 0;
+}
+.tab-bar .tab-btn:hover { color: var(--text); }
+.tab-bar .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+
+/* 策略页信息卡操作区 */
+.px-info-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+@media (max-width: 768px) {
+  .proxies-layout { flex-direction: column; gap: 12px; }
+  .proxies-sidebar { width: 100%; position: static; }
+  .proxies-sidebar .card { padding: 8px; }
+  .px-nav { display: flex; gap: 6px; overflow-x: auto; }
+  .px-section { flex-shrink: 0; padding: 0; display: flex; gap: 6px; align-items: center; }
+  .px-section-title { display: none; }
+  .px-section + .px-section { border-left: 1px solid var(--border); padding-left: 8px; }
+  .px-item { flex-shrink: 0; background: var(--surface2); }
+  .px-item .px-grip { display: none; }
+  .px-add { width: auto; margin-top: 0; }
+}

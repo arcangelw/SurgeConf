@@ -187,11 +187,12 @@ async def update_node(node_id: int, data: NodeRegionUpdate, db: AsyncSession = D
     if not node:
         raise HTTPException(404, "节点不存在")
 
-    if data.region_manual is not None:
+    # 显式传 null 表示清空该字段；未提供的字段保持不变
+    if "region_manual" in data.model_fields_set:
         node.region_manual = data.region_manual
-    if data.enabled is not None:
+    if "enabled" in data.model_fields_set:
         node.enabled = data.enabled
-    if data.pinned_services is not None:
+    if "pinned_services" in data.model_fields_set:
         node.pinned_services = data.pinned_services
     await db.commit()
     return {

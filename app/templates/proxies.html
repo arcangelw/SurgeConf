@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}{{ t["proxies.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ t["proxies.title"] }}</h1>
+  <div style="display:flex;gap:8px;">
+    <button class="btn btn-success" onclick="syncAll(this)">{{ t["btn.sync_all"] }}</button>
+    <button class="btn btn-primary" onclick="autoAssign(this)">{{ t["btn.auto_assign"] }}</button>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px;">
+  <p style="font-size:13px;color:var(--text2);">{{ t["proxies.desc"] }}</p>
+</div>
+
+<div class="proxies-layout">
+  <aside class="proxies-sidebar">
+    <div class="px-nav" id="px-nav"></div>
+  </aside>
+  <div class="proxies-main" id="px-main"></div>
+</div>
+
+<!-- 批量操作栏（nodes 页平移） -->
+<div id="batch-bar" style="display:none;position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  background:var(--surface);border:1px solid var(--primary);border-radius:12px;padding:12px 20px;
+  display:none;align-items:center;gap:12px;z-index:100;box-shadow:0 4px 20px rgba(0,0,0,0.4);">
+  <span id="batch-count" style="font-size:13px;font-weight:600;"></span>
+  <span style="color:var(--text2);font-size:12px;">{{ t["node.batch_action"] }}</span>
+  <select id="batch-target" style="width:120px;"></select>
+  <button class="btn btn-primary btn-sm" onclick="batchMove(this)">{{ t["node.batch_move"] }}</button>
+  <button class="btn btn-success btn-sm" onclick="batchPin(this)">{{ t["node.batch_pin"] }}</button>
+  <button class="btn btn-danger btn-sm" onclick="batchUnpin(this)">{{ t["node.batch_unpin"] }}</button>
+  <button class="btn btn-outline btn-sm" onclick="clearSelection()">{{ t["node.batch_cancel"] }}</button>
+</div>
+
+<!-- 节点详情弹窗 -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal" style="max-width:560px;">
+    <h3>{{ t["node.detail_title"] }}</h3>
+    <div id="detail-content"></div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('detail-modal')">{{ t["btn.close"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 钉选服务弹窗（多选，nodes 页平移） -->
+<div class="modal-overlay" id="pin-modal">
+  <div class="modal" style="max-width:420px;">
+    <h3 id="pin-modal-title">{{ t["node.pin_modal_title"] }}</h3>
+    <p style="font-size:12px;color:var(--text2);margin:8px 0;">{{ t["node.pin_modal_hint"] }}</p>
+    <div id="pin-service-list" style="max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;"></div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('pin-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" id="pin-modal-confirm">{{ t["btn.confirm"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 节点多选弹窗（地区组添加成员 / 服务组钉选共用） -->
+<div class="modal-overlay" id="node-picker-modal">
+  <div class="modal" style="max-width:480px;">
+    <h3 id="node-picker-title"></h3>
+    <p style="font-size:12px;color:var(--text2);margin:8px 0;">{{ t["proxies.node_picker_hint"] }}</p>
+    <input type="text" id="node-picker-search" placeholder="{{ t["proxies.search_placeholder"] }}"
+      oninput="filterPickerList()" style="width:100%;margin-bottom:8px;">
+    <div id="node-picker-list" style="max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;"></div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('node-picker-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" id="node-picker-confirm">{{ t["btn.confirm"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 订阅编辑弹窗（subscriptions 页平移） -->
+<div class="modal-overlay" id="sub-modal">
+  <div class="modal">
+    <h3 id="modal-title">{{ t["btn.add"] }}</h3>
+    <input type="hidden" id="edit-id">
+    <div class="form-group">
+      <label>{{ t["sub.name"] }}</label>
+      <input type="text" id="sub-name" placeholder="例：机场A">
+    </div>
+    <div style="display:flex;gap:12px;">
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["sub.tag"] }}</label>
+        <input type="text" id="sub-tag" placeholder="例：主力">
+      </div>
+      <div class="form-group" style="width:100px;">
+        <label>{{ t["sub.color"] }}</label>
+        <input type="color" id="sub-color" value="#6c5ce7" style="height:36px;padding:2px;">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["sub.url"] }}</label>
+      <input type="url" id="sub-url" placeholder="https://...">
+    </div>
+    <div style="display:flex;gap:16px;">
+      <div class="form-group">
+        <label class="checkbox"><input type="checkbox" id="sub-enabled" checked> {{ t["sub.enabled"] }}</label>
+      </div>
+      <div class="form-group">
+        <label class="checkbox"><input type="checkbox" id="sub-auto-update" checked> {{ t["sub.auto_update"] }}</label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["sub.interval"] }}</label>
+      <input type="number" id="sub-interval" value="86400">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('sub-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveSubscription()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 地区组编辑弹窗（groups 页平移） -->
+<div class="modal-overlay" id="region-modal">
+  <div class="modal">
+    <h3 id="region-modal-title">{{ t["group.add_region"] }}</h3>
+    <input type="hidden" id="region-edit-id">
+    <div class="form-group">
+      <label>{{ t["group.name"] }}</label>
+      <input type="text" id="region-name" placeholder="例：France">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.regex"] }}</label>
+      <input type="text" id="region-regex" placeholder="法|法国|France|FR">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.icon"] }}</label>
+      <input type="url" id="region-icon" placeholder="https://...">
+    </div>
+    <div style="display:flex;gap:12px;">
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["group.auto_enabled"] }}</label>
+        <select id="region-auto-enabled">
+          <option value="true">{{ t["btn.enable"] }}</option>
+          <option value="false">{{ t["btn.disable"] }}</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["group.manual_enabled"] }}</label>
+        <select id="region-manual-enabled">
+          <option value="true">{{ t["btn.enable"] }}</option>
+          <option value="false">{{ t["btn.disable"] }}</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.order"] }}</label>
+      <input type="number" id="region-order" value="10">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('region-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveRegion()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+
+<!-- 服务组编辑弹窗（groups 页平移） -->
+<div class="modal-overlay" id="service-modal">
+  <div class="modal" style="max-width:600px;">
+    <h3 id="service-modal-title">{{ t["group.add_service"] }}</h3>
+    <input type="hidden" id="service-edit-id">
+    <div class="form-group">
+      <label>{{ t["group.name"] }}</label>
+      <input type="text" id="service-name" placeholder="例：Spotify">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.type"] }}</label>
+      <select id="service-type">
+        <option value="select">{{ t["group.select_type"] }}</option>
+        <option value="url-test">{{ t["group.urltest_type"] }}</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label>{{ t["group.policies"] }}</label>
+      <div id="policy-tags" class="policy-tags"></div>
+    </div>
+
+    <div class="form-group">
+      <label style="margin-bottom:8px;">{{ t["group.click_add"] }}</label>
+      <div id="available-groups" class="available-groups"></div>
+    </div>
+
+    <div class="form-group">
+      <label>{{ t["group.icon"] }}</label>
+      <input type="url" id="service-icon" placeholder="https://...">
+    </div>
+    <div class="form-group">
+      <label>{{ t["group.order"] }}</label>
+      <input type="number" id="service-order" value="10">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('service-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveService()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/rules-common.js"></script>
+<script src="/static/js/proxies.js" defer></script>
+{% endblock %}

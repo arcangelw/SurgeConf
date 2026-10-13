@@ -52,6 +52,10 @@ async def page_nodes(request: Request):
 async def page_groups(request: Request):
     return _render(request, "groups.html")
 
+@router.get("/proxies", response_class=HTMLResponse)
+async def page_proxies(request: Request):
+    return _render(request, "proxies.html")
+
 
 @router.get("/rules", response_class=HTMLResponse)
 async def page_rules(request: Request):

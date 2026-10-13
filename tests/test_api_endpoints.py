@@ -141,3 +141,29 @@ async def test_batch_unpin_removes_service(client):
     for nid in ids:
         node = (await client.get(f"/api/nodes/{nid}")).json()
         assert "AI服务" not in (node.get("pinned_services") or [])
+
+
+@pytest.mark.asyncio
+async def test_update_node_null_clears_region(client):
+    """显式传 null 清空 region_manual；未提供的字段保持不变"""
+    async with client._test_factory() as s:
+        node = ProxyNode(name="HK-C1", node_type="trojan", server="9.9.9.7", port=443,
+                         config="HK-C1 = trojan, 9.9.9.7, 443, password=x",
+                         region_auto="香港", region_manual="香港", enabled=True)
+        s.add(node)
+        await s.commit()
+        nid = node.id
+
+    # 显式 null：清空手动地区（回落 auto）
+    resp = await client.put(f"/api/nodes/{nid}", json={"region_manual": None})
+    assert resp.status_code == 200
+    assert resp.json()["region_manual"] is None
+
+    # 空请求体：所有字段不变
+    resp = await client.put(f"/api/nodes/{nid}", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["region_manual"] is None and body["enabled"] is True
+
+    detail = (await client.get(f"/api/nodes/{nid}")).json()
+    assert detail["region_auto"] == "香港"
