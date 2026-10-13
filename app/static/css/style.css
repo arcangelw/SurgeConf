@@ -441,7 +441,7 @@ textarea {
   white-space: pre;
 }
 
-/* General 页面 */
+/* General / 生成器页面共用 */
 .gen-section { margin-bottom: 16px; }
 .gen-grid {
   display: grid;
@@ -518,10 +518,6 @@ textarea {
   overflow-y: auto;
 }
 
-/* 生成器页面 */
-.gen-section {
-  margin-bottom: 16px;
-}
 .gen-card-title {
   font-size: 15px;
   font-weight: 600;

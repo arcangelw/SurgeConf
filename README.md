@@ -376,7 +376,9 @@ MITM（中间人解密）是 URL Rewrite、Header Rewrite、Script 等功能的�
 ```
 SurgeConf/
 ├── app/
-│   ├── main.py              # FastAPI 应用入口 + 种子数据
+│   ├── main.py              # FastAPI 装配层（中间件 + 路由挂载 + 静态文件）
+│   ├── bootstrap.py         # 启动引导：建表 + 种子数据 + 幂等迁移 + lifespan
+│   ├── pages.py             # 9 个页面路由（Jinja2 渲染）
 │   ├── models.py            # 数据库模型（含 CustomRule、HostMapping）
 │   ├── database.py          # 数据库配置 + 迁移
 │   ├── i18n.py              # 多语言支持
@@ -387,12 +389,16 @@ SurgeConf/
 │   │   ├── nodes.py         # 节点管理 + 绑定服务 API
 │   │   ├── groups.py        # 策略分组 API
 │   │   ├── configs.py       # 配置方案 + 自定义规则 + Host 映射 + 生成 API
-│   │   └── general.py       # General 设置 API
+│   │   ├── general.py       # General 设置 API
+│   │   └── settings.py      # 系统设置 API（locale/重置/系统配置批量）
 │   ├── services/
 │   │   ├── subscription.py  # 订阅拉取与节点解析
 │   │   └── generator.py     # Surge 配置生成器
-│   ├── templates/           # HTML 页面模板
-│   └── static/              # CSS + JS
+│   ├── templates/           # HTML 页面模板（macros/ 含共用弹窗 macro）
+│   └── static/
+│       ├── css/             # 样式
+│       ├── js/              # app.js 公共层 + rules-common.js + 每页一个 JS（无构建）
+│       └── vendor/          # 第三方库（SortableJS 本地化）
 ├── data/                    # SQLite 数据库 + 生成的配置
 ├── tests/                   # 单元测试
 ├── start.sh                 # 启动脚本（开发模式）
