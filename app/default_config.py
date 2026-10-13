@@ -415,24 +415,17 @@ HOST_DNS_PRESETS = [
 DEFAULT_URL_REWRITES = [
     "^https?:\\/\\/(www\\.)?(g|google)\\.cn https://www.google.com 302",
     "^https?:\\/\\/(ditu|maps)\\.google\\.cn https://maps.google.com 302",
-    "^https?:\\/\\/(www\\.)?taobao\\.com\\/ https://taobao.com/ 302",
-    "^https?:\\/\\/(www\\.)?jd\\.com\\/ https://www.jd.com/ 302",
-    "^https?:\\/\\/(www\\.)?mi\\.com\\/ https://www.mi.com/ 302",
-    "^https?:\\/\\/(www\\.)?suning\\.com\\/ https://suning.com/ 302",
-    "^https?:\\/\\/(www\\.)?yhd\\.com\\/ https://yhd.com/ 302",
     "^https?:\\/\\/api\\.abema\\.io\\/v\\d\\/ip\\/check - reject",
 ]
 
-DEFAULT_HEADER_REWRITES = [
-    "http-request ^https:\\/\\/github\\.com\\/ header-replace Accept-Language en-us",
-    "http-request ^https:\\/\\/(raw|gist)\\.githubusercontent\\.com\\/ header-replace Accept-Language en-us",
-]
+# 注意：URL Rewrite / Header Rewrite 对 HTTPS 需对应域名在 MITM hostname 中，否则不生效
+DEFAULT_HEADER_REWRITES = []
 
 DEFAULT_MITM = {
-    "skip-server-cert-verify": True,
+    "skip-server-cert-verify": False,
     "tcp-connection": True,
     "h2": True,
-    "hostname": "www.google.cn, api.abema.io, *.zhihu.com, -CUSTOMMitM, sub.store",
+    "hostname": "www.google.cn, api.abema.io",
 }
 
 # 前置自定义规则 - 放在规则集之前，覆盖规则集的匹配

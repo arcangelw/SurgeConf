@@ -13,6 +13,8 @@ from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_
 # 默认排除关键词（优先使用系统配置）
 DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
 
+# IP 类规则集关键词：命中则生成 no-resolve，避免域名连接为匹配 IP 规则触发本地 DNS 解析（DNS 泄漏）
+DEFAULT_NO_RESOLVE_KEYWORDS = "(ip),ASN,/ip/,Lan"
 
 async def _get_sys_config(db: AsyncSession) -> dict:
     """读取系统级配置"""
@@ -124,10 +126,14 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
             sections.append(f"{key} = {value}")
     sections.append("")
 
-    # Proxy
+    # Proxy（排除订阅信息节点，如 Expire/Traffic，与分组过滤使用同一关键词）
+    import re as _re
+    info_pattern = _re.compile(exclusion_keywords)
     sections.append("[Proxy]")
     if all_nodes:
         for node in all_nodes:
+            if info_pattern.search(node.name):
+                continue
             display = _display_name(node, sub_map)
             config_line = node.config.replace(node.name, display, 1)
             sections.append(config_line)
@@ -157,7 +163,8 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     )
     general_rules = general_rules_result.scalars().all()
 
-    sections.extend(_build_rules(rule_sources, pre_rules, general_rules, t, tc, tcomment))
+    no_resolve_keywords = sys_config.get("no_resolve_keywords", DEFAULT_NO_RESOLVE_KEYWORDS)
+    sections.extend(_build_rules(rule_sources, pre_rules, general_rules, t, tc, tcomment, no_resolve_keywords))
     sections.append("")
 
     # Host
@@ -334,8 +341,11 @@ def _build_proxy_groups(
     return lines
 
 
-def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment) -> list[str]:
+def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, no_resolve_keywords: str | None = None) -> list[str]:
     lines = []
+
+    # 命中关键词的规则集视为 IP 类，追加 no-resolve 防止触发本地 DNS 解析
+    ip_keywords = [k.strip() for k in (no_resolve_keywords or DEFAULT_NO_RESOLVE_KEYWORDS).split(",") if k.strip()]
 
     # 前置自定义规则
     if pre_rules:
@@ -358,7 +368,10 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
             lines.append(f"# >> {tc(current_category)}")
 
         translated_action = t(rs.action)
-        lines.append(f"{rs.rule_type},{rs.url},{_quote(translated_action)}")
+        line = f"{rs.rule_type},{rs.url},{_quote(translated_action)}"
+        if any(kw in rs.name or kw in rs.url for kw in ip_keywords):
+            line += ",no-resolve"
+        lines.append(line)
 
     # 通用自定义规则
     if general_rules:
@@ -374,7 +387,7 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
                 lines.append(rule)
 
     lines.append("")
-    lines.append("RULE-SET,LAN,DIRECT")
+    lines.append("RULE-SET,LAN,DIRECT,no-resolve")
 
     lines.append("")
     lines.append(f"# >> {tcomment('final_rule')}")

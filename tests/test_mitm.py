@@ -89,7 +89,7 @@ class TestGeneratorMitm:
         """无 profile 时使用 DEFAULT_MITM"""
         config = await generate_surge_config(db, profile_id=None)
         mitm_lines = self._extract_mitm(config)
-        assert "skip-server-cert-verify = true" in mitm_lines
+        assert "skip-server-cert-verify = false" in mitm_lines
         assert "tcp-connection = true" in mitm_lines
         assert "h2 = true" in mitm_lines
         assert "www.google.cn" in " ".join(mitm_lines)
@@ -99,7 +99,7 @@ class TestGeneratorMitm:
         """profile.mitm 为空时回退 DEFAULT_MITM"""
         config = await generate_surge_config(db, profile_id=1)
         mitm_lines = self._extract_mitm(config)
-        assert "skip-server-cert-verify = true" in mitm_lines
+        assert "skip-server-cert-verify = false" in mitm_lines
         assert "tcp-connection = true" in mitm_lines
         assert "h2 = true" in mitm_lines
         assert "www.google.cn" in " ".join(mitm_lines)
@@ -133,7 +133,7 @@ class TestGeneratorMitm:
         config = await generate_surge_config(db, profile_id=p.id)
         mitm_lines = self._extract_mitm(config)
         assert "hostname = only.this.com" in mitm_lines
-        assert "skip-server-cert-verify = true" in mitm_lines
+        assert "skip-server-cert-verify = false" in mitm_lines
         assert "tcp-connection = true" in mitm_lines
         assert "h2 = true" in mitm_lines
 
@@ -190,13 +190,13 @@ class TestGeneratorMitm:
         """重置 profile.mitm={} 后生成器回退 DEFAULT_MITM"""
         from app.models import ConfigProfile
         p = ConfigProfile(name="重置测试", locale="zh",
-                          mitm={"skip-server-cert-verify": False})
+                          mitm={"skip-server-cert-verify": True})
         db.add(p)
         await db.commit()
 
         # 覆盖前
         config_before = await generate_surge_config(db, profile_id=p.id)
-        assert "skip-server-cert-verify = false" in self._extract_mitm(config_before)
+        assert "skip-server-cert-verify = true" in self._extract_mitm(config_before)
 
         # 重置
         p.mitm = {}
@@ -204,7 +204,7 @@ class TestGeneratorMitm:
 
         # 覆盖后
         config_after = await generate_surge_config(db, profile_id=p.id)
-        assert "skip-server-cert-verify = true" in self._extract_mitm(config_after)
+        assert "skip-server-cert-verify = false" in self._extract_mitm(config_after)
 
     @pytest.mark.asyncio
     async def test_no_profile_still_has_mitm_section(self, db):

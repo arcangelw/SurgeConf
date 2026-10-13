@@ -403,7 +403,39 @@ class TestBuildRules:
 
     def test_lan_rule_present(self):
         lines = self._rules()
-        assert any("RULE-SET,LAN,DIRECT" == l for l in lines)
+        assert any("RULE-SET,LAN,DIRECT,no-resolve" == l for l in lines)
+
+    def test_ip_ruleset_gets_no_resolve(self):
+        rs = RuleSource(name="Domestic (ip)", url="https://ruleset.skk.moe/List/ip/domestic.conf",
+                        action="大陆直连", rule_type="RULE-SET", category="mainland", sort_order=0, enabled=True)
+        lines = self._rules(sources=[rs])
+        line = next(l for l in lines if "domestic.conf" in l)
+        assert line.endswith(",no-resolve")
+
+    def test_asn_ruleset_gets_no_resolve(self):
+        rs = RuleSource(name="ASN China", url="https://example.com/ASN.China.list",
+                        action="DIRECT", rule_type="RULE-SET", category="mainland", sort_order=0, enabled=True)
+        lines = self._rules(sources=[rs])
+        line = next(l for l in lines if "ASN.China.list" in l)
+        assert line.endswith(",no-resolve")
+
+    def test_domain_ruleset_no_no_resolve(self):
+        rs = RuleSource(name="Domestic (non_ip)", url="https://ruleset.skk.moe/List/non_ip/domestic.conf",
+                        action="大陆直连", rule_type="RULE-SET", category="mainland", sort_order=0, enabled=True)
+        lines = self._rules(sources=[rs])
+        line = next(l for l in lines if "non_ip/domestic.conf" in l)
+        assert not line.endswith(",no-resolve")
+        assert "no-resolve" not in line
+
+    def test_custom_no_resolve_keywords(self):
+        rs = RuleSource(name="Telethon IP", url="https://example.com/tg.list",
+                        action="Telegram", rule_type="RULE-SET", category="social", sort_order=0, enabled=True)
+        lines = _build_rules([rs], [], [], _t_zh,
+                             lambda k: CATEGORY_NAMES.get(k, k),
+                             lambda k: COMMENT_NAMES.get(k, (k, k))[0],
+                             no_resolve_keywords="Telethon")
+        line = next(l for l in lines if "tg.list" in l)
+        assert line.endswith(",no-resolve")
 
     def test_rule_action_not_translated_zh(self):
         rs = RuleSource(name="Test", url="https://example.com", action="AI服务",
