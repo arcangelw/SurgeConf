@@ -441,20 +441,38 @@ textarea {
   white-space: pre;
 }
 
-/* General / 生成器页面共用 */
-.gen-section { margin-bottom: 16px; }
+/* General / 生成器页面共用（紧凑布局） */
+.gen-section {
+  margin-bottom: 12px;
+  padding: 14px 16px;
+}
+.gen-section .card-header { margin-bottom: 10px; }
 .gen-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 10px 16px;
 }
-.gen-field { margin-bottom: 4px; }
+.gen-field { margin-bottom: 0; }
 .gen-field-wide { grid-column: 1 / -1; }
 .gen-label {
   display: block;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text2);
-  margin-bottom: 4px;
+  margin-bottom: 3px;
+}
+.gen-field-bool {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.gen-field-bool .gen-hint { flex-basis: 100%; }
+.gen-label-hint { font-size: 11px; color: var(--text2); font-weight: 400; }
+.gen-field-bool .gen-label { margin-bottom: 0; }
+.gen-grid .gen-field > input,
+.gen-grid .gen-field > .tags-input-wrap > textarea {
+  padding: 6px 10px;
 }
 .gen-toggle {
   font-size: 11px;
@@ -519,9 +537,9 @@ textarea {
 }
 
 .gen-card-title {
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
-  margin-bottom: 14px;
+  margin-bottom: 0;
 }
 .gen-row {
   display: flex;
@@ -555,9 +573,10 @@ textarea {
   font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
 }
 .gen-hint {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text2);
-  margin-top: 10px;
+  margin-top: 3px;
+  line-height: 1.5;
 }
 
 /* 全屏预览遮罩 */
@@ -980,7 +999,6 @@ textarea {
   }
 
   /* 通用设置 */
-  .gen-grid { grid-template-columns: 1fr; }
   .gen-row { flex-direction: column; align-items: stretch; }
   .gen-filename-input { width: 100%; }
   .gen-ip-select { max-width: none; }

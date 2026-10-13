@@ -240,14 +240,14 @@ function renderField(f, profileId) {
   const hintText = hint(f) ? `<p class="gen-hint">${hint(f)}</p>` : "";
 
   if (f.type === "bool") {
+    const inlineHint = hint(f) ? ` <span class="gen-label-hint">${hint(f)}</span>` : "";
     return `
-    <div class="gen-field">
-      <label class="gen-label" for="${id}">${label(f)}</label>
-      <label class="toggle-wrap">
+    <div class="gen-field gen-field-bool">
+      <label class="gen-label" for="${id}">${label(f)}${inlineHint}</label>
+      <label class="toggle-wrap" title="${hint(f) || ""}">
         <input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool">
         <span class="toggle-slider"></span>
       </label>
-      ${hintText}
     </div>`;
   }
 
