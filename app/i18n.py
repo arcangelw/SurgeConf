@@ -307,6 +307,7 @@ TRANSLATIONS = {
         "generator.localhost": "127.0.0.1 (本机)",
         "generator.lan_ip": "{0} (局域网)",
         "generator.copied": "已复制订阅链接",
+        "generator.copy_failed": "复制失败，请手动复制（已全选）",
         "generator.locale_auto": "跟随配置方案",
         # General
         "general.title": "General 设置",
@@ -652,6 +653,7 @@ TRANSLATIONS = {
         "generator.localhost": "127.0.0.1 (Localhost)",
         "generator.lan_ip": "{0} (LAN)",
         "generator.copied": "Subscription URL copied",
+        "generator.copy_failed": "Copy failed, please copy manually (selected)",
         "generator.locale_auto": "Follow Profile",
         # General
         "general.title": "General Settings",

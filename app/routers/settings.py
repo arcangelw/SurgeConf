@@ -43,24 +43,6 @@ async def get_sys_config(db=Depends(get_db)):
     return configs
 
 
-class SysConfigUpdate(BaseModel):
-    key: str
-    value: str
-
-
-@router.put("/config")
-async def update_sys_config(data: SysConfigUpdate, db=Depends(get_db)):
-    """更新单条系统配置"""
-    result = await db.execute(select(SystemConfig).where(SystemConfig.key == data.key))
-    cfg = result.scalar_one_or_none()
-    if not cfg:
-        cfg = SystemConfig(key=data.key, value=data.value)
-        db.add(cfg)
-    else:
-        cfg.value = data.value
-    await db.commit()
-    return {data.key: data.value}
-
 
 class SysConfigBatchUpdate(BaseModel):
     configs: dict[str, str]

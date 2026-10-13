@@ -32,7 +32,7 @@
     </div>
   </div>
   <div style="margin-top:12px;">
-    <button class="btn btn-primary" onclick="saveSysConfig()">{{ t["btn.save"] }}</button>
+    <button class="btn btn-primary" onclick="saveSysConfig(this)">{{ t["btn.save"] }}</button>
   </div>
 </div>
 
@@ -46,54 +46,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
-async function setLocale(locale) {
-  try {
-    await fetch("/api/settings/locale", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ locale }),
-    });
-    window.location.reload();
-  } catch (e) { toast(e.message, "error"); }
-}
-
-async function resetData() {
-  if (!confirm("{{ t["settings.confirm_reset"] }}")) return;
-  try {
-    const resp = await fetch("/api/settings/reset", { method: "POST" });
-    if (resp.ok) {
-      toast("{{ t["settings.reset_done"] }}");
-      setTimeout(() => window.location.reload(), 1000);
-    }
-  } catch (e) { toast(e.message, "error"); }
-}
-
-// ===== 系统级配置 =====
-
-async function loadSysConfig() {
-  try {
-    const config = await API.get("/api/settings/config");
-    const keywords = config.exclusion_keywords || "Remain|Expired|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed";
-    document.getElementById("exclusion-keywords").value = keywords.replace(/\|/g, "\n");
-    document.getElementById("other-auto-enabled").checked = config.other_auto_enabled !== "false";
-    document.getElementById("other-manual-enabled").checked = config.other_manual_enabled !== "false";
-  } catch (e) { toast(e.message, "error"); }
-}
-
-async function saveSysConfig() {
-  try {
-    const keywords = document.getElementById("exclusion-keywords").value
-      .split("\n").map(s => s.trim()).filter(Boolean).join("|");
-    await API.put("/api/settings/config", { key: "exclusion_keywords", value: keywords });
-    const autoChecked = document.getElementById("other-auto-enabled").checked;
-    const manualChecked = document.getElementById("other-manual-enabled").checked;
-    await API.put("/api/settings/config", { key: "other_auto_enabled", value: autoChecked ? "true" : "false" });
-    await API.put("/api/settings/config", { key: "other_manual_enabled", value: manualChecked ? "true" : "false" });
-    toast("{{ t["settings.saved"] }}");
-  } catch (e) { toast(e.message, "error"); }
-}
-
-loadSysConfig();
-</script>
+<script src="/static/js/settings.js" defer></script>
 {% endblock %}
