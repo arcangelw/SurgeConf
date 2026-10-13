@@ -111,13 +111,14 @@ async def apply_data_migrations(db) -> None:
             db.add(CustomRule(profile_id=None, **r))
             added += 1
 
-    # 存量档案 ipv6-vif: auto → disable（与模板 ipv6=false 对齐，彻底禁用 v6）
+    # 存量档案 ipv6-vif 归一为官方规范值 disabled（auto/native 按既定策略强制关闭；
+    # off 是官方兼容旧值、disable 是历史拼写错误，统一归一不改变"关闭"语义）
     # 必须先复制再改后整体赋值：原地修改 + reassign 相等值会被 SQLAlchemy 判为无变化而跳过 UPDATE
     fixed_v6 = 0
     for profile in (await db.execute(select(ConfigProfile))).scalars().all():
         g = dict(profile.general) if isinstance(profile.general, dict) else {}
-        if g.get("ipv6-vif") == "auto":
-            g["ipv6-vif"] = "disable"
+        if g.get("ipv6-vif") in ("auto", "native", "off", "disable"):
+            g["ipv6-vif"] = "disabled"
             profile.general = g
             fixed_v6 += 1
 

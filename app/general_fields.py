@@ -35,7 +35,7 @@ GENERAL_GROUPS = [
                      "启用 IPv6 支持", "Enable IPv6 support"),
             FieldDef("ipv6-vif", "IPv6 VIF 模式", "IPv6 VIF Mode", SELECT,
                      hint_zh="IPv6 虚拟网卡模式", hint_en="IPv6 virtual interface mode",
-                     options=[("auto", "自动", "Auto"), ("native", "原生", "Native"), ("off", "关闭", "Off")]),
+                     options=[("disabled", "关闭", "Disabled"), ("auto", "自动", "Auto"), ("always", "始终", "Always")]),
             FieldDef("udp-priority", "UDP 优先", "UDP Priority", BOOL,
                      "优先处理 UDP 流量", "Prioritize UDP traffic"),
             FieldDef("all-hybrid", "全部混合代理", "All Hybrid Proxy", BOOL,

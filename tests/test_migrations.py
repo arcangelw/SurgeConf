@@ -61,23 +61,24 @@ async def test_user_deleted_default_rules_not_revived(db):
 
 
 @pytest.mark.asyncio
-async def test_ipv6_vif_auto_migrated_to_disable(db):
-    """存量档案 ipv6-vif=auto 被修正为 disable 并持久化；disable 不动"""
+@pytest.mark.parametrize("legacy", ["auto", "native", "off", "disable"])
+async def test_ipv6_vif_normalized_to_disabled(db, legacy):
+    """存量档案 ipv6-vif 的 auto/native/off/disable 全部归一为官方规范值 disabled 并持久化；幂等"""
     p = (await db.execute(select(ConfigProfile))).scalars().first()
-    p.general = dict(p.general, **{"ipv6-vif": "auto"})
+    p.general = dict(p.general, **{"ipv6-vif": legacy})
     await db.commit()
 
     await apply_data_migrations(db)
 
     async with await _fresh_view(db) as fresh:
         g = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
-    assert g["ipv6-vif"] == "disable"
+    assert g["ipv6-vif"] == "disabled"
 
-    # 已是 disable 时再迁移无变化（幂等）
+    # 已是 disabled 时再迁移无变化（幂等）
     await apply_data_migrations(db)
     async with await _fresh_view(db) as fresh:
         g2 = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
-    assert g2["ipv6-vif"] == "disable"
+    assert g2["ipv6-vif"] == "disabled"
 
 
 @pytest.mark.asyncio
