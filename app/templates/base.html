@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}SurgeConf{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v={{ asset_ver }}">
 </head>
 <body>
   <div class="layout">
@@ -31,8 +31,8 @@
   <div class="toast-container"></div>
 <script>const LOCALE_NAMES = {{ locale_names | tojson }};</script>
   <script>window.I18N = {{ t | tojson }};</script>
-  <script src="/static/vendor/Sortable.min.js"></script>
-  <script src="/static/js/app.js"></script>
+  <script src="/static/vendor/Sortable.min.js?v={{ asset_ver }}"></script>
+  <script src="/static/js/app.js?v={{ asset_ver }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

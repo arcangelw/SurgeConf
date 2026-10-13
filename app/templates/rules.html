@@ -179,6 +179,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/js/rules-common.js"></script>
-<script src="/static/js/rules.js" defer></script>
+<script src="/static/js/rules-common.js?v={{ asset_ver }}"></script>
+<script src="/static/js/rules.js?v={{ asset_ver }}" defer></script>
 {% endblock %}
