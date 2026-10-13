@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.main import apply_data_migrations
+from app.bootstrap import apply_data_migrations
 from app.models import CustomRule, ConfigProfile, SystemConfig
 from app.default_config import SECURITY_PRE_RULES
 

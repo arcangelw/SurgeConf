@@ -12,7 +12,7 @@ from typing import Optional
 from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
 from app.services.generator import generate_surge_config
-from app.default_config import HOST_DNS_PRESETS
+from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
 
 router = APIRouter(prefix="/api/configs", tags=["配置管理"])
 
@@ -122,13 +122,31 @@ async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSe
 
 @router.delete("/profiles/{profile_id}")
 async def delete_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
+    """级联删除：单事务内删除该档案的定制规则、Host 映射与档案本体"""
     result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
     profile = result.scalar_one_or_none()
     if not profile:
         raise HTTPException(404, "配置方案不存在")
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(CustomRule).where(CustomRule.profile_id == profile_id))
+    await db.execute(sa_delete(HostMapping).where(HostMapping.profile_id == profile_id))
     await db.delete(profile)
     await db.commit()
     return {"deleted": profile_id}
+
+
+@router.put("/profiles/{profile_id}/set-default")
+async def set_default_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
+    """设为默认：同事务内先清旧默认再置新默认，保证全局恰一条 is_default"""
+    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
+    profile = result.scalar_one_or_none()
+    if not profile:
+        raise HTTPException(404, "配置方案不存在")
+    from sqlalchemy import update as sa_update
+    await db.execute(sa_update(ConfigProfile).where(ConfigProfile.is_default == True).values(is_default=False))
+    profile.is_default = True
+    await db.commit()
+    return {"ok": True}
 
 
 # ===== 规则源 =====
@@ -150,6 +168,11 @@ async def list_rules(db: AsyncSession = Depends(get_db)):
         }
         for r in rules
     ]
+
+@router.get("/rules/default-order")
+async def get_rules_default_order():
+    """内置规则源的默认排序，供前端「恢复默认排序」使用"""
+    return [{"name": rs["name"], "sort_order": rs["sort_order"]} for rs in DEFAULT_RULE_SOURCES]
 
 
 @router.post("/rules")
