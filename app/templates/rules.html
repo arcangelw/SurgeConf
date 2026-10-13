@@ -244,20 +244,12 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/rules-common.js"></script>
 <script>
 let allRules = [];
 let allRegions = [];
 let allServices = [];
 let allCustomRules = {pre: [], general: []};
-
-const VIRT_LABELS = {
-  "全部节点": "{{ t["group.virt.all_nodes"] }}",
-  "自动选择": "{{ t["group.virt.auto"] }}",
-  "代理": "{{ t["group.virt.proxy"] }}",
-  "手动选择": "{{ t["group.virt.manual_select"] }}",
-  "大陆直连": "{{ t["group.virt.mainland"] }}",
-  "兜底": "{{ t["group.virt.fallback"] }}",
-};
 
 const CATEGORY_MAP = {
   unbreak: "{{ t["rule.cat.unbreak"] }}",
@@ -278,52 +270,6 @@ const CATEGORY_MAP = {
 
 function displayAction(name) {
   return VIRT_LABELS[name] || translateName(name);
-}
-
-function buildActionOptions(selectedValue) {
-  const parts = [];
-
-  const sysActions = ["DIRECT", "REJECT", "REJECT-DROP", "REJECT-NO-DROP"];
-  parts.push('<optgroup label="{{ t["rule.action_system"] }}">');
-  for (const a of sysActions) {
-    parts.push(`<option value="${a}" ${a === selectedValue ? 'selected' : ''}>${a}</option>`);
-  }
-  parts.push('</optgroup>');
-
-  const virtGroups = ["全部节点", "自动选择", "代理", "手动选择", "大陆直连", "其他"];
-  parts.push('<optgroup label="{{ t["rule.action_virtual"] }}">');
-  for (const g of virtGroups) {
-    const label = VIRT_LABELS[g] || g;
-    parts.push(`<option value="${escapeHtml(g)}" ${g === selectedValue ? 'selected' : ''}>${escapeHtml(label)}</option>`);
-  }
-  parts.push('</optgroup>');
-
-  if (allServices.length > 0) {
-    parts.push('<optgroup label="{{ t["rule.action_service"] }}">');
-    for (const s of allServices) {
-      const label = translateName(s.name);
-      parts.push(`<option value="${escapeHtml(s.name)}" ${s.name === selectedValue ? 'selected' : ''}>${escapeHtml(label)}</option>`);
-    }
-    parts.push('</optgroup>');
-  }
-
-  if (allRegions.length > 0) {
-    parts.push('<optgroup label="{{ t["rule.action_region_auto"] }}">');
-    for (const r of allRegions) {
-      parts.push(`<option value="${escapeHtml(r.name)}" ${r.name === selectedValue ? 'selected' : ''}>${escapeHtml(translateName(r.name))}</option>`);
-    }
-    parts.push('</optgroup>');
-
-    parts.push('<optgroup label="{{ t["rule.action_region_manual"] }}">');
-    for (const r of allRegions) {
-      const manName = r.name + "手动";
-      const manLabel = translateName(r.name) + " Manual";
-      parts.push(`<option value="${escapeHtml(manName)}" ${manName === selectedValue ? 'selected' : ''}>${escapeHtml(manLabel)}</option>`);
-    }
-    parts.push('</optgroup>');
-  }
-
-  return parts.join("");
 }
 
 function buildCategoryOptions() {
@@ -479,7 +425,7 @@ function showAddRule() {
   document.getElementById("rule-name").value = "";
   document.getElementById("rule-url").value = "";
   document.getElementById("rule-type").value = "RULE-SET";
-  document.getElementById("rule-action").innerHTML = buildActionOptions("");
+  document.getElementById("rule-action").innerHTML = buildActionOptions("", allServices, allRegions);
   document.getElementById("rule-category").value = "";
   document.getElementById("rule-order").value = 50;
   showModal("rule-modal");
@@ -491,7 +437,7 @@ function editRule(r) {
   document.getElementById("rule-name").value = r.name;
   document.getElementById("rule-url").value = r.url;
   document.getElementById("rule-type").value = r.rule_type;
-  document.getElementById("rule-action").innerHTML = buildActionOptions(r.action);
+  document.getElementById("rule-action").innerHTML = buildActionOptions(r.action, allServices, allRegions);
   document.getElementById("rule-category").value = r.category || "";
   document.getElementById("rule-order").value = r.sort_order;
   showModal("rule-modal");
@@ -538,19 +484,6 @@ async function deleteRule(id) {
 
 // ===== 自定义规则 CRUD =====
 
-const RULE_TYPE_LABELS = {
-  "DOMAIN": "{{ t["rule.value_domain"] }}",
-  "DOMAIN-SUFFIX": "{{ t["rule.value_domain"] }}",
-  "DOMAIN-KEYWORD": "{{ t["rule.value_keyword"] }}",
-  "IP-CIDR": "{{ t["rule.value_ip"] }}",
-  "IP-CIDR6": "{{ t["rule.value_ipv6"] }}",
-  "URL-REGEX": "{{ t["rule.value_regex"] }}",
-  "PROCESS-NAME": "{{ t["rule.value_process"] }}",
-  "PROTOCOL": "{{ t["rule.value_protocol"] }}",
-};
-
-const SIMPLE_RULE_TYPES = ["DOMAIN","DOMAIN-SUFFIX","DOMAIN-KEYWORD","IP-CIDR","IP-CIDR6","URL-REGEX","PROCESS-NAME","PROTOCOL"];
-
 function toggleCustomRuleMode() {
   const raw = document.getElementById("custom-rule-raw-mode").checked;
   document.getElementById("custom-rule-structured").style.display = raw ? "none" : "block";
@@ -568,14 +501,6 @@ document.addEventListener("DOMContentLoaded", function() {
   if (sel) sel.addEventListener("change", updateCustomRuleValueLabel);
 });
 
-function parseRuleText(text) {
-  const parts = text.split(",");
-  if (parts.length >= 3 && SIMPLE_RULE_TYPES.includes(parts[0])) {
-    return { type: parts[0], value: parts.slice(1, -1).join(","), action: parts[parts.length - 1] };
-  }
-  return null;
-}
-
 function showAddCustomRule(position) {
   document.getElementById("custom-rule-modal-title").textContent =
     position === "pre" ? "{{ t["rule.add_pre"] }}" : "{{ t["rule.add_general"] }}";
@@ -586,7 +511,7 @@ function showAddCustomRule(position) {
   document.getElementById("custom-rule-raw").style.display = "none";
   document.getElementById("custom-rule-type").value = "DOMAIN-SUFFIX";
   document.getElementById("custom-rule-value").value = "";
-  document.getElementById("custom-rule-action").innerHTML = buildActionOptions("");
+  document.getElementById("custom-rule-action").innerHTML = buildActionOptions("", allServices, allRegions);
   document.getElementById("custom-rule-text").value = "";
   document.getElementById("custom-rule-comment").value = "";
   updateCustomRuleValueLabel();
@@ -607,7 +532,7 @@ function editCustomRule(r) {
     document.getElementById("custom-rule-raw").style.display = "none";
     document.getElementById("custom-rule-type").value = parsed.type;
     document.getElementById("custom-rule-value").value = parsed.value;
-    document.getElementById("custom-rule-action").innerHTML = buildActionOptions(parsed.action);
+    document.getElementById("custom-rule-action").innerHTML = buildActionOptions(parsed.action, allServices, allRegions);
     updateCustomRuleValueLabel();
   } else {
     document.getElementById("custom-rule-raw-mode").checked = true;

@@ -38,6 +38,7 @@ TRANSLATIONS = {
         "btn.close": "关闭",
         "btn.reset": "重置",
         "btn.upload": "上传 .p12",
+        "btn.confirm": "确认",
         # 通用消息
         "msg.saved": "已保存",
         "msg.updated": "已更新",
@@ -49,6 +50,7 @@ TRANSLATIONS = {
         "msg.loading": "加载中...",
         "msg.default": "(默认)",
         # 仪表盘
+        "msg.required": "请填写必填项",
         "dashboard.title": "仪表盘",
         "dashboard.subs": "订阅源",
         "dashboard.nodes": "代理节点",
@@ -376,6 +378,7 @@ TRANSLATIONS = {
         "btn.close": "Close",
         "btn.reset": "Reset",
         "btn.upload": "Upload .p12",
+        "btn.confirm": "Confirm",
         # 通用消息
         "msg.saved": "Saved",
         "msg.updated": "Updated",
@@ -386,6 +389,7 @@ TRANSLATIONS = {
         "msg.confirm_reset": "Are you sure? This cannot be undone.",
         "msg.loading": "Loading...",
         "msg.default": "(Default)",
+        "msg.required": "Please fill in required fields",
         # 仪表盘
         "dashboard.title": "Dashboard",
         "dashboard.subs": "Subscriptions",

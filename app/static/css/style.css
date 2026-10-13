@@ -320,6 +320,25 @@ textarea {
 .toast-success { background: var(--success); color: white; }
 .toast-error { background: var(--danger); color: white; }
 
+/* 校验失败红框 + 禁用按钮反馈（app.js flashInput / withLoading） */
+.input-error { border-color: var(--danger) !important; }
+.btn[disabled] { opacity: 0.6; cursor: not-allowed; }
+.btn-loading { position: relative; color: transparent !important; }
+.btn-loading::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: btnSpin 0.7s linear infinite;
+}
+@keyframes btnSpin { to { transform: rotate(360deg); } }
+
 @keyframes slideIn {
   from { transform: translateX(100%); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }

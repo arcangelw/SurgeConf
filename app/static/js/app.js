@@ -3,7 +3,10 @@
 const API = {
   async get(url) {
     const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`GET ${url}: ${resp.status}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `GET ${url}: ${resp.status}`);
+    }
     return resp.json();
   },
   async post(url, data) {
@@ -32,7 +35,10 @@ const API = {
   },
   async del(url) {
     const resp = await fetch(url, { method: "DELETE" });
-    if (!resp.ok) throw new Error(`DELETE ${url}: ${resp.status}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `DELETE ${url}: ${resp.status}`);
+    }
     return resp.json();
   },
   async getText(url) {
@@ -64,10 +70,75 @@ function showModal(id) {
   el.onclick = function(e) {
     if (e.target === el) hideModal(id);
   };
+  // 聚焦弹窗内第一个输入控件
+  const first = el.querySelector("input, select, textarea");
+  if (first) first.focus();
 }
 
 function hideModal(id) {
   document.getElementById(id)?.classList.remove("show");
+}
+
+/** ESC 关闭当前展示的弹窗（自绘确认框优先处理） */
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const shown = document.querySelector(".modal-overlay.show");
+  if (shown?.id) hideModal(shown.id);
+});
+
+/** 自绘确认弹窗：Promise<boolean>；ESC/遮罩点击 resolve(false) */
+function confirmDialog(message, opts = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal confirm-modal" style="max-width:400px;">
+        <h3>${escapeHtml(opts.title || "")}</h3>
+        <p style="margin:12px 0 20px;line-height:1.6;">${escapeHtml(message)}</p>
+        <div class="modal-actions" style="display:flex;gap:10px;justify-content:flex-end;">
+          <button class="btn cd-cancel">${I18N["btn.cancel"]}</button>
+          <button class="btn ${opts.danger ? "btn-danger" : "btn-primary"} cd-ok">${I18N["btn.confirm"]}</button>
+        </div>
+      </div>`;
+    const close = (result) => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(false); }
+    };
+    overlay.querySelector(".cd-ok").onclick = () => close(true);
+    overlay.querySelector(".cd-cancel").onclick = () => close(false);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close(false);
+    });
+    document.addEventListener("keydown", onKey, true);
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add("show"));
+    overlay.querySelector(".cd-ok").focus();
+  });
+}
+
+/** 按钮防双击：async 执行期间禁用按钮，结束恢复 */
+async function withLoading(btn, fn) {
+  if (!btn || !fn) return fn?.();
+  const prev = btn.disabled;
+  btn.disabled = true;
+  btn.classList.add("btn-loading");
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = prev;
+    btn.classList.remove("btn-loading");
+  }
+}
+
+/** 输入校验失败反馈：红框 2 秒 */
+function flashInput(el) {
+  if (!el) return;
+  el.classList.add("input-error");
+  setTimeout(() => el.classList.remove("input-error"), 2000);
 }
 
 function escapeHtml(s) {

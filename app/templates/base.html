@@ -44,8 +44,9 @@
   </div>
   <div class="loading-overlay" id="loading-overlay"><div class="loading-spinner"></div></div>
   <div class="toast-container"></div>
-  <script>const LOCALE_NAMES = {{ locale_names | tojson }};</script>
-  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
+<script>const LOCALE_NAMES = {{ locale_names | tojson }};</script>
+  <script>window.I18N = {{ t | tojson }};</script>
+  <script src="/static/vendor/Sortable.min.js"></script>
   <script src="/static/js/app.js"></script>
   {% block scripts %}{% endblock %}
 </body>
