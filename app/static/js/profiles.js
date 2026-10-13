@@ -1,11 +1,20 @@
-/** 配置方案页：档案 CRUD、分组折叠、规则/Host 列表、MITM（由 profiles.html 内联 JS 迁出；弹窗交互共用 setupRuleModals） */
+/** 配置方案页：方案 CRUD + 内嵌 Tab（概览/General/规则/Host/生成）
+ *  平移自 profiles/general/generator 三页；General 表单与生成器按方案作用域化；弹窗交互共用 setupRuleModals */
 
 let dnsPresets = [];
 let profileRegions = [];
 let profileServices = [];
+let fieldMeta = [];      // General 字段元数据（全局共享）
+let serverIps = [];      // 生成 Tab 可选服务器地址（全局共享）
+let allProfiles = [];    // 当前方案列表（loadData 后有效）
 
-// 展开状态保持：profileId → Set(sectionKey)，重渲染后恢复
+// 展开状态保持：profileId → activeTab，重渲染后恢复
 const openSections = new Map();
+
+const currentLocale = document.documentElement.lang === "en" ? "en" : "zh";
+const SERVER_PORT = location.port || (location.protocol === "https:" ? "443" : "80");
+
+// ===== 基础数据 =====
 
 async function loadProfileGroups() {
   try {
@@ -24,9 +33,38 @@ async function loadDnsPresets() {
   } catch (e) { /* ignore */ }
 }
 
+async function loadGeneralFields() {
+  try {
+    fieldMeta = await API.get("/api/general/fields");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function loadServerIps() {
+  try {
+    const data = await API.get("/api/configs/server-ips");
+    serverIps = data.ips || [];
+  } catch (e) { serverIps = []; }
+}
+
+// ===== 方案卡片渲染 =====
+
+const TABS = [
+  { key: "overview", labelKey: "profile.tab_overview" },
+  { key: "general", labelKey: "profile.tab_general" },
+  { key: "rules", labelKey: "profile.tab_rules" },
+  { key: "hosts", labelKey: "profile.tab_hosts" },
+  { key: "generate", labelKey: "profile.tab_generate" },
+];
+
+function activeTabOf(profileId) {
+  return openSections.get(profileId)?.tab
+    || (localStorage.getItem(`profile-tab:${profileId}`) || "overview");
+}
+
 async function loadData() {
   try {
     const profiles = await API.get("/api/configs/profiles");
+    allProfiles = profiles;
     const container = document.getElementById("profile-list");
     if (profiles.length === 0) {
       container.innerHTML = `<div class="empty"><div class="icon">🔧</div><p>${I18N["profile.empty"]}</p></div>`;
@@ -34,7 +72,7 @@ async function loadData() {
     }
     container.innerHTML = profiles.map(p => {
       const localeLabel = p.locale === 'en' ? 'English' : I18N["settings.lang_zh"];
-      const open = (key) => openSections.get(p.id)?.has(key) ? "block" : "none";
+      const activeTab = activeTabOf(p.id);
       return `
       <div class="card" style="margin-bottom:16px;">
         <div class="card-header">
@@ -42,130 +80,495 @@ async function loadData() {
             <h3>${escapeHtml(p.name)} ${p.is_default ? `<span class="badge badge-warning">${I18N["profile.default"]}</span>` : ''} <span class="badge badge-primary">${localeLabel}</span></h3>
             ${p.description ? `<p style="font-size:12px;color:var(--text2);margin-top:2px;">${escapeHtml(p.description)}</p>` : ''}
           </div>
-          <div style="display:flex;gap:6px;">
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-sm btn-outline" onclick='editProfile(${JSON.stringify(p)})'>${I18N["btn.edit"]}</button>
             <button class="btn btn-sm btn-success" onclick="setAsDefault(${p.id}, this)">${I18N["profile.set_default"]}</button>
-            <button class="btn btn-sm btn-primary" onclick="generateForProfile(${p.id})">${I18N["btn.generate"]}</button>
             ${!p.is_default ? `<button class="btn btn-sm btn-danger" onclick="deleteProfile(${p.id}, this)">${I18N["btn.delete"]}</button>` : ''}
           </div>
         </div>
-        <div style="padding:0 16px 8px;display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-sm btn-outline" onclick="toggleSection('pre-rules-${p.id}', ${p.id}, 'pre')">
-            ${I18N["rule.pre_title"]} <span id="pre-count-${p.id}" class="badge badge-primary" style="margin-left:4px;">0</span>
-          </button>
-          <button class="btn btn-sm btn-outline" onclick="toggleSection('general-rules-${p.id}', ${p.id}, 'general')">
-            ${I18N["rule.general_title"]} <span id="general-count-${p.id}" class="badge badge-success" style="margin-left:4px;">0</span>
-          </button>
-          <button class="btn btn-sm btn-outline" onclick="toggleSection('hosts-${p.id}', ${p.id}, 'hosts')">
-            ${I18N["profile.hosts"]} <span id="hosts-count-${p.id}" class="badge badge-warning" style="margin-left:4px;">0</span>
-          </button>
-          <button class="btn btn-sm btn-outline" onclick="toggleMitm(${p.id})">
-            ${I18N["profile.mitm"]}
-          </button>
+        <div class="tab-bar" id="tab-bar-${p.id}">
+          ${TABS.map(t => `<button class="tab-btn${t.key === activeTab ? ' active' : ''}" data-tab="${t.key}"
+            onclick="switchTab(${p.id}, '${t.key}')">${I18N[t.labelKey]}</button>`).join("")}
         </div>
-        <!-- 前置规则 -->
-        <div id="pre-rules-${p.id}" style="display:${open('pre')};padding:0 16px 16px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <span style="font-size:12px;color:var(--text2);">${I18N["rule.pre_hint"]}</span>
-            <button class="btn btn-sm btn-primary" onclick="showAddCustomRule('pre', ${p.id})">${I18N["rule.add_pre"]}</button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr>
-                <th>${I18N["rule.rule_text"]}</th>
-                <th>${I18N["rule.comment"]}</th>
-                <th>${I18N["sub.status"]}</th>
-                <th>${I18N["node.col_action"]}</th>
-              </tr></thead>
-              <tbody id="pre-list-${p.id}"></tbody>
-            </table>
-          </div>
-        </div>
-        <!-- 通用规则 -->
-        <div id="general-rules-${p.id}" style="display:${open('general')};padding:0 16px 16px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <span style="font-size:12px;color:var(--text2);">${I18N["rule.general_hint"]}</span>
-            <button class="btn btn-sm btn-primary" onclick="showAddCustomRule('general', ${p.id})">${I18N["rule.add_general"]}</button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr>
-                <th>${I18N["rule.rule_text"]}</th>
-                <th>${I18N["rule.comment"]}</th>
-                <th>${I18N["sub.status"]}</th>
-                <th>${I18N["node.col_action"]}</th>
-              </tr></thead>
-              <tbody id="general-list-${p.id}"></tbody>
-            </table>
-          </div>
-        </div>
-        <!-- Host 映射 -->
-        <div id="hosts-${p.id}" style="display:${open('hosts')};padding:0 16px 16px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <span style="font-size:12px;color:var(--text2);">${I18N["profile.hosts_hint"]}</span>
-            <button class="btn btn-sm btn-primary" onclick="showAddHost(${p.id})">${I18N["profile.add_host"]}</button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr>
-                <th>${I18N["profile.host_domain"]}</th>
-                <th>${I18N["profile.host_target"]}</th>
-                <th>${I18N["profile.host_skip_proxy_col"]}</th>
-                <th>${I18N["sub.status"]}</th>
-                <th>${I18N["node.col_action"]}</th>
-              </tr></thead>
-              <tbody id="hosts-list-${p.id}"></tbody>
-            </table>
-          </div>
-        </div>
-        <!-- MITM 配置 -->
-        <div id="mitm-${p.id}" style="display:${open('mitm')};padding:0 16px 16px;">
-          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;">
-            <label class="checkbox"><input type="checkbox" id="mitm-skip-${p.id}"> skip-server-cert-verify</label>
-            <label class="checkbox"><input type="checkbox" id="mitm-tcp-${p.id}"> tcp-connection</label>
-            <label class="checkbox"><input type="checkbox" id="mitm-h2-${p.id}"> h2</label>
-          </div>
-          <div class="form-group">
-            <label>${I18N["profile.mitm_passphrase"]}</label>
-            <input type="password" id="mitm-passphrase-${p.id}" placeholder="${I18N["profile.mitm_passphrase_placeholder"]}" style="max-width:300px;">
-          </div>
-          <div class="form-group">
-            <label>${I18N["profile.mitm_cap12"]}</label>
-            <div style="font-size:12px;color:var(--text2);margin-bottom:4px;">${I18N["profile.mitm_cap12_manual"]}</div>
-            <input type="text" id="mitm-cap12-${p.id}" placeholder="${I18N["profile.mitm_cap12_placeholder"]}" style="width:100%;max-width:500px;margin-bottom:8px;">
-            <div style="display:flex;align-items:center;gap:8px;">
-              <span style="font-size:12px;color:var(--text2);">${I18N["profile.mitm_cap12_upload"]}</span>
-              <label class="btn btn-sm btn-outline" style="cursor:pointer;margin:0;">
-                ${I18N["btn.upload"]}
-                <input type="file" accept=".p12" style="display:none;" onchange="uploadMitmCert(${p.id}, this)">
-              </label>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>${I18N["profile.mitm_hostname"]}</label>
-            <textarea id="mitm-hostname-${p.id}" rows="3" placeholder="${I18N["profile.mitm_hostname_placeholder"]}"></textarea>
-          </div>
-          <div style="display:flex;gap:8px;margin-top:8px;">
-            <button class="btn btn-sm btn-primary" onclick="saveMitm(${p.id})">${I18N["profile.mitm_save"]}</button>
-            <button class="btn btn-sm btn-outline" onclick="resetMitm(${p.id})">${I18N["profile.mitm_reset"]}</button>
-          </div>
-        </div>
+        <div id="tab-content-${p.id}"></div>
       </div>`;
     }).join("");
 
-    // 并发加载各档案统计
     await Promise.all(profiles.map(p => loadProfileStats(p.id)));
-    // 恢复展开态后加载对应列表
     for (const p of profiles) {
-      const sections = openSections.get(p.id);
-      if (!sections) continue;
-      if (sections.has("pre")) loadProfileRuleList(p.id, "pre");
-      if (sections.has("general")) loadProfileRuleList(p.id, "general");
-      if (sections.has("hosts")) loadHostList(p.id);
-      if (sections.has("mitm")) loadMitm(p.id);
+      renderTabContent(p.id);
     }
   } catch (e) { toast(e.message, "error"); }
 }
+
+function switchTab(profileId, tab) {
+  openSections.set(profileId, { tab });
+  try { localStorage.setItem(`profile-tab:${profileId}`, tab); } catch { /* 隐私模式忽略 */ }
+  document.querySelectorAll(`#tab-bar-${profileId} .tab-btn`).forEach(b => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+  });
+  renderTabContent(profileId);
+}
+
+function renderTabContent(profileId) {
+  const tab = activeTabOf(profileId);
+  const el = document.getElementById(`tab-content-${profileId}`);
+  if (!el) return;
+  if (tab === "general") renderGeneralTab(profileId);
+  else if (tab === "rules") renderRulesTab(profileId);
+  else if (tab === "hosts") renderHostsTab(profileId);
+  else if (tab === "generate") renderGenerateTab(profileId);
+  else renderOverviewTab(profileId);
+}
+
+// ===== 概览 Tab：统计 + MITM =====
+
+function renderOverviewTab(profileId) {
+  const el = document.getElementById(`tab-content-${profileId}`);
+  el.innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
+      <span class="badge badge-primary">${I18N["rule.pre_title"]} <span id="pre-count-${profileId}">0</span></span>
+      <span class="badge badge-success">${I18N["rule.general_title"]} <span id="general-count-${profileId}">0</span></span>
+      <span class="badge badge-warning">${I18N["profile.hosts"]} <span id="hosts-count-${profileId}">0</span></span>
+    </div>
+    <h3 style="font-size:14px;margin-bottom:8px;">${I18N["profile.mitm_config"]}</h3>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;">
+      <label class="checkbox"><input type="checkbox" id="mitm-skip-${profileId}"> skip-server-cert-verify</label>
+      <label class="checkbox"><input type="checkbox" id="mitm-tcp-${profileId}"> tcp-connection</label>
+      <label class="checkbox"><input type="checkbox" id="mitm-h2-${profileId}"> h2</label>
+    </div>
+    <div class="form-group">
+      <label>${I18N["profile.mitm_passphrase"]}</label>
+      <input type="password" id="mitm-passphrase-${profileId}" placeholder="${I18N["profile.mitm_passphrase_placeholder"]}" style="max-width:300px;">
+    </div>
+    <div class="form-group">
+      <label>${I18N["profile.mitm_cap12"]}</label>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:4px;">${I18N["profile.mitm_cap12_manual"]}</div>
+      <input type="text" id="mitm-cap12-${profileId}" placeholder="${I18N["profile.mitm_cap12_placeholder"]}" style="width:100%;max-width:500px;margin-bottom:8px;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:12px;color:var(--text2);">${I18N["profile.mitm_cap12_upload"]}</span>
+        <label class="btn btn-sm btn-outline" style="cursor:pointer;margin:0;">
+          ${I18N["btn.upload"]}
+          <input type="file" accept=".p12" style="display:none;" onchange="uploadMitmCert(${profileId}, this)">
+        </label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>${I18N["profile.mitm_hostname"]}</label>
+      <textarea id="mitm-hostname-${profileId}" rows="3" placeholder="${I18N["profile.mitm_hostname_placeholder"]}"></textarea>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;">
+      <button class="btn btn-sm btn-primary" onclick="saveMitm(${profileId})">${I18N["profile.mitm_save"]}</button>
+      <button class="btn btn-sm btn-outline" onclick="resetMitm(${profileId})">${I18N["profile.mitm_reset"]}</button>
+    </div>`;
+  loadProfileStats(profileId);
+  loadMitm(profileId);
+}
+
+// ===== General Tab（general.js 平移，按方案作用域化） =====
+
+function label(f) {
+  return currentLocale === "en" ? (f.label_en || f.label_zh) : f.label_zh;
+}
+
+function hint(f) {
+  return currentLocale === "en" ? (f.hint_en || f.hint_zh) : f.hint_zh;
+}
+
+function optLabel(opt) {
+  return currentLocale === "en" ? (opt.label_en || opt.label_zh) : opt.label_zh;
+}
+
+function groupTitle(g) {
+  return currentLocale === "en" ? (g.label_en || g.label_zh) : g.label_zh;
+}
+
+/** 折叠状态持久化：key = general-collapse:<groupId>，值 "1" 表示折叠 */
+function isGroupCollapsed(groupId) {
+  try { return localStorage.getItem(`general-collapse:${groupId}`) === "1"; } catch { return false; }
+}
+
+function setGroupCollapsed(groupId, collapsed) {
+  try {
+    if (collapsed) localStorage.setItem(`general-collapse:${groupId}`, "1");
+    else localStorage.removeItem(`general-collapse:${groupId}`);
+  } catch { /* 隐私模式等场景忽略 */ }
+}
+
+function renderGeneralTab(profileId) {
+  const el = document.getElementById(`tab-content-${profileId}`);
+  el.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+      <button class="btn btn-primary btn-sm" onclick="saveGeneralValues(${profileId}, this)">${I18N["btn.save"]}</button>
+    </div>
+    <div id="groups-container-${profileId}"></div>
+    <details style="margin-top:16px;">
+      <summary style="cursor:pointer;font-size:13px;color:var(--primary);">${I18N["general.json_override"]}</summary>
+      <div class="card" style="margin-top:8px;">
+        <div class="form-group" style="margin-bottom:0;">
+          <textarea id="custom-json-${profileId}" rows="4" placeholder='{"key": "value"}'></textarea>
+          <p style="font-size:11px;color:var(--text2);margin-top:4px;">${I18N["general.json_hint"]}</p>
+        </div>
+      </div>
+    </details>`;
+  renderGeneralForm(profileId);
+  loadGeneralValues(profileId);
+}
+
+function renderGeneralForm(profileId) {
+  const container = document.getElementById(`groups-container-${profileId}`);
+  container.innerHTML = fieldMeta.map(g => {
+    const groupId = `group-${g.key}`;
+    const collapsed = isGroupCollapsed(groupId);
+    return `
+    <div class="card gen-section">
+      <div class="card-header" style="cursor:pointer;" onclick="toggleGroup('${groupId}')">
+        <h3 class="gen-card-title">${groupTitle(g)}</h3>
+        <span class="gen-toggle" id="${groupId}-arrow">${collapsed ? "▶" : "▼"}</span>
+      </div>
+      <div id="${groupId}-body" style="${collapsed ? "display:none;" : ""}">
+        <div class="gen-grid">
+          ${g.fields.map(f => renderField(f, profileId)).join("")}
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderField(f, profileId) {
+  const id = `field-${profileId}-${f.key}`;
+  const hintText = hint(f) ? `<p class="gen-hint">${hint(f)}</p>` : "";
+
+  if (f.type === "bool") {
+    return `
+    <div class="gen-field">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <label class="toggle-wrap">
+        <input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool">
+        <span class="toggle-slider"></span>
+      </label>
+      ${hintText}
+    </div>`;
+  }
+
+  if (f.type === "select") {
+    const opts = f.options.map(o =>
+      `<option value="${o.value}">${optLabel(o)}</option>`
+    ).join("");
+    return `
+    <div class="gen-field">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <select id="${id}" data-key="${f.key}" data-type="select">${opts}</select>
+      ${hintText}
+    </div>`;
+  }
+
+  if (f.type === "tags") {
+    return `
+    <div class="gen-field gen-field-wide">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <div class="tags-input-wrap">
+        <textarea id="${id}" data-key="${f.key}" data-type="tags" rows="2"
+          placeholder="${hint(f) || I18N["general.tags_placeholder"]}"></textarea>
+      </div>
+      ${hintText}
+    </div>`;
+  }
+
+  if (f.type === "int") {
+    return `
+    <div class="gen-field">
+      <label class="gen-label" for="${id}">${label(f)}</label>
+      <input type="number" id="${id}" data-key="${f.key}" data-type="int">
+      ${hintText}
+    </div>`;
+  }
+
+  // text
+  return `
+  <div class="gen-field${f.key.includes("url") || f.key.includes("skip") ? " gen-field-wide" : ""}">
+    <label class="gen-label" for="${id}">${label(f)}</label>
+    <input type="text" id="${id}" data-key="${f.key}" data-type="text">
+    ${hintText}
+  </div>`;
+}
+
+function toggleGroup(groupId) {
+  const body = document.getElementById(`${groupId}-body`);
+  const arrow = document.getElementById(`${groupId}-arrow`);
+  if (body.style.display === "none") {
+    body.style.display = "";
+    arrow.textContent = "▼";
+    setGroupCollapsed(groupId, false);
+  } else {
+    body.style.display = "none";
+    arrow.textContent = "▶";
+    setGroupCollapsed(groupId, true);
+  }
+}
+
+async function loadGeneralValues(profileId) {
+  try {
+    const data = await API.get(`/api/general/values?profile_id=${profileId}`);
+    fillGeneralForm(profileId, data.values);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function fillGeneralForm(profileId, values) {
+  document.querySelectorAll(`#tab-content-${profileId} [data-key]`).forEach(el => {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+    const val = values[key];
+
+    if (type === "bool") {
+      el.checked = bool(val);
+    } else if (type === "tags") {
+      if (typeof val === "string" && val) {
+        el.value = val.split(",").map(s => s.trim()).join("\n");
+      } else {
+        el.value = "";
+      }
+    } else if (type === "int") {
+      el.value = val ?? "";
+    } else if (type === "select") {
+      el.value = val ?? "";
+    } else {
+      el.value = val ?? "";
+    }
+  });
+}
+
+function bool(v) {
+  if (v === true || v === "true") return true;
+  return false;
+}
+
+function collectGeneralValues(profileId) {
+  const values = {};
+  document.querySelectorAll(`#tab-content-${profileId} [data-key]`).forEach(el => {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+
+    if (type === "bool") {
+      values[key] = el.checked;
+    } else if (type === "tags") {
+      const raw = el.value.trim();
+      if (raw) {
+        values[key] = raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean).join(", ");
+      }
+    } else if (type === "int") {
+      const n = parseInt(el.value);
+      if (!isNaN(n)) values[key] = n;
+    } else {
+      values[key] = el.value;
+    }
+  });
+
+  const jsonStr = document.getElementById(`custom-json-${profileId}`).value.trim();
+  if (jsonStr) {
+    try {
+      const custom = JSON.parse(jsonStr);
+      Object.assign(values, custom);
+    } catch {
+      toast(I18N["general.json_error"], "error");
+      return null;
+    }
+  }
+  return values;
+}
+
+async function saveGeneralValues(profileId, btn) {
+  const values = collectGeneralValues(profileId);
+  if (!values) return;
+
+  await withLoading(btn, async () => {
+    try {
+      await API.put(`/api/general/values?profile_id=${profileId}`, values);
+      toast(I18N["msg.saved"]);
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+// ===== 规则 Tab：前置 + 通用两段 =====
+
+function renderRulesTab(profileId) {
+  const el = document.getElementById(`tab-content-${profileId}`);
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <span style="font-size:12px;color:var(--text2);">${I18N["rule.pre_hint"]}</span>
+      <button class="btn btn-sm btn-primary" onclick="showAddCustomRule('pre', ${profileId})">${I18N["rule.add_pre"]}</button>
+    </div>
+    <div class="table-wrap" style="margin-bottom:16px;">
+      <table>
+        <thead><tr>
+          <th>${I18N["rule.rule_text"]}</th>
+          <th>${I18N["rule.comment"]}</th>
+          <th>${I18N["sub.status"]}</th>
+          <th>${I18N["node.col_action"]}</th>
+        </tr></thead>
+        <tbody id="pre-list-${profileId}"></tbody>
+      </table>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <span style="font-size:12px;color:var(--text2);">${I18N["rule.general_hint"]}</span>
+      <button class="btn btn-sm btn-primary" onclick="showAddCustomRule('general', ${profileId})">${I18N["rule.add_general"]}</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>${I18N["rule.rule_text"]}</th>
+          <th>${I18N["rule.comment"]}</th>
+          <th>${I18N["sub.status"]}</th>
+          <th>${I18N["node.col_action"]}</th>
+        </tr></thead>
+        <tbody id="general-list-${profileId}"></tbody>
+      </table>
+    </div>`;
+  loadProfileRuleList(profileId, "pre");
+  loadProfileRuleList(profileId, "general");
+}
+
+// ===== Host Tab =====
+
+function renderHostsTab(profileId) {
+  const el = document.getElementById(`tab-content-${profileId}`);
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <span style="font-size:12px;color:var(--text2);">${I18N["profile.hosts_hint"]}</span>
+      <button class="btn btn-sm btn-primary" onclick="showAddHost(${profileId})">${I18N["profile.add_host"]}</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>${I18N["profile.host_domain"]}</th>
+          <th>${I18N["profile.host_target"]}</th>
+          <th>${I18N["profile.host_skip_proxy_col"]}</th>
+          <th>${I18N["sub.status"]}</th>
+          <th>${I18N["node.col_action"]}</th>
+        </tr></thead>
+        <tbody id="hosts-list-${profileId}"></tbody>
+      </table>
+    </div>`;
+  loadHostList(profileId);
+}
+
+// ===== 生成 Tab（generator.js 平移，profile 固定为当前方案） =====
+
+function renderGenerateTab(profileId) {
+  const el = document.getElementById(`tab-content-${profileId}`);
+  const ipOptions = [`<option value="127.0.0.1">${I18N["generator.localhost"]}</option>`]
+    .concat(serverIps.map(ip => `<option value="${ip}">${I18N["generator.lan_ip"].replace("{0}", ip)}</option>`))
+    .join("");
+  el.innerHTML = `
+    <div class="card gen-section">
+      <h3 class="gen-card-title">${I18N["generator.download"]}</h3>
+      <div class="gen-row">
+        <input type="text" id="filename-input-${profileId}" placeholder="Surge.conf" value="Surge.conf" class="gen-filename-input">
+        <button class="btn btn-success" onclick="downloadConfig(${profileId})">${I18N["generator.btn_download"]}</button>
+      </div>
+      <p class="gen-hint">${I18N["generator.download_hint"]}</p>
+    </div>
+    <div class="card gen-section">
+      <h3 class="gen-card-title">${I18N["generator.subscribe"]}</h3>
+      <div class="form-group">
+        <label>${I18N["generator.server_ip"]}</label>
+        <select id="ip-select-${profileId}" class="gen-ip-select" onchange="updateSubscribeUrl(${profileId})">${ipOptions}</select>
+      </div>
+      <div class="form-group" style="margin-bottom:0;">
+        <label>${I18N["generator.subscribe_url"]}</label>
+        <div class="gen-row">
+          <input type="text" id="subscribe-url-${profileId}" readonly class="gen-sub-url">
+          <button class="btn btn-outline" onclick="copySubscribeUrl(${profileId})">${I18N["generator.copy"]}</button>
+        </div>
+      </div>
+      <p class="gen-hint">${I18N["generator.subscribe_hint"]}</p>
+    </div>
+    <div class="card gen-section">
+      <div class="gen-row" style="justify-content:flex-start;">
+        <button class="btn btn-primary" onclick="previewConfig(${profileId})">${I18N["generator.btn_preview"]}</button>
+        <span style="font-size:12px;color:var(--text2);margin-left:8px;" id="config-size-${profileId}"></span>
+      </div>
+    </div>`;
+  const ipSel = document.getElementById(`ip-select-${profileId}`);
+  if (serverIps.length > 0) ipSel.value = serverIps[0];
+  updateSubscribeUrl(profileId);
+}
+
+function buildBaseUrl(ip) {
+  const port = SERVER_PORT === "80" || SERVER_PORT === "443" ? "" : `:${SERVER_PORT}`;
+  return `${location.protocol}//${ip}${port}`;
+}
+
+function updateSubscribeUrl(profileId) {
+  const ip = document.getElementById(`ip-select-${profileId}`)?.value || "127.0.0.1";
+  const base = buildBaseUrl(ip);
+  const url = `${base}/api/configs/subscribe?profile_id=${profileId}`;
+  const input = document.getElementById(`subscribe-url-${profileId}`);
+  if (input) input.value = url;
+}
+
+async function previewConfig(profileId) {
+  try {
+    showLoading();
+    const result = await API.get(`/api/configs/preview?profile_id=${profileId}`);
+    const sizeLabel = `${(result.size / 1024).toFixed(1)} KB`;
+    document.getElementById(`config-size-${profileId}`).textContent = sizeLabel;
+    document.getElementById("fullscreen-content").textContent = result.content;
+    document.getElementById("fullscreen-size").textContent = sizeLabel;
+    document.getElementById("fullscreen-overlay").classList.add("show");
+    document.body.style.overflow = "hidden";
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    hideLoading();
+  }
+}
+
+function downloadConfig(profileId) {
+  const filename = document.getElementById(`filename-input-${profileId}`).value.trim() || "Surge.conf";
+  window.open(`/api/configs/generate?filename=${encodeURIComponent(filename)}&profile_id=${profileId}`, "_blank");
+}
+
+function copySubscribeUrl(profileId) {
+  const input = document.getElementById(`subscribe-url-${profileId}`);
+  input.select();
+  input.setSelectionRange(0, 99999);
+  // 先尝试同步 execCommand（HTTP 局域网环境可用，需在用户手势内执行）
+  try {
+    if (document.execCommand("copy")) {
+      toast(I18N["generator.copied"]);
+      return;
+    }
+  } catch (e) {}
+  // 再尝试异步 Clipboard API（HTTPS 环境）；两者都失败时诚实报错并保持选中态供手动 Cmd+C
+  navigator.clipboard.writeText(input.value).then(() => {
+    toast(I18N["generator.copied"]);
+  }).catch(() => {
+    input.select();
+    input.setSelectionRange(0, 99999);
+    toast(I18N["generator.copy_failed"], "error");
+  });
+}
+
+function toggleFullscreen() {
+  const overlay = document.getElementById("fullscreen-overlay");
+  if (overlay.classList.contains("show")) {
+    overlay.classList.remove("show");
+    document.body.style.overflow = "";
+  }
+}
+
+function closeFullscreen(e) {
+  if (e.target === document.getElementById("fullscreen-overlay")) {
+    toggleFullscreen();
+  }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") toggleFullscreen();
+});
+
+// ===== 统计 =====
 
 async function loadProfileStats(profileId) {
   try {
@@ -180,25 +583,6 @@ async function loadProfileStats(profileId) {
     if (el(`general-count-${profileId}`)) el(`general-count-${profileId}`).textContent = generalRules.length;
     if (el(`hosts-count-${profileId}`)) el(`hosts-count-${profileId}`).textContent = hosts.length;
   } catch (e) { /* ignore */ }
-}
-
-function toggleSection(sectionId, profileId, type) {
-  const el = document.getElementById(sectionId);
-  const key = type === "pre-rules" || type === "pre" ? "pre"
-    : type === "general-rules" || type === "general" ? "general"
-    : type;
-  if (!openSections.has(profileId)) openSections.set(profileId, new Set());
-  const sections = openSections.get(profileId);
-  if (el.style.display === "none") {
-    el.style.display = "block";
-    sections.add(key);
-    if (key === "hosts") loadHostList(profileId);
-    else if (key === "mitm") loadMitm(profileId);
-    else loadProfileRuleList(profileId, key);
-  } else {
-    el.style.display = "none";
-    sections.delete(key);
-  }
 }
 
 // ===== Profile 基础 CRUD =====
@@ -276,6 +660,7 @@ async function loadProfileRuleList(profileId, position) {
   try {
     const rules = await API.get(`/api/configs/custom-rules?profile_id=${profileId}&position=${position}`);
     const tbody = document.getElementById(`${position}-list-${profileId}`);
+    if (!tbody) return;
     tbody.innerHTML = rules.map(r => `
       <tr>
         <td><code style="font-size:12px;">${escapeHtml(r.rule_text)}</code></td>
@@ -305,6 +690,7 @@ async function loadHostList(profileId) {
   try {
     const mappings = await API.get(`/api/configs/host-mappings?profile_id=${profileId}`);
     const tbody = document.getElementById(`hosts-list-${profileId}`);
+    if (!tbody) return;
     tbody.innerHTML = mappings.map(m => `
       <tr>
         <td><code style="font-size:12px;">${escapeHtml(m.domain)}</code></td>
@@ -331,25 +717,11 @@ async function toggleHost(mappingId, enabled, profileId) {
 
 // ===== MITM 配置管理 =====
 
-function toggleMitm(profileId) {
-  const el = document.getElementById(`mitm-${profileId}`);
-  if (el.style.display === "none") {
-    el.style.display = "block";
-    if (!openSections.has(profileId)) openSections.set(profileId, new Set());
-    openSections.get(profileId).add("mitm");
-    loadMitm(profileId);
-  } else {
-    el.style.display = "none";
-    openSections.get(profileId)?.delete("mitm");
-  }
-}
-
 async function loadMitm(profileId) {
   try {
-    const profiles = await API.get("/api/configs/profiles");
-    const p = profiles.find(x => x.id === profileId);
-    if (!p) return;
-    const mitm = p.mitm || {};
+    if (allProfiles.length === 0) allProfiles = await API.get("/api/configs/profiles");
+    const profile = allProfiles.find(x => x.id === profileId) || {};
+    const mitm = profile.mitm || {};
     document.getElementById(`mitm-skip-${profileId}`).checked = mitm['skip-server-cert-verify'] !== false;
     document.getElementById(`mitm-tcp-${profileId}`).checked = mitm['tcp-connection'] !== false;
     document.getElementById(`mitm-h2-${profileId}`).checked = mitm['h2'] !== false;
@@ -426,7 +798,7 @@ setupRuleModals({
 });
 
 async function init() {
-  await Promise.all([loadDnsPresets(), loadProfileGroups()]);
+  await Promise.all([loadDnsPresets(), loadProfileGroups(), loadGeneralFields(), loadServerIps()]);
   loadData();
 }
 init();
