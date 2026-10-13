@@ -315,7 +315,7 @@ DEFAULT_GENERAL = {
     "test-timeout": 3,
     "geoip-maxmind-url": "https://github.com/Hackl0us/GeoIP2-CN/raw/release/Country.mmdb",
     "ipv6": False,
-    "ipv6-vif": "auto",
+    "ipv6-vif": "disable",
     "allow-wifi-access": False,
     "wifi-access-http-port": 6152,
     "wifi-access-socks5-port": 6153,
@@ -454,7 +454,17 @@ DEFAULT_PRE_RULES = [
      "comment": "拦截 YouTube UDP 流量"},
     {"rule_text": "DOMAIN-SUFFIX,z.ai,大陆直连", "position": "pre", "sort_order": 11,
      "comment": "智谱AI"},
+    {"rule_text": "DOMAIN-KEYWORD,stun,REJECT", "position": "pre", "sort_order": 90,
+     "comment": "阻断 STUN 防止 WebRTC 泄露真实出口"},
+    {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,3478)),REJECT", "position": "pre", "sort_order": 91,
+     "comment": "阻断 IP 直连 STUN (UDP 3478)"},
+    {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,19302)),REJECT", "position": "pre", "sort_order": 92,
+     "comment": "阻断 IP 直连 STUN (UDP 19302)"},
 ]
+
+# 内置安全规则（随版本分发的防护，老库启动时幂等补齐；只增不删，不复活用户删过的其他默认规则）
+# ⚠ sort_order >= 90 是安全规则保留区：新增普通默认规则勿使用 90+，否则会被当安全规则在每次启动时强制补齐（用户删除后复活）
+SECURITY_PRE_RULES = [r for r in DEFAULT_PRE_RULES if r["sort_order"] >= 90]
 
 # 通用自定义规则 - 放在规则集之后，补充未覆盖的域名
 DEFAULT_GENERAL_RULES = [

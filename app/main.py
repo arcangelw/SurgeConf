@@ -70,6 +70,7 @@ async def seed_defaults():
             await db.commit()
 
     # 确保系统级配置存在（首次启动或数据库已有旧数据时）
+    # 注：no_resolve_keywords 键由下方 apply_data_migrations 幂等补齐，此处不重复
     sys_config_keys = {"exclusion_keywords", "other_auto_enabled", "other_manual_enabled", "skip_proxy_custom"}
     existing_configs = set()
     async with async_session() as db:
@@ -89,12 +90,54 @@ async def seed_defaults():
         if missing:
             await db.commit()
 
+    # 数据迁移：内置安全规则补齐 + 存量 ipv6-vif 修正（多设备部署，修复随代码分发）
+    async with async_session() as db:
+        await apply_data_migrations(db)
+
     # 数据维护：清理孤儿节点（修复旧版本删除订阅时未级联删除节点导致的残留）
     from app.services.subscription import cleanup_orphan_nodes
     async with async_session() as db:
         removed = await cleanup_orphan_nodes(db)
         if removed:
             print(f"[数据维护] 已清理 {removed} 个孤儿节点（归属订阅已删除的残留节点）", file=sys.stderr)
+
+
+async def apply_data_migrations(db) -> None:
+    """幂等数据迁移：内置安全规则补齐 + 存量 ipv6-vif 修正。可安全重复执行。"""
+    from sqlalchemy import select
+    from app.default_config import SECURITY_PRE_RULES
+    from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
+    from app.models import CustomRule, ConfigProfile, SystemConfig
+
+    # 系统键补齐（no_resolve_keywords：IP 类规则集 no-resolve 关键词，generator 有代码兜底，此处补齐供面板管理）
+    existing_keys = {row[0] for row in (await db.execute(select(SystemConfig.key))).all()}
+    if "no_resolve_keywords" not in existing_keys:
+        db.add(SystemConfig(key="no_resolve_keywords", value=DEFAULT_NO_RESOLVE_KEYWORDS))
+
+    # 内置安全规则：按 rule_text 幂等插入，不复活用户删过的其他默认规则
+    existing_rules = {row[0] for row in (await db.execute(select(CustomRule.rule_text))).all()}
+    added = 0
+    for r in SECURITY_PRE_RULES:
+        if r["rule_text"] not in existing_rules:
+            db.add(CustomRule(profile_id=None, **r))
+            added += 1
+
+    # 存量档案 ipv6-vif: auto → disable（与模板 ipv6=false 对齐，彻底禁用 v6）
+    # 必须先复制再改后整体赋值：原地修改 + reassign 相等值会被 SQLAlchemy 判为无变化而跳过 UPDATE
+    fixed_v6 = 0
+    for profile in (await db.execute(select(ConfigProfile))).scalars().all():
+        g = dict(profile.general) if isinstance(profile.general, dict) else {}
+        if g.get("ipv6-vif") == "auto":
+            g["ipv6-vif"] = "disable"
+            profile.general = g
+            fixed_v6 += 1
+
+    # 无条件 commit：上面的 select 会触发 autoflush（flush ≠ commit），若按 db.new/db.dirty 判断
+    # 会因已 flush 而误判"无变更"跳过 commit，session 关闭时事务回滚、变更丢失
+    key_added = "no_resolve_keywords" not in existing_keys
+    await db.commit()
+    if added or fixed_v6 or key_added:
+        print(f"[数据迁移] 补齐内置安全规则 {added} 条，修正存量 ipv6-vif {fixed_v6} 个档案，补系统键 {int(key_added)} 项", file=sys.stderr)
 
 
 @asynccontextmanager
