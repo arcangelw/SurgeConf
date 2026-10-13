@@ -1,0 +1,94 @@
+{# 规则/Host 映射编辑弹窗（rules 与 profiles 页共用一套元素 id，交互由 rules-common.js setupRuleModals 绑定） #}
+
+{% macro custom_rule_modal() %}
+<!-- 自定义规则编辑弹窗 -->
+<div class="modal-overlay" id="custom-rule-modal">
+  <div class="modal">
+    <h3 id="custom-rule-modal-title">{{ t["rule.add_custom"] }}</h3>
+    <input type="hidden" id="custom-rule-edit-id">
+    <input type="hidden" id="custom-rule-profile-id" value="">
+    <input type="hidden" id="custom-rule-position">
+    <div class="form-group">
+      <label class="checkbox">
+        <input type="checkbox" id="custom-rule-raw-mode"> {{ t["rule.raw_mode"] }}
+      </label>
+    </div>
+    <!-- 结构化模式 -->
+    <div id="custom-rule-structured">
+      <div class="form-group">
+        <label>{{ t["rule.type"] }}</label>
+        <select id="custom-rule-type">
+          <option value="DOMAIN">DOMAIN</option>
+          <option value="DOMAIN-SUFFIX">DOMAIN-SUFFIX</option>
+          <option value="DOMAIN-KEYWORD">DOMAIN-KEYWORD</option>
+          <option value="IP-CIDR">IP-CIDR</option>
+          <option value="IP-CIDR6">IP-CIDR6</option>
+          <option value="URL-REGEX">URL-REGEX</option>
+          <option value="PROCESS-NAME">PROCESS-NAME</option>
+          <option value="PROTOCOL">PROTOCOL</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label id="custom-rule-value-label">{{ t["rule.value_domain"] }}</label>
+        <input type="text" id="custom-rule-value" placeholder="example.com">
+      </div>
+      <div class="form-group">
+        <label>{{ t["rule.action"] }}</label>
+        <select id="custom-rule-action"></select>
+      </div>
+    </div>
+    <!-- 原始文本模式 -->
+    <div id="custom-rule-raw" style="display:none;">
+      <div class="form-group">
+        <label>{{ t["rule.rule_text"] }}</label>
+        <input type="text" id="custom-rule-text" placeholder="DOMAIN-SUFFIX,example.com,DIRECT">
+        <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["rule.rule_text_hint"] }}</p>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>{{ t["rule.comment"] }}</label>
+      <input type="text" id="custom-rule-comment" placeholder="{{ t["rule.comment_placeholder"] }}">
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('custom-rule-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveCustomRule()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endmacro %}
+
+{% macro host_modal() %}
+<!-- Host 映射编辑弹窗 -->
+<div class="modal-overlay" id="host-modal">
+  <div class="modal">
+    <h3 id="host-modal-title">{{ t["profile.add_host"] }}</h3>
+    <input type="hidden" id="host-edit-id">
+    <input type="hidden" id="host-profile-id" value="">
+    <div class="form-group">
+      <label>{{ t["profile.host_domain"] }}</label>
+      <input type="text" id="host-domain" placeholder="*.example.com">
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.host_target"] }}</label>
+      <select id="host-target-preset">
+        <option value="">{{ t["profile.host_select_preset"] }}</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.host_target_custom"] }}</label>
+      <input type="text" id="host-target" placeholder="server:223.5.5.5 或 IP 地址">
+      <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.host_target_hint"] }}</p>
+    </div>
+    <div class="form-group">
+      <label class="checkbox">
+        <input type="checkbox" id="host-skip-proxy" checked> {{ t["profile.host_skip_proxy"] }}
+      </label>
+      <p style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.host_skip_proxy_hint"] }}</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="hideModal('host-modal')">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveHost()">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
+{% endmacro %}

@@ -70,6 +70,195 @@ function buildActionOptions(selectedValue, services = [], regions = []) {
   return parts.join("");
 }
 
+/** 统一绑定自定义规则/Host 映射弹窗交互（rules 与 profiles 页共用，元素 id 见 macros/rule_modals.html）
+ *  opts: { getServices, getRegions, getDnsPresets, getNextSortOrder, onRuleSaved(profileId, position), onHostSaved(profileId) } */
+function setupRuleModals(opts = {}) {
+  const getServices = () => (opts.getServices ? opts.getServices() : []);
+  const getRegions = () => (opts.getRegions ? opts.getRegions() : []);
+  const getDnsPresets = () => (opts.getDnsPresets ? opts.getDnsPresets() : []);
+
+  const $ = (id) => document.getElementById(id);
+
+  // ===== 自定义规则弹窗 =====
+
+  function toggleCustomRuleMode() {
+    const raw = $("custom-rule-raw-mode").checked;
+    $("custom-rule-structured").style.display = raw ? "none" : "block";
+    $("custom-rule-raw").style.display = raw ? "block" : "none";
+  }
+
+  function updateCustomRuleValueLabel() {
+    const type = $("custom-rule-type").value;
+    $("custom-rule-value-label").textContent = RULE_TYPE_LABELS[type] || I18N["rule.value_domain"];
+  }
+
+  $("custom-rule-raw-mode").addEventListener("change", toggleCustomRuleMode);
+  $("custom-rule-type").addEventListener("change", updateCustomRuleValueLabel);
+
+  window.showAddCustomRule = function(position, profileId = null) {
+    $("custom-rule-modal-title").textContent =
+      position === "pre" ? I18N["rule.add_pre"] : I18N["rule.add_general"];
+    $("custom-rule-edit-id").value = "";
+    $("custom-rule-profile-id").value = profileId ?? "";
+    $("custom-rule-position").value = position;
+    $("custom-rule-raw-mode").checked = false;
+    $("custom-rule-structured").style.display = "block";
+    $("custom-rule-raw").style.display = "none";
+    $("custom-rule-type").value = "DOMAIN-SUFFIX";
+    $("custom-rule-value").value = "";
+    $("custom-rule-action").innerHTML = buildActionOptions("", getServices(), getRegions());
+    $("custom-rule-text").value = "";
+    $("custom-rule-comment").value = "";
+    updateCustomRuleValueLabel();
+    showModal("custom-rule-modal");
+  };
+
+  window.editCustomRule = function(r, profileId = null) {
+    $("custom-rule-modal-title").textContent = I18N["btn.edit"];
+    $("custom-rule-edit-id").value = r.id;
+    $("custom-rule-profile-id").value = profileId ?? "";
+    $("custom-rule-position").value = r.position;
+    $("custom-rule-comment").value = r.comment || "";
+    $("custom-rule-text").value = r.rule_text;
+
+    const parsed = parseRuleText(r.rule_text);
+    if (parsed) {
+      $("custom-rule-raw-mode").checked = false;
+      $("custom-rule-structured").style.display = "block";
+      $("custom-rule-raw").style.display = "none";
+      $("custom-rule-type").value = parsed.type;
+      $("custom-rule-value").value = parsed.value;
+      $("custom-rule-action").innerHTML = buildActionOptions(parsed.action, getServices(), getRegions());
+      updateCustomRuleValueLabel();
+    } else {
+      $("custom-rule-raw-mode").checked = true;
+      $("custom-rule-structured").style.display = "none";
+      $("custom-rule-raw").style.display = "block";
+    }
+    showModal("custom-rule-modal");
+  };
+
+  window.saveCustomRule = async function() {
+    const id = $("custom-rule-edit-id").value;
+    const profileId = parseInt($("custom-rule-profile-id").value) || null;
+    const position = $("custom-rule-position").value;
+    const raw = $("custom-rule-raw-mode").checked;
+    let rule_text;
+    if (raw) {
+      rule_text = $("custom-rule-text").value.trim();
+      if (!rule_text) {
+        toast(I18N["msg.required"], "error"); flashInput($("custom-rule-text")); return;
+      }
+    } else {
+      const type = $("custom-rule-type").value;
+      const value = $("custom-rule-value").value.trim();
+      const action = $("custom-rule-action").value;
+      if (!value) {
+        toast(I18N["msg.required"], "error"); flashInput($("custom-rule-value")); return;
+      }
+      rule_text = `${type},${value},${action}`;
+    }
+    const data = {
+      rule_text: rule_text,
+      position: position,
+      comment: $("custom-rule-comment").value.trim() || null,
+    };
+    try {
+      if (id) {
+        await API.put(`/api/configs/custom-rules/${id}`, data);
+        toast(I18N["msg.updated"]);
+      } else {
+        if (profileId) data.profile_id = profileId;
+        data.sort_order = opts.getNextSortOrder ? opts.getNextSortOrder(position) : 0;
+        await API.post("/api/configs/custom-rules", data);
+        toast(I18N["msg.added"]);
+      }
+      hideModal("custom-rule-modal");
+      opts.onRuleSaved?.(profileId, position);
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  window.deleteCustomRule = async function(id, profileId = null, position = null) {
+    if (!(await confirmDialog(I18N["rule.confirm_delete"], { danger: true }))) return;
+    try {
+      await API.del(`/api/configs/custom-rules/${id}`);
+      toast(I18N["msg.deleted"]);
+      opts.onRuleSaved?.(profileId, position);
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  // ===== Host 映射弹窗 =====
+
+  function fillHostPresets(selectedValue) {
+    const sel = $("host-target-preset");
+    sel.innerHTML = `<option value="">${I18N["profile.host_select_preset"]}</option>` +
+      getDnsPresets().map(p => `<option value="${p.value}">${p.label_zh}</option>`).join("");
+    sel.value = getDnsPresets().find(p => p.value === selectedValue) ? selectedValue : "";
+  }
+
+  $("host-target-preset").addEventListener("change", function() {
+    if (this.value) $("host-target").value = this.value;
+  });
+
+  window.showAddHost = function(profileId = null) {
+    $("host-modal-title").textContent = I18N["profile.add_host"];
+    $("host-edit-id").value = "";
+    $("host-profile-id").value = profileId ?? "";
+    $("host-domain").value = "";
+    $("host-target").value = "";
+    fillHostPresets("");
+    $("host-skip-proxy").checked = true;
+    showModal("host-modal");
+  };
+
+  window.editHost = function(m, profileId = null) {
+    $("host-modal-title").textContent = I18N["btn.edit"];
+    $("host-edit-id").value = m.id;
+    $("host-profile-id").value = profileId ?? "";
+    $("host-domain").value = m.domain;
+    $("host-target").value = m.target;
+    fillHostPresets(m.target);
+    $("host-skip-proxy").checked = m.skip_proxy !== false;
+    showModal("host-modal");
+  };
+
+  window.saveHost = async function() {
+    const id = $("host-edit-id").value;
+    const profileId = parseInt($("host-profile-id").value) || null;
+    const domain = $("host-domain").value.trim();
+    const presetTarget = $("host-target-preset").value;
+    const customTarget = $("host-target").value.trim();
+    const target = presetTarget || customTarget;
+    const skipProxy = $("host-skip-proxy").checked;
+    if (!domain) {
+      toast(I18N["msg.required"], "error"); flashInput($("host-domain")); return;
+    }
+    if (!target) {
+      toast(I18N["msg.required"], "error"); flashInput($("host-target")); return;
+    }
+    try {
+      if (id) {
+        await API.put(`/api/configs/host-mappings/${id}`, { domain, target, skip_proxy: skipProxy });
+        toast(I18N["msg.updated"]);
+      } else {
+        await API.post("/api/configs/host-mappings", { profile_id: profileId, domain, target, skip_proxy: skipProxy, sort_order: 0 });
+        toast(I18N["msg.added"]);
+      }
+      hideModal("host-modal");
+      opts.onHostSaved?.(profileId);
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  window.deleteHost = async function(id, profileId = null) {
+    if (!(await confirmDialog(I18N["rule.confirm_delete"], { danger: true }))) return;
+    try {
+      await API.del(`/api/configs/host-mappings/${id}`);
+      toast(I18N["msg.deleted"]);
+      opts.onHostSaved?.(profileId);
+    } catch (e) { toast(e.message, "error"); }
+  };
+}
+
 /** 解析 "TYPE,value,action" 文本为结构化对象；非简单类型返回 null */
 function parseRuleText(text) {
   const parts = text.split(",");

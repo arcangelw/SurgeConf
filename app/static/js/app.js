@@ -71,7 +71,7 @@ function showModal(id) {
     if (e.target === el) hideModal(id);
   };
   // 聚焦弹窗内第一个输入控件
-  const first = el.querySelector("input, select, textarea");
+  const first = el.querySelector("input:not([type=hidden]), select, textarea");
   if (first) first.focus();
 }
 
