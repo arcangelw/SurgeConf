@@ -50,4 +50,59 @@ async function saveSysConfig(btn) {
   });
 }
 
+// ===== 全局 Skip-Proxy（general.js 平移） =====
+
+let skipProxyItems = [];
+
+async function loadSkipProxy() {
+  try {
+    const data = await API.get("/api/general/skip-proxy");
+    skipProxyItems = data.custom || [];
+    renderSkipProxy();
+    const defaultsEl = document.getElementById("skip-proxy-defaults");
+    defaultsEl.innerHTML = (data.defaults || []).map(d =>
+      `<span class="badge">${escapeHtml(d)}</span>`
+    ).join("");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderSkipProxy() {
+  const el = document.getElementById("skip-proxy-list");
+  if (!skipProxyItems.length) {
+    el.innerHTML = `<span style="font-size:12px;color:var(--text2);">${I18N["general.skip_proxy_empty"]}</span>`;
+    return;
+  }
+  el.innerHTML = skipProxyItems.map((item, i) =>
+    `<span class="badge badge-primary" style="display:inline-flex;align-items:center;gap:4px;">${escapeHtml(item)} <a style="cursor:pointer;margin-left:2px;color:var(--text2);" onclick="removeSkipProxyItem(${i})">✕</a></span>`
+  ).join("");
+}
+
+async function addSkipProxyItem() {
+  const input = document.getElementById("skip-proxy-input");
+  const val = input.value.trim();
+  if (!val) {
+    toast(I18N["msg.required"], "error"); flashInput(input); return;
+  }
+  if (skipProxyItems.includes(val)) { toast(I18N["general.skip_proxy_dup"], "error"); return; }
+  skipProxyItems.push(val);
+  input.value = "";
+  renderSkipProxy();
+  await saveSkipProxy();
+}
+
+async function removeSkipProxyItem(i) {
+  skipProxyItems.splice(i, 1);
+  renderSkipProxy();
+  await saveSkipProxy();
+}
+
+async function saveSkipProxy() {
+  try {
+    await API.put("/api/general/skip-proxy", { items: skipProxyItems });
+    toast(I18N["msg.saved"]);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+loadSkipProxy();
+
 loadSysConfig();

@@ -10,30 +10,30 @@
 </div>
 
 <div class="stats" id="stats">
-  <div class="stat-card">
+  <a class="stat-card" href="/proxies" style="text-decoration:none;">
     <div class="value" id="stat-subs">-</div>
     <div class="label">{{ t["dashboard.subs"] }}</div>
-  </div>
-  <div class="stat-card">
+  </a>
+  <a class="stat-card" href="/proxies" style="text-decoration:none;">
     <div class="value" id="stat-nodes">-</div>
     <div class="label">{{ t["dashboard.nodes"] }}</div>
-  </div>
-  <div class="stat-card">
+  </a>
+  <a class="stat-card" href="/proxies" style="text-decoration:none;">
     <div class="value" id="stat-regions">-</div>
     <div class="label">{{ t["dashboard.regions"] }}</div>
-  </div>
-  <div class="stat-card">
+  </a>
+  <a class="stat-card" href="/proxies" style="text-decoration:none;">
     <div class="value" id="stat-services">-</div>
     <div class="label">{{ t["dashboard.services"] }}</div>
-  </div>
-  <div class="stat-card">
+  </a>
+  <a class="stat-card" href="/rules" style="text-decoration:none;">
     <div class="value" id="stat-rules">-</div>
     <div class="label">{{ t["dashboard.rules"] }}</div>
-  </div>
-  <div class="stat-card">
+  </a>
+  <a class="stat-card" href="/profiles" style="text-decoration:none;">
     <div class="value" id="stat-profiles">-</div>
     <div class="label">{{ t["dashboard.profiles"] }}</div>
-  </div>
+  </a>
 </div>
 
 <div class="card">
@@ -41,10 +41,10 @@
     <h3>{{ t["dashboard.quick"] }}</h3>
   </div>
   <div style="display:flex;gap:10px;flex-wrap:wrap;">
-    <a href="/subscriptions" class="btn btn-primary">{{ t["dashboard.add_sub"] }}</a>
-    <a href="/nodes" class="btn btn-outline">{{ t["dashboard.manage_nodes"] }}</a>
+    <a href="/proxies" class="btn btn-primary">{{ t["dashboard.add_sub"] }}</a>
+    <a href="/proxies" class="btn btn-outline">{{ t["dashboard.manage_nodes"] }}</a>
     <button class="btn btn-outline" onclick="autoAssign(this)">{{ t["btn.auto_assign"] }}</button>
-    <a href="/generator" class="btn btn-success">{{ t["dashboard.generate"] }}</a>
+    <a href="/profiles" class="btn btn-success">{{ t["dashboard.generate"] }}</a>
   </div>
 </div>
 

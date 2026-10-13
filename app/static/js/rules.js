@@ -6,6 +6,20 @@ let allServices = [];
 let allCustomRules = {pre: [], general: []};
 let defaultDnsPresets = [];
 
+// ===== Tab 切换（localStorage 保持） =====
+
+function switchRulesTab(tab) {
+  document.querySelectorAll("#rules-tab-bar .tab-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+  });
+  for (const t of ["sources", "custom", "hosts"]) {
+    const el = document.getElementById(`rules-tab-${t}`);
+    if (el) el.style.display = t === tab ? "" : "none";
+  }
+  try { localStorage.setItem("rules-active-tab", tab); } catch { /* 隐私模式忽略 */ }
+}
+
+
 const CATEGORY_MAP = {
   unbreak: I18N["rule.cat.unbreak"],
   adblock: I18N["rule.cat.adblock"],
@@ -287,6 +301,9 @@ setupRuleModals({
 
 async function init() {
   document.getElementById("rule-category").innerHTML = buildCategoryOptions();
+  let savedTab = "sources";
+  try { savedTab = localStorage.getItem("rules-active-tab") || "sources"; } catch { /* ignore */ }
+  switchRulesTab(savedTab);
   await loadGroups();
   await loadDnsPresets();
   loadData();

@@ -6,112 +6,123 @@
   <h1>{{ t["rule.title"] }}</h1>
 </div>
 
-<div class="card">
-  <div class="card-header">
-    <h3>{{ t["rule.count"] }}</h3>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <span style="font-size:12px;color:var(--text2);" id="rule-count"></span>
-      <button class="btn btn-primary btn-sm" onclick="showAddRule()">{{ t["rule.add"] }}</button>
-      <button class="btn btn-outline btn-sm" onclick="resetDefaultOrder()">{{ t["rule.reset_order"] }}</button>
+<div class="tab-bar" id="rules-tab-bar">
+  <button class="tab-btn active" data-tab="sources" onclick="switchRulesTab('sources')">{{ t["rule.tab_sources"] }}</button>
+  <button class="tab-btn" data-tab="custom" onclick="switchRulesTab('custom')">{{ t["rule.tab_custom"] }}</button>
+  <button class="tab-btn" data-tab="hosts" onclick="switchRulesTab('hosts')">{{ t["rule.tab_hosts"] }}</button>
+</div>
+
+<!-- Tab：规则源 -->
+<div id="rules-tab-sources">
+  <div class="card">
+    <div class="card-header">
+      <h3>{{ t["rule.count"] }}</h3>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-size:12px;color:var(--text2);" id="rule-count"></span>
+        <button class="btn btn-primary btn-sm" onclick="showAddRule()">{{ t["rule.add"] }}</button>
+        <button class="btn btn-outline btn-sm" onclick="resetDefaultOrder()">{{ t["rule.reset_order"] }}</button>
+      </div>
     </div>
-  </div>
-  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.drag_hint"] }}</p>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th style="width:24px;"></th>
-          <th>{{ t["rule.name"] }}</th>
-          <th>{{ t["rule.type"] }}</th>
-          <th>{{ t["rule.action"] }}</th>
-          <th>{{ t["rule.category"] }}</th>
-          <th>{{ t["group.order"] }}</th>
-          <th>{{ t["sub.status"] }}</th>
-          <th>{{ t["node.col_action"] }}</th>
-        </tr>
-      </thead>
-      <tbody id="rule-list"></tbody>
-    </table>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.drag_hint"] }}</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:24px;"></th>
+            <th>{{ t["rule.name"] }}</th>
+            <th>{{ t["rule.type"] }}</th>
+            <th>{{ t["rule.action"] }}</th>
+            <th>{{ t["rule.category"] }}</th>
+            <th>{{ t["group.order"] }}</th>
+            <th>{{ t["sub.status"] }}</th>
+            <th>{{ t["node.col_action"] }}</th>
+          </tr>
+        </thead>
+        <tbody id="rule-list"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
-<!-- 前置自定义规则 -->
-<div class="card" style="margin-top:16px;">
-  <div class="card-header">
-    <h3>{{ t["rule.pre_title"] }}</h3>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <span style="font-size:12px;color:var(--text2);" id="pre-count"></span>
-      <button class="btn btn-primary btn-sm" onclick="showAddCustomRule('pre')">{{ t["rule.add_custom"] }}</button>
+<!-- Tab：自定义规则（前置 + 通用） -->
+<div id="rules-tab-custom" style="display:none;">
+  <div class="card">
+    <div class="card-header">
+      <h3>{{ t["rule.pre_title"] }}</h3>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-size:12px;color:var(--text2);" id="pre-count"></span>
+        <button class="btn btn-primary btn-sm" onclick="showAddCustomRule('pre')">{{ t["rule.add_custom"] }}</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.pre_hint"] }}</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:24px;"></th>
+            <th>{{ t["rule.rule_text"] }}</th>
+            <th>{{ t["rule.comment"] }}</th>
+            <th>{{ t["sub.status"] }}</th>
+            <th>{{ t["node.col_action"] }}</th>
+          </tr>
+        </thead>
+        <tbody id="pre-rule-list"></tbody>
+      </table>
     </div>
   </div>
-  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.pre_hint"] }}</p>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th style="width:24px;"></th>
-          <th>{{ t["rule.rule_text"] }}</th>
-          <th>{{ t["rule.comment"] }}</th>
-          <th>{{ t["sub.status"] }}</th>
-          <th>{{ t["node.col_action"] }}</th>
-        </tr>
-      </thead>
-      <tbody id="pre-rule-list"></tbody>
-    </table>
+
+  <div class="card" style="margin-top:16px;">
+    <div class="card-header">
+      <h3>{{ t["rule.general_title"] }}</h3>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-size:12px;color:var(--text2);" id="general-count"></span>
+        <button class="btn btn-primary btn-sm" onclick="showAddCustomRule('general')">{{ t["rule.add_custom"] }}</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.general_hint"] }}</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:24px;"></th>
+            <th>{{ t["rule.rule_text"] }}</th>
+            <th>{{ t["rule.comment"] }}</th>
+            <th>{{ t["sub.status"] }}</th>
+            <th>{{ t["node.col_action"] }}</th>
+          </tr>
+        </thead>
+        <tbody id="general-rule-list"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
-<!-- 通用自定义规则 -->
-<div class="card" style="margin-top:16px;">
-  <div class="card-header">
-    <h3>{{ t["rule.general_title"] }}</h3>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <span style="font-size:12px;color:var(--text2);" id="general-count"></span>
-      <button class="btn btn-primary btn-sm" onclick="showAddCustomRule('general')">{{ t["rule.add_custom"] }}</button>
+<!-- Tab：Host 映射 -->
+<div id="rules-tab-hosts" style="display:none;">
+  <div class="card">
+    <div class="card-header">
+      <h3>{{ t["rule.host_title"] }}</h3>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-size:12px;color:var(--text2);" id="host-count"></span>
+        <button class="btn btn-primary btn-sm" onclick="showAddHost()">{{ t["profile.add_host"] }}</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.host_hint"] }}</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>{{ t["profile.host_domain"] }}</th>
+            <th>{{ t["profile.host_target"] }}</th>
+            <th>{{ t["sub.status"] }}</th>
+            <th>{{ t["node.col_action"] }}</th>
+          </tr>
+        </thead>
+        <tbody id="host-list"></tbody>
+      </table>
     </div>
   </div>
-  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.general_hint"] }}</p>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th style="width:24px;"></th>
-          <th>{{ t["rule.rule_text"] }}</th>
-          <th>{{ t["rule.comment"] }}</th>
-          <th>{{ t["sub.status"] }}</th>
-          <th>{{ t["node.col_action"] }}</th>
-        </tr>
-      </thead>
-      <tbody id="general-rule-list"></tbody>
-    </table>
-  </div>
 </div>
-
-<!-- 默认 Host 映射 -->
-<div class="card" style="margin-top:16px;">
-  <div class="card-header">
-    <h3>{{ t["rule.host_title"] }}</h3>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <span style="font-size:12px;color:var(--text2);" id="host-count"></span>
-      <button class="btn btn-primary btn-sm" onclick="showAddHost()">{{ t["profile.add_host"] }}</button>
-    </div>
-  </div>
-  <p style="font-size:12px;color:var(--text2);margin-bottom:8px;">{{ t["rule.host_hint"] }}</p>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>{{ t["profile.host_domain"] }}</th>
-          <th>{{ t["profile.host_target"] }}</th>
-          <th>{{ t["sub.status"] }}</th>
-          <th>{{ t["node.col_action"] }}</th>
-        </tr>
-      </thead>
-      <tbody id="host-list"></tbody>
-    </table>
-  </div>
-</div>
-
 
 <!-- 规则源编辑弹窗 -->
 <div class="modal-overlay" id="rule-modal">
