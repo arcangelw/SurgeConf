@@ -462,7 +462,14 @@ DEFAULT_PRE_RULES = [
      "comment": "阻断 IP 直连 STUN (UDP 3478)"},
     {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,19302)),REJECT", "position": "pre", "sort_order": 92,
      "comment": "阻断 IP 直连 STUN (UDP 19302)"},
+    {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT", "position": "pre", "sort_order": 93,
+     "comment": "阻断 QUIC/HTTP3(UDP 443)：中转节点 UDP 为国内入口直出的假转发，强制回退 TCP 走真代理"},
+    {"rule_text": "PROTOCOL,STUN,REJECT", "position": "pre", "sort_order": 94,
+     "comment": "DPI 级阻断任意端口 STUN，兜底非标端口探测"},
+    {"rule_text": "DOMAIN-SUFFIX,claudeusercontent.com,AI服务", "position": "pre", "sort_order": 95,
+     "comment": "Claude Artifacts 用户内容 CDN 归组 AI 服务"},
 ]
+
 
 # 内置安全规则（随版本分发的防护，老库启动时幂等补齐；只增不删，不复活用户删过的其他默认规则）
 # ⚠ sort_order >= 90 是安全规则保留区：新增普通默认规则勿使用 90+，否则会被当安全规则在每次启动时强制补齐（用户删除后复活）
