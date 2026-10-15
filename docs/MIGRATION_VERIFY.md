@@ -13,6 +13,9 @@
    - `encrypted-dns-server`：双 DoH → `h3://dns.alidns.com/dns-query, https://dns.alidns.com/dns-query, https://doh.pub/dns-query`（三路并发先答先用）
    - `hijack-dns`：`8.8.8.8:53, 8.8.4.4:53` → `*:53`（全劫持明文 53）
 5. **`no_resolve_keywords` 系统键补齐**（IP 类规则集 no-resolve 关键词，供面板管理；生成器有代码兜底）
+6. **删除死配置 `geoip-maxmind-url`**：产物无 GEOIP 规则（国内判定走 domestic.ip/ChinaMax/ASN China 三集），该 mmdb 库不会被查询——省一次下载与常驻内存
+
+   验证：`sqlite3 data/surge_conf.db "SELECT COUNT(*) FROM config_profiles WHERE general LIKE '%geoip-maxmind-url%';"` 返回 0，且 preview 产物无 geoip 行、url-test 组均为 `tolerance=100`（官方默认，消除 50ms 容差导致的抖动切换与连接重建）。
 
 ## 验证步骤
 

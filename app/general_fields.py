@@ -62,7 +62,6 @@ GENERAL_GROUPS = [
                      "这些域名绕过 fake-ip", "Domains that bypass fake-ip"),
             FieldDef("hijack-dns", "劫持 DNS", "Hijack DNS", TAGS,
                      "劫持明文 DNS 请求，*:53 全劫持", "Hijack plain DNS, *:53 for all"),
-            FieldDef("geoip-maxmind-url", "GeoIP 数据库 URL", "GeoIP Database URL", TEXT),
         ],
     },
     {

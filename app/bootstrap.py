@@ -142,9 +142,15 @@ async def apply_data_migrations(db) -> None:
             if g.get(key) == old:
                 g[key] = new
                 changed = True
-        if changed:
-            profile.general = g
-            fixed_dns += 1
+        # 删除死配置：产物无 GEOIP 规则（国内判定走 domestic.ip/ChinaMax/ASN China 三集），
+        # geoip-maxmind-url 指向的 mmdb 库不会被查询，白占一次下载与常驻内存
+        if "geoip-maxmind-url" in g:
+            del g["geoip-maxmind-url"]
+            changed = True
+        if not changed:
+            continue
+        profile.general = g
+        fixed_dns += 1
 
     # 无条件 commit：上面的 select 会触发 autoflush（flush ≠ commit），若按 db.new/db.dirty 判断
     # 会因已 flush 而误判"无变更"跳过 commit，session 关闭时事务回滚、变更丢失

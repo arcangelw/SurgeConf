@@ -313,7 +313,6 @@ DEFAULT_GENERAL = {
     "internet-test-url": "http://connectivitycheck.gstatic.com/generate_204",
     "proxy-test-url": "http://captive.apple.com/generate_204",
     "test-timeout": 3,
-    "geoip-maxmind-url": "https://github.com/Hackl0us/GeoIP2-CN/raw/release/Country.mmdb",
     "ipv6": False,
     "ipv6-vif": "disabled",
     "allow-wifi-access": False,

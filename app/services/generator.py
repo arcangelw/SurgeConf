@@ -239,7 +239,7 @@ def _build_proxy_groups(
             f'policy-regex-filter={rg.filter_regex}, '
             f'include-other-group={_quote(t("全部节点"))}, '
             f'url=http://cp.cloudflare.com/generate_204, '
-            f'interval=300, tolerance=50, timeout=3'
+            f'interval=300, tolerance=100, timeout=3'
             f'{icon}'
         )
 
@@ -260,7 +260,7 @@ def _build_proxy_groups(
             f'policy-regex-filter={other_filter}, '
             f'include-other-group={_quote(t("全部节点"))}, '
             f'url=http://cp.cloudflare.com/generate_204, '
-            f'interval=300, tolerance=50, timeout=3, '
+            f'interval=300, tolerance=100, timeout=3, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
         )
 
@@ -300,7 +300,7 @@ def _build_proxy_groups(
     if auto_select_members:
         lines.append(
             f'{_quote(t("自动选择"))} = select, {", ".join(auto_select_members)}, '
-            f'url=http://cp.cloudflare.com/generate_204, interval=300, tolerance=50, timeout=3, '
+            f'url=http://cp.cloudflare.com/generate_204, interval=300, tolerance=100, timeout=3, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/05icon/lightning(5).png'
         )
     # 代理：自动选择 + 所有地区（自动+手动）
