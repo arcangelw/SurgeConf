@@ -16,6 +16,9 @@
 6. **删除死配置 `geoip-maxmind-url`**：产物无 GEOIP 规则（国内判定走 domestic.ip/ChinaMax/ASN China 三集），该 mmdb 库不会被查询——省一次下载与常驻内存
 
    验证：`sqlite3 data/surge_conf.db "SELECT COUNT(*) FROM config_profiles WHERE general LIKE '%geoip-maxmind-url%';"` 返回 0，且 preview 产物无 geoip 行、url-test 组均为 `tolerance=100`（官方默认，消除 50ms 容差导致的抖动切换与连接重建）。
+7. **关闭 Surge 内置 Web 面板**：`http-api-web-dashboard` → `false`（常驻内存；SurgeConf 面板不依赖它，官方默认亦为 false。Surge 的 HTTP API 端口不受影响）
+
+   验证：preview 产物含 `http-api-web-dashboard = false`。
 
 ## 验证步骤
 

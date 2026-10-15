@@ -147,6 +147,10 @@ async def apply_data_migrations(db) -> None:
         if "geoip-maxmind-url" in g:
             del g["geoip-maxmind-url"]
             changed = True
+        # 关闭 Surge 内置 Web 面板（常驻内存；SurgeConf 面板不依赖它，官方默认亦为 false）
+        if g.get("http-api-web-dashboard") is True:
+            g["http-api-web-dashboard"] = False
+            changed = True
         if not changed:
             continue
         profile.general = g

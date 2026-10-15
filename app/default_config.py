@@ -324,7 +324,7 @@ DEFAULT_GENERAL = {
     "external-controller-access": _CONTROLLER_ACCESS,
     "http-api": _HTTP_API,
     "http-api-tls": True,
-    "http-api-web-dashboard": True,
+    "http-api-web-dashboard": False,
     "compatibility-mode": 1,
     "exclude-simple-hostnames": True,
     "read-etc-hosts": True,
