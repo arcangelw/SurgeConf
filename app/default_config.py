@@ -344,6 +344,8 @@ DEFAULT_GENERAL = {
     # 全劫持明文 53 端口：应用硬编码任意 DNS 均由 fake-ip 应答接管，域名不出本机
     "hijack-dns": "*:53",
     "udp-policy-not-supported-behaviour": "REJECT",
+    # DIRECT 保留 QUIC/HTTP3 性能，代理按各自 UDP 能力自适应处理；避免全局封锁拖慢图片与视频
+    "block-quic": "per-policy",
     "proxy-restricted-to-lan": False,
 }
 
@@ -464,8 +466,6 @@ DEFAULT_PRE_RULES = [
      "comment": "阻断 IP 直连 STUN (UDP 3478)"},
     {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,19302)),REJECT", "position": "pre", "sort_order": 92,
      "comment": "阻断 IP 直连 STUN (UDP 19302)"},
-    {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT", "position": "pre", "sort_order": 93,
-     "comment": "阻断 QUIC/HTTP3(UDP 443)：中转节点 UDP 为国内入口直出的假转发，强制回退 TCP 走真代理"},
     {"rule_text": "PROTOCOL,STUN,REJECT", "position": "pre", "sort_order": 94,
      "comment": "DPI 级阻断任意端口 STUN，兜底非标端口探测"},
     {"rule_text": "DOMAIN-SUFFIX,claudeusercontent.com,AI服务", "position": "pre", "sort_order": 95,

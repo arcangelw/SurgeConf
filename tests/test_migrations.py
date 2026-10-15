@@ -155,6 +155,47 @@ async def test_dns_custom_values_not_touched(db):
 
 
 @pytest.mark.asyncio
+async def test_global_quic_block_removed_and_per_policy_default_added(db):
+    """删除误伤媒体性能的全局 UDP/443 阻断，改为 Surge 官方按策略处理 QUIC。"""
+    obsolete = "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT"
+    db.add(CustomRule(
+        profile_id=None,
+        rule_text=obsolete,
+        position="pre",
+        sort_order=93,
+        enabled=True,
+        comment="legacy global QUIC block",
+    ))
+    profile = (await db.execute(select(ConfigProfile))).scalars().first()
+    general = dict(profile.general)
+    general.pop("block-quic", None)
+    profile.general = general
+    await db.commit()
+
+    await apply_data_migrations(db)
+
+    async with await _fresh_view(db) as fresh:
+        rules = (await fresh.execute(select(CustomRule.rule_text))).scalars().all()
+        migrated_general = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
+    assert obsolete not in rules
+    assert migrated_general["block-quic"] == "per-policy"
+
+
+@pytest.mark.asyncio
+async def test_custom_block_quic_value_not_touched(db):
+    """用户显式选择的 QUIC 策略不被迁移覆盖。"""
+    profile = (await db.execute(select(ConfigProfile))).scalars().first()
+    profile.general = dict(profile.general, **{"block-quic": "always-allow"})
+    await db.commit()
+
+    await apply_data_migrations(db)
+
+    async with await _fresh_view(db) as fresh:
+        general = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
+    assert general["block-quic"] == "always-allow"
+
+
+@pytest.mark.asyncio
 async def test_no_resolve_keywords_backfilled_and_persisted(db):
     """缺 no_resolve_keywords 系统键时补默认值并持久化；已有自定义值不覆盖"""
     keys = (await db.execute(select(SystemConfig.key))).scalars().all()

@@ -93,7 +93,7 @@ async def seed_defaults():
 
 async def apply_data_migrations(db) -> None:
     """幂等数据迁移：规则源补齐 + 安全规则补齐 + ipv6-vif/DNS 默认值升级。可安全重复执行。"""
-    from sqlalchemy import select, update
+    from sqlalchemy import delete, select, update
     from app.default_config import SECURITY_PRE_RULES
     from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
     from app.models import CustomRule, ConfigProfile, SystemConfig, RuleSource
@@ -116,6 +116,18 @@ async def apply_data_migrations(db) -> None:
         )
         db.add(RuleSource(**douyin_default))
         douyin_added = 1
+
+    # 旧版曾全局阻断 UDP/443 以强制 QUIC 回退，但这也会误伤 DIRECT 的 HTTP/3，
+    # 导致国内外图片、视频先失败再回退 TCP。删除该精确内置规则，改由 General 的
+    # block-quic=per-policy 让 DIRECT 保留 QUIC、代理按各自 UDP 能力自适应处理。
+    obsolete_quic_rule = "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT"
+    removed_quic = (await db.execute(
+        delete(CustomRule).where(
+            CustomRule.profile_id.is_(None),
+            CustomRule.position == "pre",
+            CustomRule.rule_text == obsolete_quic_rule,
+        )
+    )).rowcount or 0
 
     # 系统键补齐（no_resolve_keywords：IP 类规则集 no-resolve 关键词，generator 有代码兜底，此处补齐供面板管理）
     existing_keys = {row[0] for row in (await db.execute(select(SystemConfig.key))).all()}
@@ -153,7 +165,7 @@ async def apply_data_migrations(db) -> None:
         ),
         "hijack-dns": ("8.8.8.8:53, 8.8.4.4:53", "*:53"),
     }
-    fixed_dns = 0
+    fixed_general = 0
     for profile in (await db.execute(select(ConfigProfile))).scalars().all():
         g = dict(profile.general) if isinstance(profile.general, dict) else {}
         changed = False
@@ -170,19 +182,24 @@ async def apply_data_migrations(db) -> None:
         if g.get("http-api-web-dashboard") is True:
             g["http-api-web-dashboard"] = False
             changed = True
+        # Surge 官方默认的按策略处理：DIRECT 不封 QUIC，代理根据 UDP 支持情况决定。
+        # 仅在用户从未配置时补齐，明确设置 all/all-proxy/always-allow 的用户值不覆盖。
+        if "block-quic" not in g:
+            g["block-quic"] = "per-policy"
+            changed = True
         if not changed:
             continue
         profile.general = g
-        fixed_dns += 1
+        fixed_general += 1
 
     # 无条件 commit：上面的 select 会触发 autoflush（flush ≠ commit），若按 db.new/db.dirty 判断
     # 会因已 flush 而误判"无变更"跳过 commit，session 关闭时事务回滚、变更丢失
     key_added = "no_resolve_keywords" not in existing_keys
     await db.commit()
-    if added or fixed_v6 or fixed_dns or key_added or douyin_added:
+    if added or fixed_v6 or fixed_general or key_added or douyin_added or removed_quic:
         print(f"[数据迁移] 补齐内置安全规则 {added} 条，修正存量 ipv6-vif {fixed_v6} 个档案，"
-              f"升级 DNS 配置 {fixed_dns} 个档案，补系统键 {int(key_added)} 项，"
-              f"补抖音直连规则源 {douyin_added} 项", file=sys.stderr)
+              f"升级 General 配置 {fixed_general} 个档案，补系统键 {int(key_added)} 项，"
+              f"补抖音直连规则源 {douyin_added} 项，移除全局 QUIC 阻断 {removed_quic} 条", file=sys.stderr)
 
 
 @asynccontextmanager

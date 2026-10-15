@@ -6,7 +6,7 @@
 
 ## 迁移内容（随代码静默分发）
 
-1. **WebRTC 防泄漏规则** 5 条前置规则补齐（域名/端口×3/协议级 STUN + QUIC 阻断）
+1. **WebRTC 防泄漏规则** 4 条前置规则补齐（域名、STUN 端口×2、协议级 STUN）
 2. **Claude 配套规则** `DOMAIN-SUFFIX,claudeusercontent.com,AI服务` 补齐（Artifacts CDN 归组）
 3. **存量档案 `ipv6-vif` 归一**：`auto/native/off/disable → disabled`（官方规范值；auto 按既定策略强制关闭）
 4. **DNS 默认值升级**（仅精确匹配旧默认值时升级，用户自定义不动）：
@@ -22,6 +22,7 @@
 8. **抖音优先直连**：补齐 `DouYin` 规则源并放在 `TikTok` 之前。两者都覆盖 `snssdk.com`，优先直连可避免抖音评论、视频和直播误走 TikTok 海外出口。
 
    验证：`SELECT name,action,sort_order FROM rule_sources WHERE name IN ('DouYin','TikTok') ORDER BY sort_order;` 中 `DouYin / 大陆直连` 位于 `TikTok` 之前。
+9. **恢复媒体 QUIC 性能**：删除旧版全局 `UDP/443 → REJECT`，并补 `block-quic = per-policy`。DIRECT 保留 QUIC/HTTP3，代理按 UDP 能力自适应处理；STUN 专用防泄漏规则继续生效。
 
 ## 验证步骤
 
@@ -31,7 +32,7 @@
 grep "数据迁移" logs/surgeconf.log
 ```
 
-- 老库首次启动：应有一条 `[数据迁移] 补齐内置安全规则 N 条，修正存量 ipv6-vif M 个档案，升级 DNS 配置 D 个档案，补系统键 K 项，补抖音直连规则源 Y 项`（N≤6、M≥0、D≥0、K≤1、Y≤1 均正常——老库可能已有部分规则/值；出现该行即迁移已执行）
+- 老库首次启动：应有一条 `[数据迁移] 补齐内置安全规则 N 条，修正存量 ipv6-vif M 个档案，升级 General 配置 G 个档案，补系统键 K 项，补抖音直连规则源 Y 项，移除全局 QUIC 阻断 Q 条`（N≤5、M≥0、G≥0、K≤1、Y≤1、Q≤1 均正常——老库可能已有部分规则/值；出现该行即迁移已执行）
 - 新库或已迁移库：无输出（幂等，无变更不打印）
 
 ### 2. WebRTC / Claude 规则落库
@@ -40,13 +41,12 @@ grep "数据迁移" logs/surgeconf.log
 sqlite3 data/surge_conf.db "SELECT rule_text FROM custom_rules WHERE rule_text LIKE '%stun%' OR rule_text LIKE '%3478%' OR rule_text LIKE '%19302%' OR rule_text LIKE '%443)),REJECT%' OR rule_text LIKE '%claudeusercontent%' ORDER BY sort_order;"
 ```
 
-预期包含以下 6 行（历史自建规则含这些关键词会多出其他行，集合包含即通过）：
+预期包含以下 5 行（历史自建规则含这些关键词会多出其他行，集合包含即通过）：
 
 ```
 DOMAIN-KEYWORD,stun,REJECT
 AND,((PROTOCOL,UDP), (DEST-PORT,3478)),REJECT
 AND,((PROTOCOL,UDP), (DEST-PORT,19302)),REJECT
-AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT
 PROTOCOL,STUN,REJECT
 DOMAIN-SUFFIX,claudeusercontent.com,AI服务
 ```
@@ -85,8 +85,8 @@ ipv6 = false
 ipv6-vif = disabled
 encrypted-dns-server = h3://dns.alidns.com/dns-query, https://dns.alidns.com/dns-query, https://doh.pub/dns-query
 hijack-dns = *:53
+block-quic = per-policy
 DOMAIN-KEYWORD,stun,REJECT                          ← [Rule] 段、第一条 RULE-SET 之前
-AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT
 PROTOCOL,STUN,REJECT
 RULE-SET,<URL 含 /ip/ 的规则集>,<任意策略>,no-resolve  ← 至少一行以 ,no-resolve 结尾（DNS 泄漏防护）
 ```
@@ -146,7 +146,7 @@ cd <SurgeConf 目录> && git pull && ./surgeconf.sh restart
 
 | 现象 | 处置 |
 |---|---|
-| 规则未补齐 | 先看启动日志有无异常栈；仍缺则手动插入（重启服务后生效）：`sqlite3 data/surge_conf.db "INSERT INTO custom_rules (profile_id, rule_text, position, sort_order, enabled, comment) VALUES (NULL,'AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT','pre',93,1,'阻断 QUIC/HTTP3(UDP 443)：中转节点 UDP 为国内入口直出的假转发，强制回退 TCP 走真代理'),(NULL,'PROTOCOL,STUN,REJECT','pre',94,1,'DPI 级阻断任意端口 STUN，兜底非标端口探测'),(NULL,'DOMAIN-SUFFIX,claudeusercontent.com,AI服务','pre',95,1,'Claude Artifacts 用户内容 CDN 归组 AI 服务');"` |
+| 规则未补齐 | 先看启动日志有无异常栈；仍缺则手动插入（重启服务后生效）：`sqlite3 data/surge_conf.db "INSERT INTO custom_rules (profile_id, rule_text, position, sort_order, enabled, comment) VALUES (NULL,'PROTOCOL,STUN,REJECT','pre',94,1,'DPI 级阻断任意端口 STUN，兜底非标端口探测'),(NULL,'DOMAIN-SUFFIX,claudeusercontent.com,AI服务','pre',95,1,'Claude Artifacts 用户内容 CDN 归组 AI 服务');"` |
 | ipv6-vif 仍旧值 | 迁移只归一 auto/native/off/disable 四个旧值，`always` 视为用户选择不动；确认库值后手工 UPDATE 为 disabled |
 | DNS 未升级 | 迁移只精确匹配旧默认串；该设备曾自定义 DNS 则有意跳过（不算失败），需要新默认时手工改或删键重启 |
 | STUN 仍通 | 确认 Surge 重载了新生成配置（SurgeConf 生成 ≠ Surge 已加载）；确认增强模式开启 |

@@ -17,14 +17,14 @@
 | `f059767` | General 表单紧凑化 |
 | `0536b04` | ipv6-vif 统一官方规范值 disabled |
 | `c14eed5` | DNS 优化：阿里 DoH3 三路并发 + hijack-dns `*:53` 全劫持 |
-| `7fb101b` | WebRTC 防泄漏补口（UDP 443/QUIC + PROTOCOL,STUN）+ 静默分发闭环 |
+| `7fb101b` | WebRTC 防泄漏补口（其中全局 UDP 443 阻断已因媒体性能问题撤销，保留 PROTOCOL,STUN） |
 
 ## 二、各设备标准流程（先跑这个）
 
 ```bash
 cd <SurgeConf 目录>
 git pull && ./surgeconf.sh restart && sleep 3
-./venv/bin/python -m pytest tests/ -q        # 应 110 passed
+./venv/bin/python -m pytest tests/ -q        # 应 112 passed
 ```
 
 然后按 `docs/MIGRATION_VERIFY.md` 全文自检（AI 可执行，全部通过即报告「迁移验证通过」）。
