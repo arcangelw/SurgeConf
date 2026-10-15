@@ -1,8 +1,9 @@
 # SurgeConf 升级交接文档（供各设备 AI 执行）
 
-> 本文档由主设备（macOS，仓库 `/Users/arcangelw/GitHub/SurgeConf`）的维护会话生成。
-> 目的：`docs/MIGRATION_VERIFY.md` 覆盖**能静默迁移的部分**（git pull + restart 自动生效）；
-> 本文档覆盖**无法静默处理、必须人工/AI 介入的工作**。各设备 AI 按顺序逐项执行并回报。
+> 本文档由主设备的维护会话生成。目的：`docs/MIGRATION_VERIFY.md` 覆盖**能静默迁移的部分**
+> （git pull + restart 自动生效）；本文档覆盖**无法静默处理、必须人工/AI 介入的工作**。
+> 各设备 AI 按顺序逐项执行并回报。
+
 
 ## 一、背景与提交链
 
