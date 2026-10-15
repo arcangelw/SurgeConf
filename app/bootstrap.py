@@ -92,7 +92,7 @@ async def seed_defaults():
 
 
 async def apply_data_migrations(db) -> None:
-    """幂等数据迁移：内置安全规则补齐 + 存量 ipv6-vif 修正。可安全重复执行。"""
+    """幂等数据迁移：内置安全规则补齐 + 存量 ipv6-vif 归一 + DNS 默认值升级。可安全重复执行。"""
     from sqlalchemy import select
     from app.default_config import SECURITY_PRE_RULES
     from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
@@ -122,12 +122,37 @@ async def apply_data_migrations(db) -> None:
             profile.general = g
             fixed_v6 += 1
 
+    # 存量档案 DNS 旧默认值升级（基于 Surge 官方文档 + 本机实测的性能/隐私优化）：
+    # 1) encrypted-dns-server 加入阿里 DoH3 主力（alt-svc 官宣 h3，QUIC 1-RTT 抗丢包），
+    #    保留同域 TCP DoH 与腾讯 DoH 做跨协议/跨服务商并发兜底
+    # 2) hijack-dns 从仅劫持 Google DNS 升级为 *:53 全劫持，防应用硬编码任意明文 DNS 绕过 fake-ip
+    # 仅精确匹配旧默认值时升级，用户自定义值一律不动
+    _DNS_UPGRADES = {
+        "encrypted-dns-server": (
+            "https://doh.pub/dns-query, https://dns.alidns.com/dns-query",
+            "h3://dns.alidns.com/dns-query, https://dns.alidns.com/dns-query, https://doh.pub/dns-query",
+        ),
+        "hijack-dns": ("8.8.8.8:53, 8.8.4.4:53", "*:53"),
+    }
+    fixed_dns = 0
+    for profile in (await db.execute(select(ConfigProfile))).scalars().all():
+        g = dict(profile.general) if isinstance(profile.general, dict) else {}
+        changed = False
+        for key, (old, new) in _DNS_UPGRADES.items():
+            if g.get(key) == old:
+                g[key] = new
+                changed = True
+        if changed:
+            profile.general = g
+            fixed_dns += 1
+
     # 无条件 commit：上面的 select 会触发 autoflush（flush ≠ commit），若按 db.new/db.dirty 判断
     # 会因已 flush 而误判"无变更"跳过 commit，session 关闭时事务回滚、变更丢失
     key_added = "no_resolve_keywords" not in existing_keys
     await db.commit()
-    if added or fixed_v6 or key_added:
-        print(f"[数据迁移] 补齐内置安全规则 {added} 条，修正存量 ipv6-vif {fixed_v6} 个档案，补系统键 {int(key_added)} 项", file=sys.stderr)
+    if added or fixed_v6 or fixed_dns or key_added:
+        print(f"[数据迁移] 补齐内置安全规则 {added} 条，修正存量 ipv6-vif {fixed_v6} 个档案，"
+              f"升级 DNS 配置 {fixed_dns} 个档案，补系统键 {int(key_added)} 项", file=sys.stderr)
 
 
 @asynccontextmanager

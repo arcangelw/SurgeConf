@@ -334,11 +334,13 @@ DEFAULT_GENERAL = {
     "include-all-networks": False,
     "include-local-networks": False,
     "dns-server": "223.5.5.5, 223.6.6.6, 119.29.29.29",
-    "encrypted-dns-server": "https://doh.pub/dns-query, https://dns.alidns.com/dns-query",
+    # DoH3 主力（QUIC 1-RTT）+ 同域 TCP DoH 兜底 + 跨服务商 DoH 冗余，Surge 并发查询先答先用
+    "encrypted-dns-server": "h3://dns.alidns.com/dns-query, https://dns.alidns.com/dns-query, https://doh.pub/dns-query",
     "loglevel": "notify",
     "show-error-page-for-reject": True,
     "always-real-ip": "link-ip.nextdns.io, *.msftconnecttest.com, *.msftncsi.com, *.srv.nintendo.net, *.stun.playstation.net, xbox.*.microsoft.com, *.xboxlive.com, *.logon.battlenet.com.cn, *.logon.battle.net, stun.l.google.com",
-    "hijack-dns": "8.8.8.8:53, 8.8.4.4:53",
+    # 全劫持明文 53 端口：应用硬编码任意 DNS 均由 fake-ip 应答接管，域名不出本机
+    "hijack-dns": "*:53",
     "udp-policy-not-supported-behaviour": "REJECT",
     "proxy-restricted-to-lan": False,
 }

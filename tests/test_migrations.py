@@ -1,4 +1,4 @@
-"""数据迁移 apply_data_migrations 行为测试（幂等补齐内置安全规则 / ipv6-vif 修正 / 系统键）
+"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键）
 
 持久化验证要点：断言一律通过独立新 session（db.bind 新开）查询，
 防止 autoflush 后未 commit 的事务内可见性造成假阳性。
@@ -79,6 +79,51 @@ async def test_ipv6_vif_normalized_to_disabled(db, legacy):
     async with await _fresh_view(db) as fresh:
         g2 = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
     assert g2["ipv6-vif"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_dns_defaults_upgraded_from_legacy(db):
+    """DNS 旧默认值升级：DoH 双端点→DoH3 三端点、hijack-dns→*:53；幂等"""
+    p = (await db.execute(select(ConfigProfile))).scalars().first()
+    p.general = dict(p.general, **{
+        "encrypted-dns-server": "https://doh.pub/dns-query, https://dns.alidns.com/dns-query",
+        "hijack-dns": "8.8.8.8:53, 8.8.4.4:53",
+    })
+    await db.commit()
+
+    await apply_data_migrations(db)
+
+    async with await _fresh_view(db) as fresh:
+        g = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
+    assert g["encrypted-dns-server"] == \
+        "h3://dns.alidns.com/dns-query, https://dns.alidns.com/dns-query, https://doh.pub/dns-query"
+    assert g["hijack-dns"] == "*:53"
+
+    # 幂等：再迁移无变化
+    await apply_data_migrations(db)
+    async with await _fresh_view(db) as fresh:
+        g2 = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
+    assert g2["hijack-dns"] == "*:53"
+
+
+@pytest.mark.asyncio
+async def test_dns_custom_values_not_touched(db):
+    """用户自定义 DNS 值不被迁移覆盖"""
+    custom_dns = "https://1.1.1.1/dns-query"
+    custom_hijack = "1.2.3.4:53"
+    p = (await db.execute(select(ConfigProfile))).scalars().first()
+    p.general = dict(p.general, **{
+        "encrypted-dns-server": custom_dns,
+        "hijack-dns": custom_hijack,
+    })
+    await db.commit()
+
+    await apply_data_migrations(db)
+
+    async with await _fresh_view(db) as fresh:
+        g = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
+    assert g["encrypted-dns-server"] == custom_dns
+    assert g["hijack-dns"] == custom_hijack
 
 
 @pytest.mark.asyncio
