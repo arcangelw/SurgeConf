@@ -19,6 +19,9 @@
 7. **关闭 Surge 内置 Web 面板**：`http-api-web-dashboard` → `false`（常驻内存；SurgeConf 面板不依赖它，官方默认亦为 false。Surge 的 HTTP API 端口不受影响）
 
    验证：preview 产物含 `http-api-web-dashboard = false`。
+8. **抖音优先直连**：补齐 `DouYin` 规则源并放在 `TikTok` 之前。两者都覆盖 `snssdk.com`，优先直连可避免抖音评论、视频和直播误走 TikTok 海外出口。
+
+   验证：`SELECT name,action,sort_order FROM rule_sources WHERE name IN ('DouYin','TikTok') ORDER BY sort_order;` 中 `DouYin / 大陆直连` 位于 `TikTok` 之前。
 
 ## 验证步骤
 
@@ -28,7 +31,7 @@
 grep "数据迁移" logs/surgeconf.log
 ```
 
-- 老库首次启动：应有一条 `[数据迁移] 补齐内置安全规则 N 条，修正存量 ipv6-vif M 个档案，升级 DNS 配置 D 个档案，补系统键 K 项`（N≤6、M≥0、D≥0、K≤1 均正常——老库可能已有部分同文本规则/值已是新默认；出现该行即迁移已执行）
+- 老库首次启动：应有一条 `[数据迁移] 补齐内置安全规则 N 条，修正存量 ipv6-vif M 个档案，升级 DNS 配置 D 个档案，补系统键 K 项，补抖音直连规则源 Y 项`（N≤6、M≥0、D≥0、K≤1、Y≤1 均正常——老库可能已有部分规则/值；出现该行即迁移已执行）
 - 新库或已迁移库：无输出（幂等，无变更不打印）
 
 ### 2. WebRTC / Claude 规则落库

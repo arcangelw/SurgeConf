@@ -92,11 +92,30 @@ async def seed_defaults():
 
 
 async def apply_data_migrations(db) -> None:
-    """幂等数据迁移：内置安全规则补齐 + 存量 ipv6-vif 归一 + DNS 默认值升级。可安全重复执行。"""
-    from sqlalchemy import select
+    """幂等数据迁移：规则源补齐 + 安全规则补齐 + ipv6-vif/DNS 默认值升级。可安全重复执行。"""
+    from sqlalchemy import select, update
     from app.default_config import SECURITY_PRE_RULES
     from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
-    from app.models import CustomRule, ConfigProfile, SystemConfig
+    from app.models import CustomRule, ConfigProfile, SystemConfig, RuleSource
+
+    # 抖音与 TikTok 共用 snssdk.com 等字节系域名。TikTok-Unlock 规则源也包含该后缀，
+    # 若它先匹配会把抖音评论/视频误送海外策略。补一条更靠前的抖音专用直连规则源；
+    # 插入时整体后移后续规则，保持用户现有相对顺序。按名称或规范 URL 判重，迁移幂等。
+    douyin_default = next(rs for rs in DEFAULT_RULE_SOURCES if rs["name"] == "DouYin")
+    existing_sources = (await db.execute(select(RuleSource))).scalars().all()
+    douyin_exists = any(
+        rs.name == douyin_default["name"] or rs.url == douyin_default["url"]
+        for rs in existing_sources
+    )
+    douyin_added = 0
+    if not douyin_exists:
+        await db.execute(
+            update(RuleSource)
+            .where(RuleSource.sort_order >= douyin_default["sort_order"])
+            .values(sort_order=RuleSource.sort_order + 1)
+        )
+        db.add(RuleSource(**douyin_default))
+        douyin_added = 1
 
     # 系统键补齐（no_resolve_keywords：IP 类规则集 no-resolve 关键词，generator 有代码兜底，此处补齐供面板管理）
     existing_keys = {row[0] for row in (await db.execute(select(SystemConfig.key))).all()}
@@ -160,9 +179,10 @@ async def apply_data_migrations(db) -> None:
     # 会因已 flush 而误判"无变更"跳过 commit，session 关闭时事务回滚、变更丢失
     key_added = "no_resolve_keywords" not in existing_keys
     await db.commit()
-    if added or fixed_v6 or fixed_dns or key_added:
+    if added or fixed_v6 or fixed_dns or key_added or douyin_added:
         print(f"[数据迁移] 补齐内置安全规则 {added} 条，修正存量 ipv6-vif {fixed_v6} 个档案，"
-              f"升级 DNS 配置 {fixed_dns} 个档案，补系统键 {int(key_added)} 项", file=sys.stderr)
+              f"升级 DNS 配置 {fixed_dns} 个档案，补系统键 {int(key_added)} 项，"
+              f"补抖音直连规则源 {douyin_added} 项", file=sys.stderr)
 
 
 @asynccontextmanager

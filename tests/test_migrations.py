@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bootstrap import apply_data_migrations
-from app.models import CustomRule, ConfigProfile, SystemConfig
+from app.models import CustomRule, ConfigProfile, SystemConfig, RuleSource
 from app.default_config import SECURITY_PRE_RULES
 
 
@@ -43,6 +43,34 @@ async def test_migration_idempotent(db):
         texts = list((await fresh.execute(select(CustomRule.rule_text))).scalars().all())
     for r in SECURITY_PRE_RULES:
         assert texts.count(r["rule_text"]) == 1, f"{r['rule_text']} 重复插入"
+
+
+@pytest.mark.asyncio
+async def test_douyin_direct_source_backfilled_before_tiktok_and_idempotent(db):
+    """抖音规则源优先直连，避免共享 snssdk.com 被 TikTok 海外策略抢先匹配。"""
+    legacy_tiktok = RuleSource(
+        name="TikTok",
+        url="https://raw.githubusercontent.com/Semporia/TikTok-Unlock/master/Surge/TikTok.list",
+        action="TikTok",
+        rule_type="RULE-SET",
+        category="streaming",
+        sort_order=26,
+        enabled=True,
+    )
+    db.add(legacy_tiktok)
+    await db.commit()
+
+    await apply_data_migrations(db)
+    await apply_data_migrations(db)
+
+    async with await _fresh_view(db) as fresh:
+        sources = (await fresh.execute(select(RuleSource))).scalars().all()
+    douyin = [rs for rs in sources if rs.name == "DouYin"]
+    tiktok = next(rs for rs in sources if rs.name == "TikTok")
+    assert len(douyin) == 1
+    assert douyin[0].action == "大陆直连"
+    assert douyin[0].enabled is True
+    assert douyin[0].sort_order < tiktok.sort_order
 
 
 @pytest.mark.asyncio

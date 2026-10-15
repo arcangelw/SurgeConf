@@ -24,7 +24,7 @@
 ```bash
 cd <SurgeConf 目录>
 git pull && ./surgeconf.sh restart && sleep 3
-./venv/bin/python -m pytest tests/ -q        # 应 109 passed
+./venv/bin/python -m pytest tests/ -q        # 应 110 passed
 ```
 
 然后按 `docs/MIGRATION_VERIFY.md` 全文自检（AI 可执行，全部通过即报告「迁移验证通过」）。
