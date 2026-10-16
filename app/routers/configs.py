@@ -324,14 +324,24 @@ async def _validate_rule_order_or_422(db: AsyncSession) -> None:
         raise HTTPException(422, _invalid_configuration_detail(exc)) from exc
 
 
+class RuleSourceReorderItem(BaseModel):
+    """reorder 条目强类型：id 与 sort_order 均为必填 int，显式 null 直接 422"""
+    id: int
+    sort_order: int
+
+
 @router.put("/rules/reorder")
-async def reorder_rules(data: list[dict], db: AsyncSession = Depends(get_db)):
-    """批量更新规则排序 [{id: 1, sort_order: 0}, ...]"""
+async def reorder_rules(data: list[RuleSourceReorderItem], db: AsyncSession = Depends(get_db)):
+    """批量更新规则排序 [{id: 1, sort_order: 0}, ...]
+
+    既有语义保留：未知 id 静默忽略（按请求数量计数）、重复 id 后写覆盖、
+    遗漏项不动；sort_order 显式 null / 非整数由 Pydantic 422 拒绝。
+    """
     for item in data:
-        result = await db.execute(select(RuleSource).where(RuleSource.id == item["id"]))
+        result = await db.execute(select(RuleSource).where(RuleSource.id == item.id))
         rule = result.scalar_one_or_none()
         if rule:
-            rule.sort_order = item["sort_order"]
+            rule.sort_order = item.sort_order
     # 破坏任一顺序不变量：422 并回滚整个事务（含本次请求未触及的记录）
     try:
         await _validate_rule_order_or_422(db)
@@ -350,6 +360,14 @@ async def update_rule(rule_id: int, data: RuleSourceUpdate, db: AsyncSession = D
         raise HTTPException(404, "规则不存在")
 
     update_data = data.model_dump(exclude_unset=True)
+    # 区分「未提供」与「显式 null」：非空列显式 null 直接 422（category 为
+    # 可选列，显式 null 保留其清空语义）
+    _NON_NULLABLE_FIELDS = {"name", "url", "action", "rule_type",
+                            "sort_order", "enabled", "ip_rules"}
+    explicit_null = sorted(key for key, value in update_data.items()
+                           if value is None and key in _NON_NULLABLE_FIELDS)
+    if explicit_null:
+        raise HTTPException(422, f"字段不允许显式 null: {', '.join(explicit_null)}")
     for key, value in update_data.items():
         setattr(rule, key, value)
     # sort_order / enabled / 身份字段变化都可能破坏顺序不变量：提交前校验

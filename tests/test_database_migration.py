@@ -481,3 +481,117 @@ def test_discard_staging_removes_dangling_symlink(tmp_path):
     os.symlink(tmp_path / "does-not-exist", staging)
     discard_staging(staging)
     assert not os.path.lexists(staging)   # 不保留 dangling symlink
+
+
+# ===== 0004：sort_order 收敛非空 + ip_rules 列 downgrade→upgrade 往返 =====
+
+
+def test_upgrade_0004_normalizes_null_sort_order(tmp_path):
+    """0003 库存量 sort_order NULL → upgrade head：收敛为 0（NULL 本就排最前，
+    语义不变）、既有值保留、列变 NOT NULL（再写 NULL 被 DB 拒绝）"""
+    db_path = tmp_path / "null-sort.db"
+    command.upgrade(database_migration._alembic_config(db_path), "0003_profile_targets")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO rule_sources (name, url, action, rule_type, enabled, sort_order) "
+            "VALUES ('NULL 源', 'https://example.com/null.list', 'DIRECT', 'RULE-SET', 1, NULL)")
+        conn.execute(
+            "INSERT INTO rule_sources (name, url, action, rule_type, enabled, sort_order) "
+            "VALUES ('有值源', 'https://example.com/ok.list', 'DIRECT', 'RULE-SET', 1, 7)")
+    conn.close()
+
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = dict(conn.execute("SELECT name, sort_order FROM rule_sources").fetchall())
+        assert rows == {"NULL 源": 0, "有值源": 7}
+    finally:
+        conn.close()
+    conn = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            with conn:
+                conn.execute("UPDATE rule_sources SET sort_order = NULL WHERE name = '有值源'")
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_rule_source_ip_flags_roundtrip(tmp_path):
+    """upgrade → 业务迁移回填记账 → downgrade → upgrade → 业务迁移：
+    ip_rules 列删除后重建（值归 0），ip_flags 记账随 downgrade 删除使回填
+    可重放；order / retire 迁移记账不随列删除（语义独立）"""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.default_config import DEFAULT_RULE_SOURCES
+    from app.models import RuleSource
+    from app.services.data_migrations import apply_data_migrations
+
+    db_path = tmp_path / "roundtrip.db"
+    cfg = database_migration._alembic_config(db_path)
+    command.upgrade(cfg, "head")
+
+    # 种默认源并强制 ip_rules=0，模拟 0004 刚加列后的存量库
+    sync_engine = sqlalchemy.create_engine(f"sqlite:///{db_path}")
+    Session = sessionmaker(sync_engine)
+    with Session() as s:
+        for rs in DEFAULT_RULE_SOURCES:
+            s.add(RuleSource(**{**rs, "ip_rules": False}))
+        s.commit()
+    sync_engine.dispose()
+
+    async def _run_migrations():
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            return await apply_data_migrations(factory)
+        finally:
+            await engine.dispose()
+
+    # 第一次业务迁移：回填 ip_rules 并记账
+    applied1 = await _run_migrations()
+    assert "rule_source_ip_flags_v1" in applied1
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        flagged = conn.execute(
+            "SELECT name FROM rule_sources WHERE ip_rules = 1").fetchall()
+    finally:
+        conn.close()
+    assert {row[0] for row in flagged} == {
+        rs["name"] for rs in DEFAULT_RULE_SOURCES if rs.get("ip_rules")}
+
+    # downgrade：ip_rules 列删除 + ip_flags 记账删除（order/retire 保留）
+    command.downgrade(cfg, "0003_profile_targets")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(rule_sources)").fetchall()}
+        records = {row[0] for row in conn.execute(
+            "SELECT key FROM data_migration_records").fetchall()}
+    finally:
+        conn.close()
+    assert "ip_rules" not in columns
+    assert "rule_source_ip_flags_v1" not in records
+    assert "rule_source_order_invariants_v1" in records
+    assert "retire_no_resolve_keywords_v1" in records
+
+    # upgrade：列重建（server_default 归 0）→ 第二次业务迁移重新回填
+    command.upgrade(cfg, "head")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        zeroed = conn.execute("SELECT COUNT(*) FROM rule_sources WHERE ip_rules = 1").fetchone()[0]
+    finally:
+        conn.close()
+    assert zeroed == 0
+
+    applied2 = await _run_migrations()
+    assert applied2 == ["rule_source_ip_flags_v1"], "仅被 downgrade 撤销记账的迁移重放"
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        restored = conn.execute(
+            "SELECT COUNT(*) FROM rule_sources WHERE ip_rules = 1").fetchone()[0]
+    finally:
+        conn.close()
+    assert restored == sum(1 for rs in DEFAULT_RULE_SOURCES if rs.get("ip_rules"))

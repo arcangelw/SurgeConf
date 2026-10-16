@@ -842,20 +842,22 @@ async def test_required_rule_order_in_generated_output(full_default_sources, ear
 
 @pytest.mark.asyncio
 async def test_ip_rule_sources_always_use_no_resolve(full_default_sources):
-    """IP 类规则源（结构化 ip_rules 标记）输出必须以 ,no-resolve 结尾且不重复"""
+    """以默认数据的显式 ip_rules 声明为唯一真源：每条默认源的产物行
+    恰好匹配声明（True → 以 ,no-resolve 结尾且不重复；False → 不带）"""
     config = await generate_surge_config(full_default_sources)
-    ip_lines = [l for l in _rule_section_lines(config) if "/ip/" in l or "ASN" in l]
-    assert ip_lines, "默认源应包含 IP 类规则集"
-    assert all(l.endswith(",no-resolve") for l in ip_lines)
-    assert not any(",no-resolve,no-resolve" in l for l in ip_lines)
-    # 非 IP 规则源不加 no-resolve（结构化判定，不按 URL 猜）。
-    # LAN 例外：内置 LAN 源（Lan/Lan.list 私有网段，ip_rules=True）与硬编码
-    # LAN 兜底行都是本地网段 IP 类，合法带 no-resolve，但 URL 不含 /ip//ASN
-    non_ip = [l for l in _rule_section_lines(config) if "/ip/" not in l and "ASN" not in l
-              and l.startswith(("RULE-SET", "DOMAIN-SET"))
-              and "Lan/Lan.list" not in l and not l.startswith("RULE-SET,LAN,")]
-    assert non_ip
-    assert not any(l.endswith(",no-resolve") for l in non_ip)
+    lines = _rule_section_lines(config)
+    flagged = unflagged = 0
+    for rs in DEFAULT_RULE_SOURCES:
+        line = next(l for l in lines if rs["url"] in l)
+        if rs.get("ip_rules"):
+            flagged += 1
+            assert line.endswith(",no-resolve"), rs["name"]
+            assert ",no-resolve,no-resolve" not in line, rs["name"]
+        else:
+            unflagged += 1
+            assert not line.endswith(",no-resolve"), rs["name"]
+    assert flagged, "默认源应包含声明的 IP 类规则集"
+    assert unflagged, "默认源应包含未声明的非 IP 规则集"
 
 
 @pytest.mark.asyncio
@@ -980,3 +982,57 @@ class TestRuleOrderRouteGuard:
         resp = await client.get("/api/configs/generate?profile_id=1")
         assert resp.status_code == 422
         assert any("OpenAI" in e for e in resp.json()["detail"]["errors"])
+
+    @pytest.mark.asyncio
+    async def test_reorder_null_sort_order_rejected_422(self, client):
+        """reorder 强类型条目：sort_order 显式 null / 非整数直接 422（Pydantic）"""
+        ids = await self._rule_ids(client, "GitHub")
+        resp = await client.put("/api/configs/rules/reorder",
+                                json=[{"id": ids["GitHub"], "sort_order": None}])
+        assert resp.status_code == 422
+        resp = await client.put("/api/configs/rules/reorder",
+                                json=[{"id": ids["GitHub"], "sort_order": "abc"}])
+        assert resp.status_code == 422
+        # 未提交：顺序保持默认
+        async with client._test_factory() as db:
+            github = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "GitHub"))).scalar_one()
+        assert github.sort_order == 23
+
+    @pytest.mark.asyncio
+    async def test_update_explicit_null_non_nullable_field_422_no_commit(self, client):
+        """update 区分未提供与显式 null：非空列显式 null 422 且不提交"""
+        ids = await self._rule_ids(client, "GitHub")
+        resp = await client.put(f"/api/configs/rules/{ids['GitHub']}",
+                                json={"sort_order": None})
+        assert resp.status_code == 422
+        assert "sort_order" in resp.json()["detail"]
+        resp = await client.put(f"/api/configs/rules/{ids['GitHub']}",
+                                json={"name": None})
+        assert resp.status_code == 422
+        async with client._test_factory() as db:
+            github = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "GitHub"))).scalar_one()
+        assert github.sort_order == 23 and github.name == "GitHub"
+
+    @pytest.mark.asyncio
+    async def test_update_category_null_keeps_optional_semantics(self, client):
+        """category 为可选列：显式 null 保留清空语义，正常提交"""
+        ids = await self._rule_ids(client, "GitHub")
+        resp = await client.put(f"/api/configs/rules/{ids['GitHub']}",
+                                json={"category": None})
+        assert resp.status_code == 200
+        async with client._test_factory() as db:
+            github = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "GitHub"))).scalar_one()
+        assert github.category is None
+
+
+def test_none_sort_order_fails_closed_as_invalid_configuration():
+    """绕过 DB 约束构造的 None sort_order：fail closed 为 InvalidConfiguration，
+    绝不让 (sort_order, id) 排序比较退化成 TypeError（生成路由 422 而非 500）"""
+    bad = _builtin_stub("AI 综合", 0, 1)
+    bad.sort_order = None
+    with pytest.raises(InvalidConfiguration) as ei:
+        validate_rule_order([bad, _builtin_stub("AppStore", 5, 2)])
+    assert any("sort_order" in e for e in ei.value.errors)

@@ -282,8 +282,13 @@ def rule_source_category_positions(ordered) -> dict[str, list[tuple[int, object]
     """按 (sort_order, id) 稳定序为每个不变量类别登记 (位置, 记录)。
 
     只登记与内置稳定身份完全匹配的记录；身份字段被改过或用户自定义的
-    源一律不参与。纯函数、不抛错（迁移据此定位需重置的违例记录）。
+    源一律不参与。sort_order 为 None（绕过 DB 约束构造的对象）时
+    fail closed 抛 InvalidConfiguration，绝不让排序比较退化成 TypeError。
     """
+    for rs in ordered:
+        if rs.sort_order is None:
+            raise InvalidConfiguration(
+                [f"规则源「{rs.name}」缺少 sort_order（NULL），无法确定稳定顺序，拒绝生成"])
     sequence = sorted(ordered, key=lambda rs: (rs.sort_order, rs.id))
     positions: dict[str, list[tuple[int, object]]] = {}
     for index, rs in enumerate(sequence):

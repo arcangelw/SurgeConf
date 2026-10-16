@@ -417,6 +417,22 @@ class TestBuildRules:
         assert not line.endswith(",no-resolve")
         assert "no-resolve" not in line
 
+    def test_synthetic_mixed_ruleset_flag_drives_no_resolve(self):
+        """合成 mixed 源（URL 无任何 IP 特征）：判定完全由 ip_rules 声明驱动，
+        与 URL 命名无关（默认源真实远端内容的审计结果固化在声明里，测试不触网）"""
+        mixed = RuleSource(name="混合列表", url="https://example.com/my-mixed.list",
+                           action="DIRECT", rule_type="RULE-SET", category="intl_service",
+                           sort_order=0, enabled=True, ip_rules=True)
+        same_url_unflagged = RuleSource(name="同库未声明", url="https://example.com/other.list",
+                                        action="DIRECT", rule_type="RULE-SET",
+                                        category="intl_service",
+                                        sort_order=1, enabled=True, ip_rules=False)
+        lines = self._rules(sources=[mixed, same_url_unflagged])
+        flagged = next(l for l in lines if "my-mixed.list" in l)
+        unflagged = next(l for l in lines if "other.list" in l)
+        assert flagged.endswith(",no-resolve")
+        assert not unflagged.endswith(",no-resolve")
+
     def test_rule_action_not_translated_zh(self):
         rs = RuleSource(name="Test", url="https://example.com", action="AI服务",
                         rule_type="RULE-SET", category="ai", sort_order=0, enabled=True)

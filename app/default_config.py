@@ -157,6 +157,10 @@ DEFAULT_SERVICE_GROUPS = [
 ]
 
 # 规则源 - action 使用中文分组名（与上方保持一致）
+# ip_rules 声明依据：对各 URL 真实远端内容的逐项审计（IP-CIDR/IP-CIDR6/
+# IP-ASN/GEOIP 行计数，见 task-5-report 审计表）；含 IP 行的混合/纯 IP
+# 列表必须标记，生成时追加 no-resolve 防 DNS 泄漏。skk.moe /List/ip/
+# 目录按路径结构 + 同目录实测样本判定。
 DEFAULT_RULE_SOURCES = [
     # 规则修正
     {"name": "Unbreak", "url": "https://raw.githubusercontent.com/zxfccmm4/Profiles/refs/heads/main/Surge/Ruleset/Unbreak.list",
@@ -167,18 +171,18 @@ DEFAULT_RULE_SOURCES = [
     {"name": "Reject-Drop (non_ip)", "url": "https://ruleset.skk.moe/List/non_ip/reject-drop.conf",
      "action": "REJECT-DROP", "rule_type": "RULE-SET", "category": "adblock", "sort_order": 2},
     {"name": "Reject (non_ip)", "url": "https://ruleset.skk.moe/List/non_ip/reject.conf",
-     "action": "REJECT", "rule_type": "RULE-SET", "category": "adblock", "sort_order": 3},
+     "action": "REJECT", "rule_type": "RULE-SET", "category": "adblock", "ip_rules": True, "sort_order": 3},
     {"name": "Reject (ip)", "url": "https://ruleset.skk.moe/List/ip/reject.conf",
      "action": "REJECT-DROP", "rule_type": "RULE-SET", "category": "adblock", "ip_rules": True, "sort_order": 4},
     # 国内应用
     {"name": "WeChat", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/WeChat/WeChat.list",
-     "action": "微信", "rule_type": "RULE-SET", "category": "mainland_app", "sort_order": 5},
+     "action": "微信", "rule_type": "RULE-SET", "category": "mainland_app", "ip_rules": True, "sort_order": 5},
     {"name": "NetEaseMusic (non_ip)", "url": "https://ruleset.skk.moe/List/non_ip/neteasemusic.conf",
      "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland_app", "sort_order": 6},
     {"name": "NetEaseMusic (ip)", "url": "https://ruleset.skk.moe/List/ip/neteasemusic.conf",
      "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland_app", "ip_rules": True, "sort_order": 7},
     {"name": "Bilibili", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/BiliBili/BiliBili.list",
-     "action": "哔哩哔哩", "rule_type": "RULE-SET", "category": "mainland_app", "sort_order": 8},
+     "action": "哔哩哔哩", "rule_type": "RULE-SET", "category": "mainland_app", "ip_rules": True, "sort_order": 8},
     {"name": "Weibo", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Weibo/Weibo.list",
      "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland_app", "sort_order": 9},
     {"name": "XiaoHongShu", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/XiaoHongShu/XiaoHongShu.list",
@@ -188,7 +192,7 @@ DEFAULT_RULE_SOURCES = [
      "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland_app", "sort_order": 11},
     # AI（前置：域名与 Apple/Google/Global 规则重叠，AI 须先行匹配——顺序不变量强制）
     {"name": "OpenAI", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/OpenAI/OpenAI.list",
-     "action": "AI服务", "rule_type": "RULE-SET", "category": "ai", "sort_order": 12},
+     "action": "AI服务", "rule_type": "RULE-SET", "category": "ai", "ip_rules": True, "sort_order": 12},
     {"name": "Claude", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Claude/Claude.list",
      "action": "AI服务", "rule_type": "RULE-SET", "category": "ai", "sort_order": 13},
     {"name": "Gemini", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Gemini/Gemini.list",
@@ -198,7 +202,7 @@ DEFAULT_RULE_SOURCES = [
     {"name": "AI 综合", "url": "https://ruleset.skk.moe/List/non_ip/ai.conf",
      "action": "AI服务", "rule_type": "RULE-SET", "category": "ai", "sort_order": 16},
     {"name": "AI 兜底", "url": "https://raw.githubusercontent.com/EAlyce/conf/refs/heads/main/Rule/OpenAI.list",
-     "action": "AI服务", "rule_type": "RULE-SET", "category": "ai", "sort_order": 17},
+     "action": "AI服务", "rule_type": "RULE-SET", "category": "ai", "ip_rules": True, "sort_order": 17},
     # Apple（后移：顺序不变量要求 AI 规则先行匹配）
     {"name": "AppStore", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/AppStore/AppStore.list",
      "action": "DIRECT", "rule_type": "RULE-SET", "category": "apple", "sort_order": 18},
@@ -209,22 +213,22 @@ DEFAULT_RULE_SOURCES = [
     {"name": "AppleTV", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/AppleTV/AppleTV.list",
      "action": "苹果服务", "rule_type": "RULE-SET", "category": "apple", "sort_order": 21},
     {"name": "Apple", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Apple/Apple.list",
-     "action": "苹果服务", "rule_type": "RULE-SET", "category": "apple", "sort_order": 22},
+     "action": "苹果服务", "rule_type": "RULE-SET", "category": "apple", "ip_rules": True, "sort_order": 22},
     # 开发工具（提前，确保 GitHub 等走代理）
     {"name": "GitHub", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/GitHub/GitHub.list",
      "action": "GitHub", "rule_type": "RULE-SET", "category": "dev", "sort_order": 23},
     # Google
     {"name": "Google", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Google/Google.list",
-     "action": "Google服务", "rule_type": "RULE-SET", "category": "google", "sort_order": 24},
+     "action": "Google服务", "rule_type": "RULE-SET", "category": "google", "ip_rules": True, "sort_order": 24},
     # 流媒体
     {"name": "Disney+", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Disney/Disney.list",
      "action": "Disney+", "rule_type": "RULE-SET", "category": "streaming", "sort_order": 25},
     {"name": "Netflix", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Netflix/Netflix.list",
-     "action": "Netflix", "rule_type": "RULE-SET", "category": "streaming", "sort_order": 26},
+     "action": "Netflix", "rule_type": "RULE-SET", "category": "streaming", "ip_rules": True, "sort_order": 26},
     {"name": "TikTok", "url": "https://raw.githubusercontent.com/Semporia/TikTok-Unlock/master/Surge/TikTok.list",
      "action": "TikTok", "rule_type": "RULE-SET", "category": "streaming", "sort_order": 27},
     {"name": "YouTube", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/YouTube/YouTube.list",
-     "action": "YouTube", "rule_type": "RULE-SET", "category": "streaming", "sort_order": 28},
+     "action": "YouTube", "rule_type": "RULE-SET", "category": "streaming", "ip_rules": True, "sort_order": 28},
     {"name": "Emby", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Emby/Emby.list",
      "action": "Global", "rule_type": "RULE-SET", "category": "streaming", "sort_order": 29},
     # 地区流媒体
@@ -257,7 +261,7 @@ DEFAULT_RULE_SOURCES = [
      "action": "台湾", "rule_type": "RULE-SET", "category": "region_stream", "ip_rules": True, "sort_order": 41},
     # 社交媒体
     {"name": "Twitter", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Twitter/Twitter.list",
-     "action": "X", "rule_type": "RULE-SET", "category": "social", "sort_order": 42},
+     "action": "X", "rule_type": "RULE-SET", "category": "social", "ip_rules": True, "sort_order": 42},
     {"name": "Telegram (non_ip)", "url": "https://ruleset.skk.moe/List/non_ip/telegram.conf",
      "action": "Telegram", "rule_type": "RULE-SET", "category": "social", "sort_order": 43},
     {"name": "Telegram (ip)", "url": "https://ruleset.skk.moe/List/ip/telegram.conf",
@@ -265,7 +269,7 @@ DEFAULT_RULE_SOURCES = [
     {"name": "Telegram ASN", "url": "https://ruleset.skk.moe/List/ip/telegram_asn.conf",
      "action": "Telegram", "rule_type": "RULE-SET", "category": "social", "ip_rules": True, "sort_order": 45},
     {"name": "Facebook", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Facebook/Facebook.list",
-     "action": "Global", "rule_type": "RULE-SET", "category": "social", "sort_order": 46},
+     "action": "Global", "rule_type": "RULE-SET", "category": "social", "ip_rules": True, "sort_order": 46},
     {"name": "Instagram", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Instagram/Instagram.list",
      "action": "Global", "rule_type": "RULE-SET", "category": "social", "sort_order": 47},
     {"name": "Threads", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Threads/Threads.list",
@@ -289,7 +293,7 @@ DEFAULT_RULE_SOURCES = [
     {"name": "Domestic (ip)", "url": "https://ruleset.skk.moe/List/ip/domestic.conf",
      "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland", "ip_rules": True, "sort_order": 56},
     {"name": "ChinaMax", "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/ChinaMax/ChinaMax.list",
-     "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland", "sort_order": 57},
+     "action": "大陆直连", "rule_type": "RULE-SET", "category": "mainland", "ip_rules": True, "sort_order": 57},
     {"name": "ASN China", "url": "https://raw.githubusercontent.com/VirgilClyne/GetSomeFries/main/ruleset/ASN.China.list",
      "action": "DIRECT", "rule_type": "RULE-SET", "category": "mainland", "ip_rules": True, "sort_order": 58},
     {"name": "Download (domainset)", "url": "https://ruleset.skk.moe/List/domainset/download.conf",
