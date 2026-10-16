@@ -430,3 +430,29 @@ async def test_general_endpoints_explicit_missing_profile_404(client):
     """General 字段/值读取：显式 id 不存在 404（与生成入口一致）"""
     assert (await client.get("/api/general/fields?profile_id=99999")).status_code == 404
     assert (await client.get("/api/general/values?profile_id=99999")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_export_resolves_profile_exactly_once(client, runtime_paths, monkeypatch):
+    """导出由生成入口唯一解析档案：不存在前置 _require_profile 预查（行为验证）"""
+    import app.routers.configs as configs_router
+
+    async def _no_prefetch(db, profile_id):
+        raise AssertionError("导出不应再做前置档案预查（唯一解析在生成入口内）")
+
+    monkeypatch.setattr(configs_router, "_require_profile", _no_prefetch)
+    resp = await client.post("/api/configs/1/exports", json={"confirm": True})
+    assert resp.status_code == 200, resp.text
+    assert (runtime_paths.exports / resp.json()["name"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_generate_unexpected_error_is_not_swallowed(client, monkeypatch):
+    """_render_profile_config 只映射两类档案领域错误：其他生成异常原样传播"""
+
+    async def _boom(db, profile_id=None, locale_override=None):
+        raise ValueError("generator exploded")
+
+    monkeypatch.setattr("app.routers.configs.generate_surge_config", _boom)
+    with pytest.raises(ValueError):
+        await client.get("/api/configs/generate?profile_id=1")

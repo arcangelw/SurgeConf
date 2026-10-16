@@ -404,8 +404,7 @@ async def export_config(profile_id: int, data: ExportRequest,
             status_code=400,
             detail='缺少确认参数：请求体需包含 {"confirm": true}',
         )
-    await _require_profile(db, profile_id)
-    content = await generate_surge_config(db, profile_id, None)
+    content = await _render_profile_config(db, profile_id, None)
     paths = resolve_runtime_paths()
     refresh_runtime_permissions(paths)
     target = unique_path(paths.exports, _export_filename(data.filename, profile_id), ".conf")
@@ -437,7 +436,12 @@ async def subscribe_config(
     profile = result.scalar_one_or_none()
     if profile is None or not verify_profile_token(token, profile.subscription_token_hash):
         raise HTTPException(404, "Not Found")
-    content = await generate_surge_config(db, profile_id, locale)
+    try:
+        content = await generate_surge_config(db, profile_id, locale)
+    except (ProfileNotFound, DefaultProfileMissing):
+        # token 验证通过后、生成阶段档案恰好被删（确定性竞态）：
+        # 与一切 token 失败同口径 404，不泄露档案存在性差异
+        raise HTTPException(404, "Not Found")
     # Surge 订阅需要设置合适的 Content-Type 和更新间隔提示
     return PlainTextResponse(
         content,

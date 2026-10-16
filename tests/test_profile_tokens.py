@@ -251,3 +251,25 @@ async def test_node_lists_never_expose_server_or_config(admin_client):
         dumped = json.dumps((await admin_client.get(url)).json())
         assert "1.2.3.4" not in dumped, url
         assert "topsecret" not in dumped, url
+
+
+@pytest.mark.asyncio
+async def test_subscribe_generation_race_matches_invalid_token_404(
+        admin_client, anonymous_client, monkeypatch):
+    """确定性竞态：token 验证通过后、生成阶段档案恰好被删（ProfileNotFound），
+    响应与无效 token 的 404 完全一致（状态码 + detail），不泄露档案存在性差异"""
+    from app.services.profile_resolution import ProfileNotFound
+
+    token = (await admin_client.post("/api/configs/profiles/1/token")).json()["token"]
+    baseline = await anonymous_client.get(
+        f"/api/configs/profiles/1/subscribe?token={'A' * 43}")
+    assert baseline.status_code == 404
+
+    async def _racing_generate(db, profile_id=None, locale_override=None):
+        # 模拟验证后档案被并发删除：唯一解析入口抛领域错误
+        raise ProfileNotFound(profile_id if profile_id is not None else 1)
+
+    monkeypatch.setattr("app.routers.configs.generate_surge_config", _racing_generate)
+    raced = await anonymous_client.get(f"/api/configs/profiles/1/subscribe?token={token}")
+    assert raced.status_code == 404
+    assert raced.json() == baseline.json()
