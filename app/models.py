@@ -138,6 +138,8 @@ class RuleSource(Base):
     category = Column(String(100), nullable=True, comment="分类")
     enabled = Column(Boolean, default=True)
     sort_order = Column(Integer, default=0)
+    ip_rules = Column(Boolean, default=False, server_default="0",
+                      comment="内容为 IP/CIDR/ASN 规则集：生成时追加 no-resolve（结构化判定，不按 URL 猜）")
     created_at = Column(DateTime, server_default=func.now())
 
 

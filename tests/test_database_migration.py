@@ -19,6 +19,8 @@ DATA_MIGRATION_KEYS = {
     "security_rules_v1", "douyin_rule_v1", "ipv6_vif_v1",
     "dns_defaults_v1", "remove_global_quic_v1", "no_resolve_keywords_v1",
     "dangling_rule_source_actions_v1",
+    "rule_source_ip_flags_v1", "rule_source_order_invariants_v1",
+    "retire_no_resolve_keywords_v1",
 }
 
 
@@ -216,7 +218,7 @@ def test_alembic_head_check_constraints_match_metadata(tmp_path):
     from app.models import ConfigProfile
 
     head = database_migration._head_revision()
-    registered = database_migration.SCHEMA_REVISION_CHECKS[head]["config_profiles"]
+    registered = database_migration._accumulated_required_checks(head)["config_profiles"]
     metadata_checks = {
         c.name: database_migration._normalize_check_expression(c.sqltext.text)
         for c in ConfigProfile.__table__.constraints

@@ -1,16 +1,16 @@
-"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键 / 悬空规则源引用修复）
+"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键 / 悬空规则源引用修复 / 顺序不变量重排 / IP 标记回填）
 
 持久化验证要点：断言一律通过独立新 session（db.bind 新开）查询，
 防止 autoflush 后未 commit 的事务内可见性造成假阳性。
 """
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.services.data_migrations import apply_data_migrations
 from app.models import CustomRule, ConfigProfile, ProxyNode, SystemConfig, RuleSource
-from app.default_config import SECURITY_PRE_RULES
+from app.default_config import DEFAULT_RULE_SOURCES, SECURITY_PRE_RULES
 
 
 async def _fresh_view(db) -> AsyncSession:
@@ -201,24 +201,21 @@ async def test_custom_block_quic_value_not_touched(db):
 
 
 @pytest.mark.asyncio
-async def test_no_resolve_keywords_backfilled_and_persisted(db):
-    """缺 no_resolve_keywords 系统键时补默认值并持久化；已有自定义值不覆盖"""
+async def test_no_resolve_keywords_retired_after_structured_ip_flags(db):
+    """no-resolve 判定结构化（rule_sources.ip_rules）后关键词系统键退役：
+    历史补键迁移仍执行，但随后被 retire 迁移清理；记账后用户重写不复活清理"""
     keys = (await db.execute(select(SystemConfig.key))).scalars().all()
     assert "no_resolve_keywords" not in keys, "前置条件：老库无该键"
 
     await apply_data_migrations(_factory(db))
 
-    # 跨 session 验证持久化（回归：autoflush 后跳过 commit 导致回滚丢失）
     async with await _fresh_view(db) as fresh:
-        row = (await fresh.execute(
-            select(SystemConfig).where(SystemConfig.key == "no_resolve_keywords"))).scalar_one()
-        assert row.value == "(ip),ASN,/ip/,Lan"
+        remaining = {row[0] for row in (await fresh.execute(select(SystemConfig.key))).all()}
+    assert "no_resolve_keywords" not in remaining, "关键词键应随结构化迁移退役"
 
-    # 用户自定义值不被覆盖
+    # 记账后用户手动写入：迁移不再执行，键保留（尊重用户现状）
     async with await _fresh_view(db) as fresh:
-        obj = (await fresh.execute(
-            select(SystemConfig).where(SystemConfig.key == "no_resolve_keywords"))).scalar_one()
-        obj.value = "custom"
+        fresh.add(SystemConfig(key="no_resolve_keywords", value="custom"))
         await fresh.commit()
 
     await apply_data_migrations(_factory(db))
@@ -482,3 +479,119 @@ async def test_no_change_run_leaves_no_pending(db):
     await apply_data_migrations(_factory(db))  # 先补齐
     await apply_data_migrations(_factory(db))  # 再跑一次：无变更路径
     # 不抛异常即通过；数据完整性由其他测试的跨 session 断言保证
+
+
+# ===== 顺序不变量迁移：AI/Apple 块重排 + 内置 IP 源结构化标记回填 =====
+
+
+async def _seed_default_sources(db) -> dict[str, int]:
+    """补齐 conftest 未种的默认规则源，返回 (name → sort_order) 当前快照"""
+    existing = {rs.name for rs in (await db.execute(select(RuleSource))).scalars().all()}
+    for rs in DEFAULT_RULE_SOURCES:
+        if rs["name"] not in existing:
+            db.add(RuleSource(**rs))
+    await db.commit()
+    return {rs.name: rs.sort_order for rs in (await db.execute(select(RuleSource))).scalars().all()}
+
+
+_NEW_DEFAULT_ORDER = {rs["name"]: rs["sort_order"] for rs in DEFAULT_RULE_SOURCES}
+_LEGACY_AI_BLOCK = {"OpenAI": 18, "Claude": 19, "Gemini": 20, "Bing": 21,
+                    "AI 综合": 22, "AI 兜底": 23}
+_LEGACY_APPLE_BLOCK = {"AppStore": 12, "AppleNews": 13, "Apple CDN": 14,
+                       "AppleTV": 15, "Apple": 16}
+
+
+@pytest.mark.asyncio
+async def test_rule_order_migration_resets_legacy_ai_after_apple_and_idempotent(db):
+    """老库顺序（AI 18-23 在 Apple 12-16 之后）：只重置违例类别块到新默认；
+    GitHub（非不变量类别）与自定义源保持原值；幂等"""
+    await _seed_default_sources(db)
+    legacy_map = {**_LEGACY_AI_BLOCK, **_LEGACY_APPLE_BLOCK, "GitHub": 17}
+    for name, sort_order in legacy_map.items():
+        await db.execute(update(RuleSource).where(RuleSource.name == name)
+                         .values(sort_order=sort_order))
+    db.add(RuleSource(name="自定义兜底", url="https://example.com/my-global.list",
+                      action="Global", rule_type="RULE-SET", category="global",
+                      sort_order=30, enabled=True))
+    db.add(RuleSource(name="我的综合 AI", url="https://ruleset.skk.moe/List/non_ip/ai.conf",
+                      action="AI服务", rule_type="RULE-SET", category="ai",
+                      sort_order=90, enabled=True))  # 身份字段被改：保守不动
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))  # 幂等
+
+    async with await _fresh_view(db) as fresh:
+        sources = {rs.name: rs for rs in (await fresh.execute(select(RuleSource))).scalars().all()}
+    # AI/Apple 重置为新默认（AI 12-17、Apple 18-22）
+    for name in _LEGACY_AI_BLOCK | _LEGACY_APPLE_BLOCK:
+        assert sources[name].sort_order == _NEW_DEFAULT_ORDER[name], name
+    # GitHub 不属于任何不变量类别：保持老库值
+    assert sources["GitHub"].sort_order == 17
+    # 自定义源与身份被改的记录：值与相对顺序不动
+    assert sources["自定义兜底"].sort_order == 30
+    assert sources["我的综合 AI"].sort_order == 90
+
+
+@pytest.mark.asyncio
+async def test_rule_order_migration_no_violation_touches_nothing(db):
+    """无违例（新默认序）时迁移零变更：用户自定义排列（非不变量类别）保留"""
+    before = await _seed_default_sources(db)
+    await db.execute(update(RuleSource).where(RuleSource.name == "GitHub")
+                     .values(sort_order=60))  # GitHub 移到国内规则区，无不变量约束
+    before["GitHub"] = 60
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        after = {rs.name: rs.sort_order for rs in (await fresh.execute(select(RuleSource))).scalars().all()}
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_rule_order_migration_ignores_custom_and_disabled(db):
+    """自定义源（借用内置 category）与 disabled 内置源不触发重排"""
+    await _seed_default_sources(db)
+    db.add(RuleSource(name="自家兜底", url="https://example.com/own-global.list",
+                      action="Global", rule_type="RULE-SET", category="global",
+                      sort_order=3, enabled=True))  # 在国内直连之前：若被误判则违例
+    await db.execute(update(RuleSource).where(RuleSource.name == "AI 综合")
+                     .values(sort_order=100, enabled=False))  # disabled：不参与生成序
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        sources = {rs.name: rs for rs in (await fresh.execute(select(RuleSource))).scalars().all()}
+    assert sources["自家兜底"].sort_order == 3
+    assert sources["AI 综合"].sort_order == 100  # disabled 记录不动
+    # 无违例即零变更：其余内置源全部保持新默认（AI 综合被本测试改为 disabled+100，跳过）
+    for name, expected in _NEW_DEFAULT_ORDER.items():
+        if name == "AI 综合":
+            continue
+        assert sources[name].sort_order == expected, name
+
+
+@pytest.mark.asyncio
+async def test_ip_flags_backfill_builtin_only_and_idempotent(db):
+    """老库 ip_rules 全 0：迁移回填内置 IP 源为 True；非 IP 与自定义源不动；幂等"""
+    await _seed_default_sources(db)
+    await db.execute(update(RuleSource).values(ip_rules=False))  # 模拟 0004 加列后的存量行
+    db.add(RuleSource(name="自家 IP 集", url="https://example.com/own-ip.list",
+                      action="DIRECT", rule_type="RULE-SET", category="mainland",
+                      sort_order=70, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))
+
+    declared = {rs["name"]: bool(rs.get("ip_rules", False)) for rs in DEFAULT_RULE_SOURCES}
+    async with await _fresh_view(db) as fresh:
+        sources = {rs.name: rs for rs in (await fresh.execute(select(RuleSource))).scalars().all()}
+    for name, flagged in declared.items():
+        assert bool(sources[name].ip_rules) is flagged, name
+    assert sources["Domestic (ip)"].ip_rules is True
+    assert sources["ASN China"].ip_rules is True
+    assert sources["Domestic (non_ip)"].ip_rules is False
+    assert sources["自家 IP 集"].ip_rules is False  # 自定义源不按 URL 猜

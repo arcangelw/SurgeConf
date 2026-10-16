@@ -25,7 +25,7 @@ from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
                                resolve_runtime_paths)
 from app.security import issue_profile_token, verify_profile_token
 from app.services.backups import unique_path
-from app.services.config_validation import InvalidConfiguration
+from app.services.config_validation import InvalidConfiguration, validate_rule_order
 from app.services.generator import generate_surge_config
 from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
 
@@ -71,6 +71,7 @@ class RuleSourceCreate(BaseModel):
     name: str
     url: str
     action: str
+    ip_rules: bool = False
     rule_type: str = "RULE-SET"
     category: Optional[str] = None
     sort_order: int = 0
@@ -81,6 +82,7 @@ class RuleSourceUpdate(BaseModel):
     name: Optional[str] = None
     url: Optional[str] = None
     action: Optional[str] = None
+    ip_rules: Optional[bool] = None
     rule_type: Optional[str] = None
     category: Optional[str] = None
     sort_order: Optional[int] = None
@@ -280,6 +282,7 @@ async def list_rules(db: AsyncSession = Depends(get_db)):
             "action": r.action,
             "rule_type": r.rule_type,
             "category": r.category,
+            "ip_rules": bool(r.ip_rules),
             "sort_order": r.sort_order,
             "enabled": r.enabled,
         }
@@ -300,6 +303,7 @@ async def create_rule(data: RuleSourceCreate, db: AsyncSession = Depends(get_db)
         action=data.action,
         rule_type=data.rule_type,
         category=data.category,
+        ip_rules=data.ip_rules,
         sort_order=data.sort_order,
         enabled=data.enabled,
     )
@@ -307,6 +311,17 @@ async def create_rule(data: RuleSourceCreate, db: AsyncSession = Depends(get_db)
     await db.commit()
     await db.refresh(rule)
     return {"id": rule.id, "name": rule.name}
+
+
+async def _validate_rule_order_or_422(db: AsyncSession) -> None:
+    """提交前按数据库当前完整 enabled 候选序（含请求未触及项）校验顺序不变量；
+    违例时抛 422（调用方负责 rollback 整个事务）。"""
+    candidates = (await db.execute(
+        select(RuleSource).where(RuleSource.enabled == True))).scalars().all()
+    try:
+        validate_rule_order(candidates)
+    except InvalidConfiguration as exc:
+        raise HTTPException(422, _invalid_configuration_detail(exc)) from exc
 
 
 @router.put("/rules/reorder")
@@ -317,6 +332,12 @@ async def reorder_rules(data: list[dict], db: AsyncSession = Depends(get_db)):
         rule = result.scalar_one_or_none()
         if rule:
             rule.sort_order = item["sort_order"]
+    # 破坏任一顺序不变量：422 并回滚整个事务（含本次请求未触及的记录）
+    try:
+        await _validate_rule_order_or_422(db)
+    except HTTPException:
+        await db.rollback()
+        raise
     await db.commit()
     return {"reordered": len(data)}
 
@@ -331,6 +352,12 @@ async def update_rule(rule_id: int, data: RuleSourceUpdate, db: AsyncSession = D
     update_data = data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(rule, key, value)
+    # sort_order / enabled / 身份字段变化都可能破坏顺序不变量：提交前校验
+    try:
+        await _validate_rule_order_or_422(db)
+    except HTTPException:
+        await db.rollback()
+        raise
     await db.commit()
     return {"id": rule.id, "name": rule.name}
 

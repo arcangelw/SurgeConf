@@ -686,3 +686,297 @@ class TestRouteMapping:
         resp = await client.get(f"/api/configs/profiles/1/subscribe?token={token}")
         assert resp.status_code == 422
         assert any("幽灵组" in e for e in resp.json()["detail"]["errors"])
+
+# ════════════════════════════════════════════
+# 五、规则顺序不变量（稳定身份 + validate_rule_order）
+# ════════════════════════════════════════════
+
+
+from types import SimpleNamespace
+
+from app.default_config import DEFAULT_RULE_SOURCES
+from app.services.config_validation import rule_order_violations, validate_rule_order
+
+
+def _builtin_stub(name: str, sort_order: int, source_id: int, **override):
+    """按内置默认身份构造校验候选（真实 name/url/rule_type，不臆造）"""
+    default = next(rs for rs in DEFAULT_RULE_SOURCES if rs["name"] == name)
+    fields = {**default, "sort_order": sort_order, "id": source_id,
+              "enabled": True, **override}
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(("earlier", "later", "earlier_label", "later_label"), [
+    ("AI 综合", "AppStore", "AI", "Apple"),
+    ("AI 综合", "Google", "AI", "Google"),
+    ("AI 兜底", "Global", "AI", "Global"),
+    ("DouYin", "TikTok", "抖音", "TikTok"),
+    ("Domestic (ip)", "Global", "国内直连", "Global"),
+])
+def test_each_invariant_pair_violation_detected(earlier, later, earlier_label, later_label):
+    """同一不变量两侧均在且顺序颠倒时必须报错，错误含双方源名"""
+    ordered = [
+        _builtin_stub(later, sort_order=1, source_id=1),
+        _builtin_stub(earlier, sort_order=2, source_id=2),
+    ]
+    with pytest.raises(InvalidConfiguration) as ei:
+        validate_rule_order(ordered)
+    message = "\n".join(ei.value.errors)
+    assert earlier in message and later in message
+
+
+@pytest.mark.parametrize(("earlier", "later"), [
+    ("AI 综合", "AppStore"),
+    ("AI 综合", "Google"),
+    ("AI 兜底", "Global"),
+    ("DouYin", "TikTok"),
+    ("Domestic (ip)", "Global"),
+])
+def test_compliant_order_passes(earlier, later):
+    ordered = [
+        _builtin_stub(earlier, sort_order=1, source_id=1),
+        _builtin_stub(later, sort_order=2, source_id=2),
+    ]
+    assert rule_order_violations(ordered) == []
+
+
+@pytest.mark.parametrize(("earlier", "later"), [
+    ("AI 综合", "AppStore"),
+    ("AI 综合", "Google"),
+    ("AI 兜底", "Global"),
+    ("DouYin", "TikTok"),
+    ("Domestic (ip)", "Global"),
+])
+def test_missing_either_side_not_reported(earlier, later):
+    """可选源缺失（一侧不存在）不得误报"""
+    assert rule_order_violations([_builtin_stub(earlier, 5, 1)]) == []
+    assert rule_order_violations([_builtin_stub(later, 5, 1)]) == []
+
+
+def test_custom_source_with_builtin_category_not_checked():
+    """用户自定义源即使借用内置 category（url 不同）也不参与不变量"""
+    custom_ai = _builtin_stub("AI 综合", 10, 1,
+                              url="https://example.com/my-own-ai.list")
+    builtin_apple = _builtin_stub("AppStore", 1, 2)
+    assert rule_order_violations([builtin_apple, custom_ai]) == []
+
+
+def test_identity_tampered_builtin_not_checked():
+    """内置记录被用户改名后不再视为内置：不参与不变量（保守不动，运行时另由显式报错路径覆盖）"""
+    renamed = _builtin_stub("AI 综合", 10, 1)
+    renamed.name = "我的综合 AI"  # 身份字段被改：三元组不再匹配内置
+    builtin_apple = _builtin_stub("AppStore", 1, 2)
+    assert rule_order_violations([builtin_apple, renamed]) == []
+
+
+class TestSortOrderTieBreak:
+    def test_same_sort_order_ai_with_smaller_id_first_passes(self):
+        """同 sort_order 时按 id 升序 tie-break：AI(id=1) 先于 Apple(id=2) 合规"""
+        ordered = [
+            _builtin_stub("AI 综合", 50, 1),
+            _builtin_stub("AppStore", 50, 2),
+        ]
+        assert rule_order_violations(ordered) == []
+
+    def test_same_sort_order_ai_with_larger_id_later_violates(self):
+        """同 sort_order：Apple(id=1) 先于 AI(id=2) 违例"""
+        ordered = [
+            _builtin_stub("AppStore", 50, 1),
+            _builtin_stub("AI 综合", 50, 2),
+        ]
+        errors = rule_order_violations(ordered)
+        assert len(errors) == 1
+        assert "AI 综合" in errors[0] and "AppStore" in errors[0]
+
+
+def test_multiple_invariant_violations_aggregated():
+    """AI/Apple 与 DouYin/TikTok 同时违例：一次抛出全部错误"""
+    ordered = [
+        _builtin_stub("AppStore", 1, 1),
+        _builtin_stub("TikTok", 2, 2),
+        _builtin_stub("AI 综合", 3, 3),
+        _builtin_stub("DouYin", 4, 4),
+    ]
+    with pytest.raises(InvalidConfiguration) as ei:
+        validate_rule_order(ordered)
+    assert len(ei.value.errors) == 2
+    joined = "\n".join(ei.value.errors)
+    assert "AI 综合" in joined and "AppStore" in joined
+    assert "DouYin" in joined and "TikTok" in joined
+
+
+@pytest_asyncio.fixture
+async def full_default_sources(db):
+    """补齐 conftest 未种的默认规则源，得到完整内置集合（含新默认排序）"""
+    existing = {rs.name for rs in (await db.execute(select(RuleSource))).scalars().all()}
+    for rs in DEFAULT_RULE_SOURCES:
+        if rs["name"] not in existing:
+            db.add(RuleSource(**rs))
+    await db.commit()
+    return db
+
+
+def _rule_section_lines(config: str) -> list[str]:
+    section = config.split("[Rule]", 1)[1].split("[Host]", 1)[0]
+    return [line for line in section.splitlines() if line.strip() and not line.startswith("#")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("earlier_url", "later_url"), [
+    ("OpenAI/OpenAI.list", "AppStore/AppStore.list"),
+    ("Rule/OpenAI.list", "Apple/Apple.list"),
+    ("non_ip/ai.conf", "Google/Google.list"),
+    ("non_ip/ai.conf", "non_ip/global.conf"),
+    ("DouYin/DouYin.list", "TikTok.list"),
+    ("ip/domestic.conf", "non_ip/global.conf"),
+    ("WeChat/WeChat.list", "non_ip/global.conf"),
+])
+async def test_required_rule_order_in_generated_output(full_default_sources, earlier_url, later_url):
+    """完整默认源生成产物中，每个不变量对（按规则源 URL 定位行）的顺序符合要求"""
+    config = await generate_surge_config(full_default_sources)
+    lines = _rule_section_lines(config)
+    earlier_idx = next(i for i, l in enumerate(lines) if earlier_url in l)
+    later_idx = next(i for i, l in enumerate(lines) if later_url in l)
+    assert earlier_idx < later_idx
+
+
+@pytest.mark.asyncio
+async def test_ip_rule_sources_always_use_no_resolve(full_default_sources):
+    """IP 类规则源（结构化 ip_rules 标记）输出必须以 ,no-resolve 结尾且不重复"""
+    config = await generate_surge_config(full_default_sources)
+    ip_lines = [l for l in _rule_section_lines(config) if "/ip/" in l or "ASN" in l]
+    assert ip_lines, "默认源应包含 IP 类规则集"
+    assert all(l.endswith(",no-resolve") for l in ip_lines)
+    assert not any(",no-resolve,no-resolve" in l for l in ip_lines)
+    # 非 IP 规则源不加 no-resolve（结构化判定，不按 URL 猜）。
+    # LAN 例外：内置 LAN 源（Lan/Lan.list 私有网段，ip_rules=True）与硬编码
+    # LAN 兜底行都是本地网段 IP 类，合法带 no-resolve，但 URL 不含 /ip//ASN
+    non_ip = [l for l in _rule_section_lines(config) if "/ip/" not in l and "ASN" not in l
+              and l.startswith(("RULE-SET", "DOMAIN-SET"))
+              and "Lan/Lan.list" not in l and not l.startswith("RULE-SET,LAN,")]
+    assert non_ip
+    assert not any(l.endswith(",no-resolve") for l in non_ip)
+
+
+@pytest.mark.asyncio
+async def test_ip_no_resolve_survives_locale_override(full_default_sources):
+    """locale 覆盖（en）不影响 no-resolve 追加（判定不依赖输出语言）"""
+    config = await generate_surge_config(full_default_sources, locale_override="en")
+    ip_lines = [l for l in _rule_section_lines(config) if "/ip/" in l or "ASN" in l]
+    assert ip_lines and all(l.endswith(",no-resolve") for l in ip_lines)
+
+
+@pytest.mark.asyncio
+async def test_legacy_ai_after_apple_aborts_generation(db):
+    """老库顺序（AI 18-23 在 Apple 12-16 之后）：生成前被顺序校验拒绝"""
+    legacy_order = {"AppStore": 12, "AppleNews": 13, "Apple CDN": 14, "AppleTV": 15,
+                    "Apple": 16, "GitHub": 17, "OpenAI": 18, "Claude": 19, "Gemini": 20,
+                    "Bing": 21, "AI 综合": 22, "AI 兜底": 23}
+    for name, sort_order in legacy_order.items():
+        default = next(rs for rs in DEFAULT_RULE_SOURCES if rs["name"] == name)
+        db.add(RuleSource(**{**default, "sort_order": sort_order}))
+    await db.commit()
+    with pytest.raises(InvalidConfiguration) as ei:
+        await generate_surge_config(db)
+    joined = "\n".join(ei.value.errors)
+    assert "AI 兜底" in joined and "AppStore" in joined
+
+
+@pytest.mark.asyncio
+async def test_full_defaults_generate_for_three_targets(full_default_sources):
+    """完整默认源在三目标下均可生成（顺序与引用不变量共同通过）"""
+    from app.models import ConfigProfile as Profile
+    for target, udp in (("mac_workstation", "scoped"),
+                        ("mac_gateway", "compatible"),
+                        ("ios_mobile", "compatible")):
+        profile = Profile(name=f"顺序-{target}", is_default=False, locale="zh",
+                          final_action="手动选择", target=target, udp_security_mode=udp)
+        full_default_sources.add(profile)
+    await full_default_sources.commit()
+    result = await full_default_sources.execute(
+        select(Profile).where(Profile.is_default == False))
+    for profile in result.scalars().all():
+        config = await generate_surge_config(full_default_sources, profile.id)
+        assert "FINAL,手动选择,dns-failed" in config
+
+
+class TestRuleOrderRouteGuard:
+    """reorder / update 端点：提交前构造完整 enabled 候选序校验，违例 422 且整事务回滚"""
+
+    @staticmethod
+    async def _rule_ids(client, *names) -> dict:
+        async with client._test_factory() as db:
+            rows = (await db.execute(select(RuleSource))).scalars().all()
+        by_name = {r.name: r for r in rows}
+        return {name: by_name[name].id for name in names}
+
+    @pytest.mark.asyncio
+    async def test_reorder_breaking_invariant_422_and_rolls_back(self, client):
+        ids = await self._rule_ids(client, "OpenAI", "AppStore")
+        resp = await client.put("/api/configs/rules/reorder",
+                                json=[{"id": ids["OpenAI"], "sort_order": 99}])
+        assert resp.status_code == 422
+        errors = resp.json()["detail"]["errors"]
+        assert any("OpenAI" in e for e in errors)
+        # 整事务回滚：数据库顺序未被破坏
+        async with client._test_factory() as db:
+            openai = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "OpenAI"))).scalar_one()
+        assert openai.sort_order == 12  # 新默认：AI 块 12-17
+
+    @pytest.mark.asyncio
+    async def test_reorder_unknown_id_keeps_legacy_semantics(self, client):
+        """既有语义不放宽：未知 id 静默忽略，仍按请求数量计数返回 200"""
+        resp = await client.put("/api/configs/rules/reorder",
+                                json=[{"id": 999999, "sort_order": 0}])
+        assert resp.status_code == 200
+        assert resp.json() == {"reordered": 1}
+
+    @pytest.mark.asyncio
+    async def test_reorder_compliant_change_commits(self, client):
+        """不破坏不变量的 reorder 正常提交（如 GitHub 移到 40）"""
+        ids = await self._rule_ids(client, "GitHub")
+        resp = await client.put("/api/configs/rules/reorder",
+                                json=[{"id": ids["GitHub"], "sort_order": 40}])
+        assert resp.status_code == 200
+        async with client._test_factory() as db:
+            github = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "GitHub"))).scalar_one()
+        assert github.sort_order == 40
+
+    @pytest.mark.asyncio
+    async def test_update_sort_order_breaking_invariant_422_and_rolls_back(self, client):
+        ids = await self._rule_ids(client, "AppStore")
+        resp = await client.put(f"/api/configs/rules/{ids['AppStore']}",
+                                json={"sort_order": 0})
+        assert resp.status_code == 422
+        assert any("AppStore" in e for e in resp.json()["detail"]["errors"])
+        async with client._test_factory() as db:
+            appstore = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "AppStore"))).scalar_one()
+        assert appstore.sort_order == 18  # 新默认：Apple 块 18-22
+
+    @pytest.mark.asyncio
+    async def test_update_disabling_one_side_is_allowed(self, client):
+        """禁用不变量一侧（Apple 源缺席）不构成违例：正常提交"""
+        ids = await self._rule_ids(client, "AppStore")
+        resp = await client.put(f"/api/configs/rules/{ids['AppStore']}",
+                                json={"enabled": False})
+        assert resp.status_code == 200
+        async with client._test_factory() as db:
+            appstore = (await db.execute(
+                select(RuleSource).where(RuleSource.name == "AppStore"))).scalar_one()
+        assert appstore.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_generate_route_422_on_bad_order(self, client):
+        """顺序违例沿用 Task4 生成路由 422 通道（错误列表完整返回）"""
+        ids = await self._rule_ids(client, "OpenAI")
+        async with client._test_factory() as db:
+            await db.execute(update(RuleSource)
+                             .where(RuleSource.id == ids["OpenAI"])
+                             .values(sort_order=99))
+            await db.commit()
+        resp = await client.get("/api/configs/generate?profile_id=1")
+        assert resp.status_code == 422
+        assert any("OpenAI" in e for e in resp.json()["detail"]["errors"])

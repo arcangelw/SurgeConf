@@ -298,6 +298,7 @@ class TestGroupNameSinks:
         nodes[0].pinned_services = ["AI服务"]
         services = [_make_service("AI服务", ["自动选择", "美国"])]
         sinks = GroupNameSinks()
+
         _build_proxy_groups(nodes, regions, services, _t_zh, {}, name_sinks=sinks)
 
         pairs = {(ref.group, ref.member) for ref in sinks.member_refs}
@@ -363,15 +364,48 @@ class TestBuildRules:
 
     def test_ip_ruleset_gets_no_resolve(self):
         rs = RuleSource(name="Domestic (ip)", url="https://ruleset.skk.moe/List/ip/domestic.conf",
-                        action="大陆直连", rule_type="RULE-SET", category="mainland", sort_order=0, enabled=True)
+                        action="大陆直连", rule_type="RULE-SET", category="mainland",
+                        sort_order=0, enabled=True, ip_rules=True)
         lines = self._rules(sources=[rs])
         line = next(l for l in lines if "domestic.conf" in l)
         assert line.endswith(",no-resolve")
 
+    def test_ip_flag_not_duplicated(self):
+        """ip_rules 追加 no-resolve 恰一次，绝不重复"""
+        rs = RuleSource(name="Domestic (ip)", url="https://ruleset.skk.moe/List/ip/domestic.conf",
+                        action="大陆直连", rule_type="RULE-SET", category="mainland",
+                        sort_order=0, enabled=True, ip_rules=True)
+        lines = self._rules(sources=[rs])
+        line = next(l for l in lines if "domestic.conf" in l)
+        assert ",no-resolve" in line
+        assert ",no-resolve,no-resolve" not in line
+
     def test_asn_ruleset_gets_no_resolve(self):
         rs = RuleSource(name="ASN China", url="https://example.com/ASN.China.list",
-                        action="DIRECT", rule_type="RULE-SET", category="mainland", sort_order=0, enabled=True)
+                        action="DIRECT", rule_type="RULE-SET", category="mainland",
+                        sort_order=0, enabled=True, ip_rules=True)
         lines = self._rules(sources=[rs])
+        line = next(l for l in lines if "ASN.China.list" in l)
+        assert line.endswith(",no-resolve")
+
+    def test_url_keyword_alone_does_not_add_no_resolve(self):
+        """结构化判定：URL 含 /ip/ 但未声明 ip_rules 时不加（不按 URL 猜）"""
+        rs = RuleSource(name="Domestic (ip)", url="https://ruleset.skk.moe/List/ip/domestic.conf",
+                        action="大陆直连", rule_type="RULE-SET", category="mainland",
+                        sort_order=0, enabled=True)
+        lines = self._rules(sources=[rs])
+        line = next(l for l in lines if "domestic.conf" in l)
+        assert "no-resolve" not in line
+
+    def test_ip_flag_survives_en_locale(self):
+        """locale 覆盖不影响 no-resolve 追加（判定与输出语言无关）"""
+        rs = RuleSource(name="ASN China", url="https://example.com/ASN.China.list",
+                        action="DIRECT", rule_type="RULE-SET", category="mainland",
+                        sort_order=0, enabled=True, ip_rules=True)
+        lines = _build_rules([rs], [], [], _t_en,
+                             lambda k: k.replace("_", " ").title(),
+                             lambda k: COMMENT_NAMES.get(k, (k, k))[1],
+                             final_action="兜底")
         line = next(l for l in lines if "ASN.China.list" in l)
         assert line.endswith(",no-resolve")
 
@@ -382,17 +416,6 @@ class TestBuildRules:
         line = next(l for l in lines if "non_ip/domestic.conf" in l)
         assert not line.endswith(",no-resolve")
         assert "no-resolve" not in line
-
-    def test_custom_no_resolve_keywords(self):
-        rs = RuleSource(name="Telethon IP", url="https://example.com/tg.list",
-                        action="Telegram", rule_type="RULE-SET", category="social", sort_order=0, enabled=True)
-        lines = _build_rules([rs], [], [], _t_zh,
-                             lambda k: CATEGORY_NAMES.get(k, k),
-                             lambda k: COMMENT_NAMES.get(k, (k, k))[0],
-                             no_resolve_keywords="Telethon",
-                             final_action="兜底")
-        line = next(l for l in lines if "tg.list" in l)
-        assert line.endswith(",no-resolve")
 
     def test_rule_action_not_translated_zh(self):
         rs = RuleSource(name="Test", url="https://example.com", action="AI服务",
@@ -516,6 +539,24 @@ async def test_full_config_has_all_sections(db):
     for section in ["[General]", "[Proxy]", "[Proxy Group]", "[Rule]",
                     "[Host]", "[URL Rewrite]", "[Header Rewrite]", "[MITM]", "[Script]"]:
         assert section in config, f"缺少 {section}"
+
+
+@pytest.mark.asyncio
+async def test_rules_ordered_by_sort_order_then_id(db):
+    """生成器按 (sort_order, id) 稳定排序：同 sort_order 时 id 小者先输出"""
+    db.add(RuleSource(name="同序-先", url="https://example.com/tie-earlier.list",
+                      action="DIRECT", rule_type="RULE-SET", category="intl_service",
+                      sort_order=50, enabled=True))
+    db.add(RuleSource(name="同序-后", url="https://example.com/tie-later.list",
+                      action="DIRECT", rule_type="RULE-SET", category="intl_service",
+                      sort_order=50, enabled=True))
+    await db.commit()
+
+    config = await generate_surge_config(db)
+    rule_section = config.split("[Rule]", 1)[1].split("[Host]", 1)[0]
+    earlier = next(i for i, l in enumerate(rule_section.splitlines()) if "tie-earlier" in l)
+    later = next(i for i, l in enumerate(rule_section.splitlines()) if "tie-later" in l)
+    assert earlier < later
 
 
 @pytest.mark.asyncio

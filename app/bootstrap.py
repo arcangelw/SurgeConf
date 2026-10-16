@@ -68,7 +68,8 @@ async def seed_defaults(session_factory) -> None:
             await db.commit()
 
     # 确保系统级配置存在（首次启动或数据库已有旧数据时）
-    # 注：no_resolve_keywords 键由业务迁移 no_resolve_keywords_v1 幂等补齐，此处不重复
+    # 注：no_resolve_keywords 键已由结构化 rule_sources.ip_rules 取代
+    # （历史补键后随 retire_no_resolve_keywords_v1 退役），此处不种该键
     sys_config_keys = {"exclusion_keywords", "other_auto_enabled", "other_manual_enabled", "skip_proxy_custom"}
     existing_configs = set()
     async with session_factory() as db:

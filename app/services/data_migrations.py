@@ -12,7 +12,13 @@ from sqlalchemy import delete, select, update
 from app.default_config import DEFAULT_RULE_SOURCES, SECURITY_PRE_RULES
 from app.models import (ConfigProfile, CustomRule, DataMigrationRecord,
                         RuleSource, SystemConfig)
-from app.services.config_validation import BUILTIN_ACTIONS, localized_output_candidates
+from app.services.config_validation import (
+    BUILTIN_ACTIONS,
+    RULE_ORDER_INVARIANTS,
+    localized_output_candidates,
+    rule_order_violations,
+    rule_source_category_positions,
+)
 from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
 
 
@@ -215,6 +221,110 @@ async def _migrate_dangling_rule_source_actions(db) -> int:
     return fixed
 
 
+async def _migrate_rule_source_ip_flags(db) -> int:
+    """内置 IP 规则源的结构化 ip_rules 回填。
+
+    0004 schema 迁移把 no-resolve 判定从 URL 关键词猜测改为结构化字段，
+    存量库行默认 0；本迁移按稳定内置签名 (name + url + rule_type) 精确
+    匹配 DEFAULT_RULE_SOURCES 中声明 ip_rules=True 的记录回填为 True。
+
+    严格限定范围：
+    - 仅限身份完全匹配的内置记录（含 disabled：ip_rules 是内容属性，
+      与 enabled 无关）；
+    - 只做 False → True 回填，绝不反向清零（用户显式声明优先）；
+    - 用户自定义源（身份不匹配）一律不动，不按 URL 字符串猜；
+    - 非声明的内置记录不动。幂等：已是 True 的不再变更。
+    """
+    flagged_identities = {
+        (rs["name"], rs["url"], rs["rule_type"])
+        for rs in DEFAULT_RULE_SOURCES if rs.get("ip_rules")
+    }
+    fixed = 0
+    for rs in (await db.execute(select(RuleSource))).scalars().all():
+        identity = (rs.name, rs.url, rs.rule_type)
+        if identity in flagged_identities and not rs.ip_rules:
+            rs.ip_rules = True
+            fixed += 1
+    return fixed
+
+
+async def _migrate_rule_source_order_invariants(db) -> int:
+    """规则顺序不变量修复：仅重置违反不变量的内置记录到默认 sort_order。
+
+    老库默认排序曾把 AI 块 (18-23) 放在 Apple 块 (12-16) 之后，违反
+    「AI 先于 Apple/Google/Global」不变量。本迁移：
+    - 只对 enabled 候选序列（与生成序列一致）判违例；
+    - 违例时仅重置「越界」的内置身份记录（earlier 侧排在 later 最前
+      记录之后的、later 侧排在 earlier 最后记录之前的）为
+      DEFAULT_RULE_SOURCES 声明的默认 sort_order；未越界记录与 GitHub
+      等非不变量类别一律不动；
+    - 用户自定义源与身份字段被改过的记录（name/url/rule_type 任一不同）
+      保守不动——它们不参与不变量，坏顺序由运行时校验显式报错指引修复；
+    - 不做全量重编号，保持未受影响记录的值与相对顺序；
+    - 重置后复检仍违例则抛异常（fail closed，整事务回滚不记账）。幂等。
+    """
+    all_sources = (await db.execute(select(RuleSource))).scalars().all()
+    enabled = [rs for rs in all_sources if rs.enabled]
+    if not rule_order_violations(enabled):
+        return 0
+
+    defaults_by_identity = {
+        (rs["name"], rs["url"], rs["rule_type"]): rs["sort_order"]
+        for rs in DEFAULT_RULE_SOURCES
+    }
+    positions = rule_source_category_positions(enabled)
+
+    to_reset: set[int] = set()
+    for earlier, later, _reason in RULE_ORDER_INVARIANTS:
+        earlier_entries = positions.get(earlier)
+        later_entries = positions.get(later)
+        if not earlier_entries or not later_entries:
+            continue
+        earlier_last = max(index for index, _ in earlier_entries)
+        later_first = min(index for index, _ in later_entries)
+        if earlier_last < later_first:
+            continue
+        for index, rs in earlier_entries:
+            if index >= later_first:
+                to_reset.add(rs.id)
+        for index, rs in later_entries:
+            if index <= earlier_last:
+                to_reset.add(rs.id)
+
+    fixed = 0
+    for rs in all_sources:
+        if rs.id not in to_reset:
+            continue
+        default_order = defaults_by_identity[(rs.name, rs.url, rs.rule_type)]
+        if rs.sort_order != default_order:
+            rs.sort_order = default_order
+            fixed += 1
+
+    # 复检（同一 session 内对象已更新）：默认序之间满足全部不变量，
+    # 仍违例说明出现未预见的组合，fail closed 拒绝记账
+    if rule_order_violations(enabled):
+        raise RuntimeError("规则顺序不变量迁移后仍存在违例，拒绝记账")
+    return fixed
+
+
+async def _migrate_retire_no_resolve_keywords(db) -> int:
+    """退役 no_resolve_keywords 系统键。
+
+    IP 类规则集的 no-resolve 判定已结构化（rule_sources.ip_rules），
+    关键词机制不再被生成器读取；历史补键迁移 no_resolve_keywords_v1
+    语义保持不变（仍执行补键），本迁移紧随其后删除该键，避免面板
+    残留失效配置误导用户。幂等：键不存在则零变更；已记账后用户手动
+    重写的键不会被再次清理（尊重用户现状）。
+    """
+    result = await db.execute(
+        select(SystemConfig).where(SystemConfig.key == "no_resolve_keywords"))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return 0
+    await db.delete(row)
+    return 1
+
+
 # 有序注册表：新增业务迁移一律追加新 key，禁止修改已发布 key 的语义
 DATA_MIGRATIONS: dict = {
     "security_rules_v1": _migrate_security_rules,
@@ -224,6 +334,9 @@ DATA_MIGRATIONS: dict = {
     "remove_global_quic_v1": _migrate_remove_global_quic,
     "no_resolve_keywords_v1": _migrate_no_resolve_keywords,
     "dangling_rule_source_actions_v1": _migrate_dangling_rule_source_actions,
+    "rule_source_ip_flags_v1": _migrate_rule_source_ip_flags,
+    "rule_source_order_invariants_v1": _migrate_rule_source_order_invariants,
+    "retire_no_resolve_keywords_v1": _migrate_retire_no_resolve_keywords,
 }
 
 

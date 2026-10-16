@@ -15,7 +15,7 @@ canonical 命名流：数据库存逻辑名（中文）。GenerationContext 的�
 
 from dataclasses import dataclass
 
-from app.default_config import locale_translate
+from app.default_config import DEFAULT_RULE_SOURCES, locale_translate
 
 # Surge 内置终结动作：无需在 [Proxy] / [Proxy Group] 中定义即可被规则引用
 BUILTIN_ACTIONS = frozenset({"DIRECT", "REJECT", "REJECT-NO-DROP", "REJECT-DROP", "DNS"})
@@ -220,3 +220,108 @@ def translate_rule_action(rule_text: str, t) -> str | None:
         return None
     segments[idx] = t(segments[idx])
     return ",".join(segments)
+
+
+# ===== 规则顺序不变量（稳定身份判定） =====
+
+# 内置规则源的稳定身份：(name, url, rule_type) 三元组。任何身份字段被用户
+# 修改过的记录都不再视为内置源，不参与顺序不变量（自定义源永不误伤）；
+# 宽泛 substring 匹配（如按名称包含 "AI"）会把用户自定义源误判为内置。
+RuleSourceIdentity = tuple[str, str, str]
+
+BUILTIN_RULE_SOURCE_IDENTITIES: frozenset[RuleSourceIdentity] = frozenset(
+    (rs["name"], rs["url"], rs["rule_type"]) for rs in DEFAULT_RULE_SOURCES
+)
+
+
+def _order_category_identities(*, category: str | None = None,
+                               categories: tuple[str, ...] = (),
+                               name: str | None = None) -> frozenset[RuleSourceIdentity]:
+    """按 category / 精确名称从内置默认声明挑选身份集合（结构字段驱动）"""
+    picked: set[RuleSourceIdentity] = set()
+    for rs in DEFAULT_RULE_SOURCES:
+        if category is not None and rs["category"] != category:
+            continue
+        if categories and rs["category"] not in categories:
+            continue
+        if name is not None and rs["name"] != name:
+            continue
+        picked.add((rs["name"], rs["url"], rs["rule_type"]))
+    return frozenset(picked)
+
+
+# 不变量类别 → 内置身份集合。用户借用同名/同 category 的自定义记录因 url
+# 不同不会命中任何集合。
+_ORDER_CATEGORY_IDENTITIES: dict[str, frozenset[RuleSourceIdentity]] = {
+    "ai": _order_category_identities(category="ai"),
+    "apple": _order_category_identities(category="apple"),
+    "google": _order_category_identities(category="google"),
+    "global": _order_category_identities(category="global"),
+    "douyin": _order_category_identities(name="DouYin"),
+    "tiktok": _order_category_identities(name="TikTok"),
+    "domestic": _order_category_identities(categories=("mainland", "mainland_app")),
+}
+
+_ORDER_CATEGORY_LABELS = {
+    "ai": "AI 服务", "apple": "Apple", "google": "Google", "global": "Global 兜底",
+    "douyin": "抖音直连", "tiktok": "TikTok", "domestic": "国内直连",
+}
+
+# 顺序不变量：(earlier 类别, later 类别, 冲突原因说明)。
+# 生成、迁移与 reorder/update 端点共同执行的同一条规则。
+RULE_ORDER_INVARIANTS: tuple[tuple[str, str, str], ...] = (
+    ("ai", "apple", "AI 服务域名与 Apple 规则存在重叠，AI 规则须先行匹配"),
+    ("ai", "google", "AI 服务域名与 Google 规则存在重叠（如 Gemini），AI 规则须先行匹配"),
+    ("ai", "global", "AI 服务域名与 Global 兜底规则存在重叠，AI 规则须先行匹配"),
+    ("douyin", "tiktok", "抖音与 TikTok 共用 snssdk.com 等字节系域名，抖音直连须先行匹配"),
+    ("domestic", "global", "国内直连域名与 Global 兜底规则存在重叠，国内规则须先行匹配"),
+)
+
+
+def rule_source_category_positions(ordered) -> dict[str, list[tuple[int, object]]]:
+    """按 (sort_order, id) 稳定序为每个不变量类别登记 (位置, 记录)。
+
+    只登记与内置稳定身份完全匹配的记录；身份字段被改过或用户自定义的
+    源一律不参与。纯函数、不抛错（迁移据此定位需重置的违例记录）。
+    """
+    sequence = sorted(ordered, key=lambda rs: (rs.sort_order, rs.id))
+    positions: dict[str, list[tuple[int, object]]] = {}
+    for index, rs in enumerate(sequence):
+        identity = (rs.name, rs.url, rs.rule_type)
+        if identity not in BUILTIN_RULE_SOURCE_IDENTITIES:
+            continue
+        for category, identities in _ORDER_CATEGORY_IDENTITIES.items():
+            if identity in identities:
+                positions.setdefault(category, []).append((index, rs))
+    return positions
+
+
+def rule_order_violations(ordered) -> list[str]:
+    """检查完整 enabled 候选序列（按 (sort_order, id) 稳定序）的顺序不变量。
+
+    返回全部违例描述（中文、含双方源名与 sort_order）；同一不变量两侧
+    任一缺失时不报告——可选源缺席不构成违例。
+    """
+    positions = rule_source_category_positions(ordered)
+    errors: list[str] = []
+    for earlier, later, reason in RULE_ORDER_INVARIANTS:
+        earlier_entries = positions.get(earlier)
+        later_entries = positions.get(later)
+        if not earlier_entries or not later_entries:
+            continue
+        earlier_last_index, earlier_last = max(earlier_entries, key=lambda item: item[0])
+        later_first_index, later_first = min(later_entries, key=lambda item: item[0])
+        if earlier_last_index >= later_first_index:
+            errors.append(
+                f"规则顺序违反不变量：{_ORDER_CATEGORY_LABELS[earlier]}规则源"
+                f"「{earlier_last.name}」(sort_order={earlier_last.sort_order}) 须先于 "
+                f"{_ORDER_CATEGORY_LABELS[later]}规则源「{later_first.name}」"
+                f"(sort_order={later_first.sort_order})；{reason}")
+    return errors
+
+
+def validate_rule_order(ordered) -> None:
+    """聚合校验规则源顺序不变量；一次抛出全部错误（InvalidConfiguration）。"""
+    errors = rule_order_violations(ordered)
+    if errors:
+        raise InvalidConfiguration(errors)

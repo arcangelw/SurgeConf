@@ -23,13 +23,15 @@ from app.services.config_validation import (
     translate_policy_name,
     translate_rule_action,
     validate_generated_references,
+    validate_rule_order,
 )
 from app.services.profile_resolution import profile_scope, resolve_profile
 
 # 默认排除关键词（优先使用系统配置）
 DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
 
-# IP 类规则集关键词：命中则生成 no-resolve，避免域名连接为匹配 IP 规则触发本地 DNS 解析（DNS 泄漏）
+# 历史 no-resolve 关键词：仅供已发布业务迁移 no_resolve_keywords_v1 引用；
+# 生成器已改用 rule_sources.ip_rules 结构化字段判定（不按 URL 字符串猜）
 DEFAULT_NO_RESOLVE_KEYWORDS = "(ip),ASN,/ip/,Lan"
 
 # 控制器凭据 env 值必须匹配的单行 access@host:port 格式（host 支持
@@ -163,9 +165,13 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     service_groups = services_result.scalars().all()
 
     rules_result = await db.execute(
-        select(RuleSource).where(RuleSource.enabled == True).order_by(RuleSource.sort_order)
+        select(RuleSource).where(RuleSource.enabled == True)
+        .order_by(RuleSource.sort_order, RuleSource.id)
     )
     rule_sources = rules_result.scalars().all()
+    # 顺序不变量（AI 先于 Apple/Google/Global、DouYin 先于 TikTok、国内先于 Global）：
+    # 与引用校验同一异常通道（InvalidConfiguration → 路由 422），聚合全部顺序错误
+    validate_rule_order(rule_sources)
 
     subs_result = await db.execute(select(Subscription))
     sub_map = {s.id: s.name for s in subs_result.scalars().all()}
@@ -271,12 +277,10 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     )
     general_rules = general_rules_result.scalars().all()
 
-    no_resolve_keywords = sys_config.get("no_resolve_keywords", DEFAULT_NO_RESOLVE_KEYWORDS)
     # 先构建 + 记录结构化引用，再统一校验：任何无效引用聚合抛出，
     # 绝不把部分 [Rule] 段拼进产物（sections 只在校验通过后扩展）
     rule_refs: list[RuleActionRef] = []
     rule_lines = _build_rules(rule_sources, pre_rules, general_rules, tr, tc, tcomment,
-                              no_resolve_keywords,
                               final_action=final_action, record=rule_refs)
     validate_generated_references(GenerationContext(
         locale=locale,
@@ -521,11 +525,8 @@ def _emit_custom_rule(rule_text: str, label: str, t, record: list[RuleActionRef]
     return translated if translated is not None else rule_text
 
 
-def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, no_resolve_keywords: str | None = None, *, final_action: str, record: list[RuleActionRef] | None = None) -> list[str]:
+def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, *, final_action: str, record: list[RuleActionRef] | None = None) -> list[str]:
     lines = []
-
-    # 命中关键词的规则集视为 IP 类，追加 no-resolve 防止触发本地 DNS 解析
-    ip_keywords = [k.strip() for k in (no_resolve_keywords or DEFAULT_NO_RESOLVE_KEYWORDS).split(",") if k.strip()]
 
     # 前置自定义规则
     if pre_rules:
@@ -546,7 +547,9 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
         if record is not None:
             record.append(RuleActionRef(f"规则源「{rs.name}」", rs.action))
         line = f"{rs.rule_type},{rs.url},{_quote(translated_action)}"
-        if any(kw in rs.name or kw in rs.url for kw in ip_keywords):
+        # IP 类规则集（结构化 ip_rules 字段声明，不按 URL 猜）：追加 no-resolve
+        # 防止域名连接为匹配 IP 规则触发本地 DNS 解析（DNS 泄漏）；恰一次不重复
+        if rs.ip_rules and not line.endswith(",no-resolve"):
             line += ",no-resolve"
         lines.append(line)
 

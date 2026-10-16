@@ -117,6 +117,7 @@ SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
     "0002_profile_subscription_tokens": {("config_profiles", "subscription_token_hash")},
     "0003_profile_targets": {("config_profiles", "target"),
                              ("config_profiles", "udp_security_mode")},
+    "0004_rule_source_ip_rules": {("rule_sources", "ip_rules")},
 }
 
 # 各 revision 必需的命名 CHECK 约束（表 → 约束名 → 冻结的规范化表达式）。
@@ -213,13 +214,32 @@ def _normalize_check_expression(sqltext: str) -> str:
     return " ".join(text.split())
 
 
+def _accumulated_required_checks(revision: str) -> dict[str, dict[str, str]]:
+    """截至该 revision（含）累积的全部必需命名 CHECK 约束。
+
+    约束随结构继承：后续 revision 不引入新约束时，识别该 revision 仍须
+    校验更早 revision 的全部约束（否则篡改旧约束的库会被无约束的新
+    revision 误 stamp）。baseline（0001）无约束。
+    """
+    revisions = list(SCHEMA_REVISION_DELTAS)
+    if revision not in revisions:
+        return {}
+    accumulated: dict[str, dict[str, str]] = {}
+    for known in revisions:
+        for table, checks in SCHEMA_REVISION_CHECKS.get(known, {}).items():
+            accumulated.setdefault(table, {}).update(checks)
+        if known == revision:
+            break
+    return accumulated
+
+
 def _required_check_problems(revision: str,
                              actual_checks: dict[str, dict[str, str]]
                              ) -> tuple[set[str], set[str]]:
-    """相对 revision 必需约束返回（缺失的约束名, 表达式不一致的约束名）"""
+    """相对 revision 必需约束（累积）返回（缺失的约束名, 表达式不一致的约束名）"""
     missing: set[str] = set()
     mismatched: set[str] = set()
-    for table, required in SCHEMA_REVISION_CHECKS.get(revision, {}).items():
+    for table, required in _accumulated_required_checks(revision).items():
         actual = actual_checks.get(table, {})
         for name, expected in required.items():
             if name not in actual:
@@ -270,7 +290,7 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
             problems.append(f"{table} 缺列: {', '.join(sorted(missing))}")
         if extra:
             problems.append(f"{table} 额外列: {', '.join(sorted(extra))}")
-    for table, required in SCHEMA_REVISION_CHECKS.get(head, {}).items():
+    for table, required in _accumulated_required_checks(head).items():
         missing, mismatched = _required_check_problems(head, actual_checks)
         if missing:
             problems.append(f"{table} 缺 CHECK 约束: {', '.join(sorted(missing))}")
