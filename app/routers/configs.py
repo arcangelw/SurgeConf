@@ -17,6 +17,9 @@ from typing import Optional
 
 from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
+from app.profile_targets import (ProfileTarget, UdpSecurityMode,
+                                 default_udp_mode, validate_target_mode)
+from app.services.profile_resolution import ProfileNotFound, resolve_profile
 from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
                                resolve_runtime_paths)
 from app.security import issue_profile_token, verify_profile_token
@@ -34,6 +37,8 @@ class ConfigProfileCreate(BaseModel):
     name: str
     description: Optional[str] = None
     is_default: bool = False
+    target: ProfileTarget = ProfileTarget.MAC_WORKSTATION
+    udp_security_mode: Optional[UdpSecurityMode] = None
     locale: Optional[str] = "zh"
     final_action: Optional[str] = "手动选择"
     general: Optional[dict] = None
@@ -47,6 +52,8 @@ class ConfigProfileUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     is_default: Optional[bool] = None
+    target: Optional[ProfileTarget] = None
+    udp_security_mode: Optional[UdpSecurityMode] = None
     locale: Optional[str] = None
     final_action: Optional[str] = None
     general: Optional[dict] = None
@@ -77,8 +84,15 @@ class RuleSourceUpdate(BaseModel):
     sort_order: Optional[int] = None
     enabled: Optional[bool] = None
 
+async def _require_profile(db: AsyncSession, profile_id: int) -> ConfigProfile:
+    """显式 id 解析：不存在直接 404，绝不回退默认档案（resolve_profile 唯一语义）"""
+    try:
+        return await resolve_profile(db, profile_id)
+    except ProfileNotFound as exc:
+        raise HTTPException(404, "配置方案不存在") from exc
 
-# ===== 配置方案 =====
+
+ # ===== 配置方案 =====
 
 @router.get("/profiles")
 async def list_profiles(db: AsyncSession = Depends(get_db)):
@@ -92,6 +106,7 @@ async def list_profiles(db: AsyncSession = Depends(get_db)):
             "description": p.description,
             "is_default": p.is_default,
             "locale": p.locale,
+            "target": p.target,
             "token_configured": bool(p.subscription_token_hash),
         }
         for p in profiles
@@ -113,6 +128,8 @@ def _profile_detail(p: ConfigProfile) -> dict:
         "description": p.description,
         "is_default": p.is_default,
         "locale": p.locale,
+        "target": p.target,
+        "udp_security_mode": p.udp_security_mode,
         "final_action": p.final_action,
         "general": p.general,
         "dns": p.dns,
@@ -126,19 +143,23 @@ def _profile_detail(p: ConfigProfile) -> dict:
 @router.get("/profiles/{profile_id}")
 async def get_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
     """已认证单档案详情：UI 编辑用完整数据；MITM 秘密仅 configured 状态"""
-    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
-    profile = result.scalar_one_or_none()
-    if not profile:
-        raise HTTPException(404, "配置方案不存在")
+    profile = await _require_profile(db, profile_id)
     return _profile_detail(profile)
 
 
 @router.post("/profiles")
 async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(get_db)):
+    mode = data.udp_security_mode or default_udp_mode(data.target)
+    try:
+        validate_target_mode(data.target, mode)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     profile = ConfigProfile(
         name=data.name,
         description=data.description,
         is_default=data.is_default,
+        target=data.target.value,
+        udp_security_mode=mode.value,
         locale=data.locale or "zh",
         general=data.general or {},
         dns=data.dns or {},
@@ -154,12 +175,24 @@ async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(g
 
 @router.put("/profiles/{profile_id}")
 async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
-    profile = result.scalar_one_or_none()
-    if not profile:
-        raise HTTPException(404, "配置方案不存在")
+    profile = await _require_profile(db, profile_id)
+
+    # 目标/模式：显式提供才算（区分未提供与显式值）；组合校验先于任何
+    # 修改，失败 422 且事务不提交。只换目标未给模式 → 重置新目标默认模式。
+    fields_set = data.model_fields_set
+    target_provided = "target" in fields_set
+    mode_provided = "udp_security_mode" in fields_set
+    if target_provided or mode_provided:
+        new_target = data.target if target_provided else ProfileTarget(profile.target)
+        new_mode = data.udp_security_mode if mode_provided else default_udp_mode(new_target)
+        try:
+            validate_target_mode(new_target, new_mode)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     update_data = data.model_dump(exclude_unset=True)
+    update_data.pop("target", None)
+    update_data.pop("udp_security_mode", None)
     mitm_reset = update_data.pop("mitm_reset", None)
     mitm_clear = update_data.pop("mitm_clear", None)
     mitm_incoming = update_data.pop("mitm", None)
@@ -184,6 +217,9 @@ async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSe
 
     for key, value in update_data.items():
         setattr(profile, key, value)
+    if target_provided or mode_provided:
+        profile.target = new_target.value
+        profile.udp_security_mode = new_mode.value
     await db.commit()
     return {"id": profile.id, "name": profile.name}
 
@@ -191,10 +227,7 @@ async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSe
 @router.delete("/profiles/{profile_id}")
 async def delete_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
     """级联删除：单事务内删除该档案的定制规则、Host 映射与档案本体"""
-    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
-    profile = result.scalar_one_or_none()
-    if not profile:
-        raise HTTPException(404, "配置方案不存在")
+    profile = await _require_profile(db, profile_id)
     from sqlalchemy import delete as sa_delete
     await db.execute(sa_delete(CustomRule).where(CustomRule.profile_id == profile_id))
     await db.execute(sa_delete(HostMapping).where(HostMapping.profile_id == profile_id))
@@ -206,10 +239,7 @@ async def delete_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
 @router.put("/profiles/{profile_id}/set-default")
 async def set_default_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
     """设为默认：同事务内先清旧默认再置新默认，保证全局恰一条 is_default"""
-    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
-    profile = result.scalar_one_or_none()
-    if not profile:
-        raise HTTPException(404, "配置方案不存在")
+    profile = await _require_profile(db, profile_id)
     from sqlalchemy import update as sa_update
     await db.execute(sa_update(ConfigProfile).where(ConfigProfile.is_default == True).values(is_default=False))
     profile.is_default = True
@@ -224,10 +254,7 @@ async def issue_profile_subscription_token(profile_id: int, db: AsyncSession = D
     管理会话 + CSRF 边界内；明文只在本次响应出现一次，库中仅存 SHA-256
     哈希。再次调用即轮换，旧订阅 URL 立即失效。
     """
-    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
-    profile = result.scalar_one_or_none()
-    if not profile:
-        raise HTTPException(404, "配置方案不存在")
+    profile = await _require_profile(db, profile_id)
     plain, token_hash = issue_profile_token()
     profile.subscription_token_hash = token_hash
     await db.commit()
@@ -364,6 +391,7 @@ async def export_config(profile_id: int, data: ExportRequest,
             status_code=400,
             detail='缺少确认参数：请求体需包含 {"confirm": true}',
         )
+    await _require_profile(db, profile_id)
     content = await generate_surge_config(db, profile_id, None)
     paths = resolve_runtime_paths()
     refresh_runtime_permissions(paths)

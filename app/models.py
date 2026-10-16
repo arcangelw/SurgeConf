@@ -72,6 +72,12 @@ class ConfigProfile(Base):
     name = Column(String(100), nullable=False, unique=True, comment="配置名称")
     description = Column(Text, nullable=True, comment="配置描述")
     is_default = Column(Boolean, default=False, comment="是否为默认配置")
+    target = Column(String(20), nullable=False, default="mac_workstation",
+                    server_default="mac_workstation",
+                    comment="目标设备: mac_workstation/mac_gateway/ios_mobile")
+    udp_security_mode = Column(String(20), nullable=False, default="scoped",
+                               server_default="scoped",
+                               comment="UDP 安全模式: strict/scoped/compatible（iOS 不允许 scoped）")
     locale = Column(String(10), default="zh", comment="语言: zh/en")
     final_action = Column(String(100), default="手动选择", comment="兜底规则策略: 手动选择/自动选择/代理/大陆直连等")
     general = Column(JSON, default=dict, comment="General段自定义配置")

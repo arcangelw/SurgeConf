@@ -37,11 +37,12 @@ def create_current_schema_database(path: Path) -> Path:
     engine = sqlalchemy.create_engine(f"sqlite:///{path}")
     tables = [t for t in Base.metadata.sorted_tables if t.name != "data_migration_records"]
     Base.metadata.create_all(engine, tables=tables)
-    # 合成 pre-Alembic 基线：剔除 0002 之后新增的列（真实旧库没有它们）
+    # 合成 pre-Alembic 基线：剔除基线之后各 revision 新增的列（真实旧库没有它们）
+    post_baseline = {col for delta in database_migration.SCHEMA_REVISION_DELTAS.values()
+                     for col in delta}
     with engine.begin() as conn:
-        conn.exec_driver_sql(
-            "ALTER TABLE config_profiles DROP COLUMN subscription_token_hash")
-    engine.dispose()
+        for table, column in sorted(post_baseline):
+            conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN {column}")
     return path
 
 

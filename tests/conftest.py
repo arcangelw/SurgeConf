@@ -40,6 +40,7 @@ async def db():
         session.add(ConfigProfile(
             name="默认配置", is_default=True, locale="zh",
             final_action="兜底", general=dict(DEFAULT_GENERAL),
+            target="mac_workstation", udp_security_mode="scoped",
         ))
         for r in DEFAULT_PRE_RULES[:3]:
             session.add(CustomRule(**r))

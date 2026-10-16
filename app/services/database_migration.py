@@ -114,6 +114,8 @@ _BASELINE_TABLE_COLUMNS: dict[str, set[str]] = {
 # **新增 revision 时唯一需要更新的地方**；测试强制 head 指纹与 Base.metadata 一致。
 SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
     "0002_profile_subscription_tokens": {("config_profiles", "subscription_token_hash")},
+    "0003_profile_targets": {("config_profiles", "target"),
+                             ("config_profiles", "udp_security_mode")},
 }
 
 # 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建

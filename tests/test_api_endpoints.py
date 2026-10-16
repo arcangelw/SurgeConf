@@ -257,10 +257,130 @@ async def test_profiles_list_and_detail_contract(client):
     data = (await client.get("/api/configs/profiles")).json()
     assert data
     assert set(data[0]) == {"id", "name", "description", "is_default", "locale",
-                            "token_configured"}
+                            "target", "token_configured"}
     assert data[0]["token_configured"] is False  # 未生成过 token 的档案
 
     detail = (await client.get("/api/configs/profiles/1")).json()
     assert detail["general"] and "mitm" in detail
     assert detail["mitm"]["ca-passphrase"] == {"configured": False}
     assert detail["mitm"]["ca-p12"] == {"configured": False}
+
+
+# ===== 目标感知档案：target / udp_security_mode CRUD 边界 =====
+
+
+async def _detail(client, profile_id: int) -> dict:
+    resp = await client.get(f"/api/configs/profiles/{profile_id}")
+    assert resp.status_code == 200
+    return resp.json()
+
+
+async def _create(client, name: str, **extra) -> int:
+    resp = await client.post("/api/configs/profiles", json={"name": name, **extra})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_create_profile_fills_mode_by_target_default(client):
+    """创建未传模式：mac_workstation→scoped，ios_mobile→compatible"""
+    mac = await _detail(client, await _create(client, "mac档"))
+    assert mac["target"] == "mac_workstation"
+    assert mac["udp_security_mode"] == "scoped"
+
+    ios = await _detail(client, await _create(client, "iOS档", target="ios_mobile"))
+    assert ios["target"] == "ios_mobile"
+    assert ios["udp_security_mode"] == "compatible"
+
+
+@pytest.mark.asyncio
+async def test_create_profile_rejects_ios_scoped_without_commit(client):
+    """ios_mobile+scoped 创建：422 且不产生任何新档案（事务未提交）"""
+    before = (await client.get("/api/configs/profiles")).json()
+    resp = await client.post("/api/configs/profiles", json={
+        "name": "坏组合", "target": "ios_mobile", "udp_security_mode": "scoped"})
+    assert resp.status_code == 422
+    after = (await client.get("/api/configs/profiles")).json()
+    assert [p["name"] for p in after] == [p["name"] for p in before]
+
+
+@pytest.mark.asyncio
+async def test_create_profile_unknown_target_is_422(client):
+    """未知目标值由 Pydantic 枚举在进入服务前拒绝"""
+    resp = await client.post("/api/configs/profiles",
+                             json={"name": "烤面包机", "target": "linux_toaster"})
+    assert resp.status_code == 422
+    assert "linux_toaster" not in {p["name"] for p in
+                                   (await client.get("/api/configs/profiles")).json()}
+
+
+@pytest.mark.asyncio
+async def test_update_target_without_mode_resets_default(client):
+    """只换目标不传模式：模式随新目标重置（mac→ios 变 compatible，再回 mac 变 scoped）"""
+    pid = await _create(client, "迁移档")
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"target": "ios_mobile"})
+    assert resp.status_code == 200
+    detail = await _detail(client, pid)
+    assert detail["target"] == "ios_mobile"
+    assert detail["udp_security_mode"] == "compatible"
+
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"target": "mac_gateway"})
+    assert resp.status_code == 200
+    detail = await _detail(client, pid)
+    assert detail["target"] == "mac_gateway"
+    assert detail["udp_security_mode"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_update_target_and_mode_validated_together(client):
+    """同时提供不兼容组合：422 且原值原样保留"""
+    pid = await _create(client, "组合档")
+    resp = await client.put(f"/api/configs/profiles/{pid}",
+                            json={"target": "ios_mobile", "udp_security_mode": "scoped"})
+    assert resp.status_code == 422
+    detail = await _detail(client, pid)
+    assert detail["target"] == "mac_workstation"
+    assert detail["udp_security_mode"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_update_mode_validated_against_current_target(client):
+    """只换模式：与档案现存目标组合校验；合法值正常保存"""
+    pid = await _create(client, "iOS严格档", target="ios_mobile")
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"udp_security_mode": "scoped"})
+    assert resp.status_code == 422
+    assert (await _detail(client, pid))["udp_security_mode"] == "compatible"
+
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"udp_security_mode": "strict"})
+    assert resp.status_code == 200
+    assert (await _detail(client, pid))["udp_security_mode"] == "strict"
+
+
+@pytest.mark.asyncio
+async def test_update_unrelated_field_keeps_target_fields(client):
+    """未提供 target/mode 的部分更新（区分“未提供”与显式值）：目标字段不动"""
+    pid = await _create(client, "改名档", target="mac_gateway",
+                        udp_security_mode="strict")
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"name": "改名档2"})
+    assert resp.status_code == 200
+    detail = await _detail(client, pid)
+    assert detail["name"] == "改名档2"
+    assert detail["target"] == "mac_gateway"
+    assert detail["udp_security_mode"] == "strict"
+
+
+@pytest.mark.asyncio
+async def test_missing_profile_id_never_falls_back_to_default(client):
+    """显式 id 不存在：404，默认档案不受任何影响（无隐式回退）"""
+    default_before = await _detail(client, 1)
+    resp = await client.put("/api/configs/profiles/9999", json={"name": "幽灵档案"})
+    assert resp.status_code == 404
+    assert (await client.get("/api/configs/profiles/9999")).status_code == 404
+    assert await _detail(client, 1) == default_before
+
+
+@pytest.mark.asyncio
+async def test_export_missing_profile_is_404(client):
+    """导出不存在的档案：404（显式 id 解析，不回退默认档案）"""
+    resp = await client.post("/api/configs/profiles/9999/exports", json={"confirm": True})
+    assert resp.status_code == 404
