@@ -157,6 +157,10 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 
 实例角色（设置页 → 访问控制）决定**新建档案省略目标时的默认值**（工作电脑 → Mac 工作站，家庭网关 → Mac 网关），不改写已有档案，也不是 Surge 网关（Gateway VM）开关。General 字段按目标裁剪：iOS 产物不含 Mac-only 键，网关强制仅本网段访问。两实例部署、能力矩阵、UDP 阶段边界与 Token 安全详见 [docs/PROFILE_TARGETS.md](docs/PROFILE_TARGETS.md)（管理界面内可经设置页「打开运行指南」链接访问，路径 `/guide/profile-targets`）。
 
+### UDP 安全模式
+
+每个档案另携带一个 UDP 安全模式（`strict` / `scoped` / `compatible`，配置方案 → UDP 安全页签）：`strict` 阻断受管 STUN 流量；`scoped`（Mac 默认）先放行已配置的例外（工作站按进程名、网关按设备 MAC），再注入同样的 STUN 防护；`compatible`（iOS 默认）不注入任何托管防护以获得最佳 UDP 兼容。托管 STUN 规则由生成器按模式动态注入，不落库；`ios_mobile + scoped` 组合会被拒绝。例外匹配值在界面与 API 中始终脱敏显示。详见 [docs/UDP_COMPATIBILITY.md](docs/UDP_COMPATIBILITY.md)（含 Surge 客户端侧 Gateway VM / Fast Path 的边界与排障）。
+
 ### launchd 配置持久化
 
 `enable`/`start`/`restart` 统一走唯一安装流程：卸载已加载任务 → 按当前配置重新生成 plist → 加载并确认成功（任一步失败都会如实报错）。旧 plist 的 `0.0.0.0` 监听、仓库日志路径等遗留字段在每次安装时都会被重写。
@@ -170,6 +174,16 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 | `SURGE_HOST= ./surgeconf.sh enable`（显式空） | 清除该键，回到安全默认 `127.0.0.1` |
 
 `SURGE_HOST`/`SURGE_PORT`/`SURGECONF_DATA_DIR` 会写入 plist 的 `EnvironmentVariables`（用于定位运行目录）；控制器凭据 `SURGE_CONTROLLER_ACCESS`/`SURGE_HTTP_API` 只保存在 0600 的 launchd.env 中，绝不写入 plist。plist 本身权限 0600 并设置 `Umask 63`（即八进制 077），所有路径与值经 XML 转义并拒绝控制字符。
+
+### 升级与运行数据
+
+```bash
+cd <SurgeConf 目录> && git pull && ./surgeconf.sh restart   # 迁移幂等、静默执行
+```
+
+- 升级后的逐项验证（数据迁移、产物断言、三平台 UDP 验收清单）见 [docs/MIGRATION_VERIFY.md](docs/MIGRATION_VERIFY.md)；多设备部署照此指南在各设备执行。
+- 数据库与备份位于 `SURGECONF_DATA_DIR`（默认 `~/Library/Application Support/SurgeConf`），日志在 `~/Library/Logs/SurgeConf/surgeconf.log`；仓库目录不存放任何运行数据。
+- 三平台物理设备（Mac 工作站 / 家庭网关 / Surge iOS 5.14.6）的加载与观察属人工验收步骤，以 MIGRATION_VERIFY 清单为准记录结论。
 
 ---
 

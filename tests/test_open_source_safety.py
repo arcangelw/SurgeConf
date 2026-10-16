@@ -3,7 +3,9 @@
 - ``DEFAULT_GENERAL`` 不得包含静态控制器凭据键；
 - 全仓库（tracked + untracked non-ignored）UTF-8 文本不得包含真实用户
   目录、私钥块、疑似凭据赋值、非白名单 RFC1918 地址（含 CIDR）或
-  非白名单 MAC 地址；
+  非白名单 MAC 地址；失败消息只报 ``(文件, 规则类别)``；
+- UDP / 迁移 / README / 目标设备四篇文档必须处于扫描范围
+  （``TestDocumentCoverage`` 防改名或 .gitignore 导致的静默缩水）；
 - 命中只报告 ``(路径, 规则号)``，绝不回显疑似秘密内容；
 - 豁免按 ``(文件, 规则号) -> 文件 SHA-256`` 精确锁定：被豁免文件发生
   任何改动都会使摘要失配而重新报警（可审计），不做整文件跳过；
@@ -84,6 +86,13 @@ R_MAC = Rule(
 
 FORBIDDEN = [R_USERS, R_PEM, R_SECRET_ASSIGN, R_CTRL_ENV_ASSIGN,
              R_CTRL_KEY_ASSIGN, R_RFC1918, R_MAC]
+# 与 FORBIDDEN 索引对齐的规则类别名：失败消息只报 (文件, 类别)，
+# 绝不回显命中内容
+RULE_CATEGORIES = (
+    "user-directory", "pem-private-key", "secret-assignment",
+    "controller-env-assignment", "controller-key-assignment",
+    "rfc1918-address", "mac-address",
+)
 
 # (相对路径, 规则号) -> 该文件当前 SHA-256。
 # 仅豁免「指定规则」，文件内其他规则仍扫描；文件一旦变更，
@@ -159,7 +168,9 @@ def test_default_general_has_no_static_controller_credentials():
 
 def test_repository_text_has_no_machine_or_secret_material(repo_text_files):
     violations = scan_files(repo_text_files, FORBIDDEN)
-    assert violations == []
+    assert violations == [], "; ".join(
+        f"{name} 触发安全规则类别 {RULE_CATEGORIES[rule_id - 1]}"
+        for name, rule_id in violations)
 
 
 def test_exemptions_reference_existing_files_and_shas():
@@ -231,3 +242,58 @@ class TestRuleSemantics:
         assert self._ok(R_MAC, "12:34:56 sha256 abcdef 2026-10-16 fe80::1")
         # 六组两位点分不是标准 MAC 格式，不构成匹配
         assert self._ok(R_MAC, "02.00.00.00.00.01")
+
+    def test_real_user_directories_reported(self):
+        # 绝对用户目录报告；分段构造避免测试文件自命中
+        assert not self._ok(R_USERS, "备份在 " + "/Us" + "ers/alice/Documents/")
+        assert not self._ok(R_USERS, "cat " + "/Us" + "ers/Bob/Library/foo")
+
+    def test_tilde_home_paths_not_reported(self):
+        # 规范的 ~ 展开写法与本文档占位路径不误判（非绝对 /Users/ 形式）
+        assert self._ok(R_USERS, "~/Library/Application Support/SurgeConf")
+        assert self._ok(R_USERS, "$HOME/Library/Application Support/SurgeConf")
+        assert self._ok(R_USERS, "数据目录（默认 `~/Library/Application Support/SurgeConf`）")
+
+    def test_secret_assignment_forms_reported(self):
+        # ca-p12 / 旧 API token 键的真实值赋值（分段构造避免自命中）
+        assert not self._ok(R_SECRET_ASSIGN, "ca-" + "p12 = MIIxyZ==")
+        assert not self._ok(R_SECRET_ASSIGN, "SURGE_" + "API_TOKEN=live-token-value")
+
+    def test_controller_env_and_key_assignments_reported(self):
+        # 环境变量与 General 键的凭据赋值报告；example- 占位与空值不报告
+        assert not self._ok(R_CTRL_ENV_ASSIGN, "SURGE_" + "HTTP_API=real-key@lan:6166")
+        assert not self._ok(R_CTRL_KEY_ASSIGN, "http" + "-api = real-key@127.0.0.1:6166")
+        assert self._ok(R_CTRL_KEY_ASSIGN, "http" + "-api = example-key@127.0.0.1:6166")
+
+    def test_documentation_placeholders_not_reported(self):
+        # UDP / 迁移文档使用的规范占位符全部不误判
+        assert self._ok(R_MAC, "AND,((MAC-ADDRESS,02:00:00:00:00:01),(PROTOCOL,UDP)),DIRECT")
+        assert self._ok(R_RFC1918, "server:192.0.2.10 peer 198.51.100.20 nat 203.0.113.9")
+        assert self._ok(R_USERS, "ExampleVideo example.com ExampleNode-HK")
+
+
+class TestDocumentCoverage:
+    """UDP / 迁移 / README 文档必须处于仓库扫描范围内且内容干净。
+
+    防两类静默失效：文档被重命名或加入 .gitignore 后脱离
+    ``git ls-files`` 枚举（扫描范围缩水），或文档新增真实
+    MAC / 私网地址 / 用户目录 / 凭据而主扫描未及发现。
+    """
+
+    REQUIRED_DOCS = (
+        "README.md",
+        "docs/UDP_COMPATIBILITY.md",
+        "docs/MIGRATION_VERIFY.md",
+        "docs/PROFILE_TARGETS.md",
+    )
+
+    def test_required_docs_in_scan_scope(self, repo_text_files):
+        missing = [d for d in self.REQUIRED_DOCS if d not in repo_text_files]
+        assert missing == [], f"文档脱离扫描范围（改名/被忽略？）: {missing}"
+
+    def test_required_docs_clean(self, repo_text_files):
+        violations = scan_files(
+            [d for d in self.REQUIRED_DOCS if d in repo_text_files], FORBIDDEN)
+        assert violations == [], "; ".join(
+            f"{name} 触发安全规则类别 {RULE_CATEGORIES[rule_id - 1]}"
+            for name, rule_id in violations)
