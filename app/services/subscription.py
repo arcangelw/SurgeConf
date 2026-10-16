@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, text as sa_text
 
 from app.models import Subscription, ProxyNode
 from app.services.node_identity import stable_node_key, NodeIdentityError
@@ -476,12 +476,16 @@ async def _record_failed_attempt(db: AsyncSession, sub_id: int,
     exists=False（调用方转 404/跳过，不泄漏）；本事务自身失败仅记录
     错误码并保守返回 exists=True。
 
-    scheduled_next（调度模式）：同一写事务内重查并原子校验仍
-    enabled+auto、next==expected 且对 now 仍到期；不满足返回
+    scheduled_next（调度模式）：BEGIN IMMEDIATE 写事务内重查并原子校验
+    仍 enabled+auto、next==expected 且对 now 仍到期；不满足返回
     skipped=True（绝不改 attempt/error/next，调用方转 SCHEDULE_SKIPPED）。
-    校验与写入依赖同一事务内的 SQLite 写锁串行化（无先查后另事务写）。
+    校验与写入在同一写锁事务内串行化（无先查后另事务写）。
     """
     try:
+        # 显式写事务：guard SELECT 与状态 DML 之间不允许并发排期写入
+        # 穿透（aiosqlite legacy 事务下 SELECT 不获写锁）；BEGIN
+        # IMMEDIATE 先取 SQLite 写锁，guard 重查与 UPDATE 同事务串行化
+        await db.execute(sa_text("BEGIN IMMEDIATE"))
         # populate_existing：绕过 identity map 缓存，读到并发修改后的最新值
         sub = (await db.execute(
             select(Subscription).where(Subscription.id == sub_id)
@@ -601,8 +605,10 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
                  else last_node_count)
         return SyncResult(sub_id, False, count, 0, 0, 0, code, message)
 
-    # 阶段 3：单一写事务 upsert
+    # 阶段 3：单一写事务 upsert（先取 SQLite 写锁，guard/URL 校验与
+    # 节点 DML 在同一串行化写事务内，杜绝校验-写入间隙的排期穿透）
     try:
+        await db.execute(sa_text("BEGIN IMMEDIATE"))
         # populate_existing：绕过 identity map 缓存，URL 竞态检测取真实最新值
         sub = (await db.execute(
             select(Subscription).where(Subscription.id == sub_id)

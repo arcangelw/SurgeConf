@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete as sa_delete, select as sa_select
+from sqlalchemy import delete as sa_delete, select as sa_select, update as sa_update
 
 import app.services.subscription as subscription_service
 from app.database import Base, DatabaseRuntime
@@ -729,3 +729,109 @@ async def test_scheduled_url_only_change_keeps_stale_url_failure(
     assert sub.last_error_code == "internal_error"
     assert sub.next_update_at == UTC_NOW_NAIVE + timedelta(seconds=900)
     assert [n.name for n in nodes] == ["Keep"], "旧拉取结果不得写入"
+
+
+# ===== 写锁串行化：guard 与 DML 之间无排期穿透（Fix Round 3） =====
+
+
+@pytest.mark.asyncio
+async def test_failure_record_waits_for_held_write_lock_then_skips(
+        sched_db, tmp_path, monkeypatch):
+    """失败记录窗口：另一 session 持写锁更新排期未提交——sync 的失败
+    状态事务 BEGIN IMMEDIATE 排队等待（pending 断言，未并行穿透）；
+    用户提交后失败记录获锁、守卫看到新排期 → skip，绝不写状态"""
+    import httpx as httpx_mod
+    from sqlalchemy import text as sa_text
+
+    sub_id = await add_subscription(sched_db, next_update_at=UTC_NOW_NAIVE)
+    far = UTC_NOW_NAIVE + timedelta(days=7)
+
+    async def timeout_fetch(url):
+        raise httpx_mod.TimeoutException("synthetic timeout")
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", timeout_fetch)
+    scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                               clock=lambda: UTC_NOW)
+
+    # 用户事务：先持 SQLite 写锁、更新排期但不提交
+    async with sched_db.session_factory() as holder:
+        await holder.execute(sa_text("BEGIN IMMEDIATE"))
+        await holder.execute(sa_update(Subscription)
+                             .where(Subscription.id == sub_id)
+                             .values(next_update_at=far))
+        sync_task = asyncio.create_task(scheduler.run_due_once())
+        await asyncio.sleep(0.3)
+        assert not sync_task.done(), "失败状态事务应被写锁挡住（排队等待）"
+        await holder.commit()  # 用户先提交（新排期生效）
+
+    results = await asyncio.wait_for(sync_task, 5)
+    assert results == [], "用户已提交新排期，守卫应跳过"
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+    assert sub.last_attempt_at is None, "排队获锁后守卫跳过：不写 attempt"
+    assert sub.last_error_code is None
+    assert sub.next_update_at == far
+
+
+@pytest.mark.asyncio
+async def test_success_phase3_write_lock_blocks_concurrent_reschedule(
+        sched_db, tmp_path, monkeypatch):
+    """成功 phase3 窗口：sync BEGIN IMMEDIATE 持锁后发起的并发排期更新
+    被写锁挡住（不穿透、guard 不误判），sync 正常提交 500 节点；随后
+    用户更新获锁提交，最终排期为用户值（用户更新最终胜出）"""
+    from sqlalchemy import event as sa_event, text as sa_text
+
+    from app.models import ProxyNode
+    sub_id = await add_subscription(sched_db, next_update_at=UTC_NOW_NAIVE)
+    user_value = UTC_NOW_NAIVE + timedelta(seconds=7200)
+    user_done = asyncio.Event()
+    fired = {"lock_seen": False}
+
+    # 500 个全新连接身份：拉长 phase3 持锁窗口（500 次 INSERT 往返）
+    bulk = [{"name": f"Bulk{i}", "node_type": "trojan", "server": f"10.0.{i // 250}.{i % 250}",
+             "port": 443,
+             "config": f"Bulk{i} = trojan, 10.0.{i // 250}.{i % 250}, 443, password=p"}
+            for i in range(500)]
+
+    async def user_update():
+        async with sched_db.session_factory() as db:
+            await db.execute(sa_update(Subscription)
+                             .where(Subscription.id == sub_id)
+                             .values(update_interval=7200, next_update_at=user_value))
+            await db.commit()
+        user_done.set()
+
+    def on_before_cursor(conn, cursor, statement, params, context, executemany):
+        # sync 的写事务首条语句：此刻发起用户更新——它只能在本语句
+        # （已在 db 线程队列头）获锁之后到达 SQLite，必然排队等待
+        if (not fired["lock_seen"]
+                and statement.strip().upper().startswith("BEGIN IMMEDIATE")):
+            fired["lock_seen"] = True
+            asyncio.get_running_loop().create_task(user_update())
+
+    sa_event.listen(sched_db.engine.sync_engine, "before_cursor_execute",
+                    on_before_cursor)
+
+    async def bulk_fetch(url):
+        return bulk
+
+    try:
+        monkeypatch.setattr(subscription_service, "fetch_subscription", bulk_fetch)
+        scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                                   clock=lambda: UTC_NOW)
+        results = await asyncio.wait_for(scheduler.run_due_once(), timeout=30)
+    finally:
+        sa_event.remove(sched_db.engine.sync_engine, "before_cursor_execute",
+                        on_before_cursor)
+
+    assert fired["lock_seen"], "测试未观察到写锁获取点"
+    # sync 持锁完成全部 upsert：若用户更新曾穿透提交，guard 会转 skip
+    assert [(r.success, r.node_count) for r in results] == [(True, 500)]
+    await asyncio.wait_for(user_done.wait(), timeout=10)
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+        count = (await db.execute(
+            sa_select(ProxyNode).where(ProxyNode.subscription_id == sub_id))
+        ).scalars().all()
+    assert len(count) == 500
+    assert sub.next_update_at == user_value, "用户更新最终胜出（未被 sync 覆盖）"
