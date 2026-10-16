@@ -18,8 +18,10 @@
 """
 
 import hashlib
+import os
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -301,68 +303,50 @@ class TestDocumentCoverage:
             for name, rule_id in violations)
 
 
-# 与 docs/RUNTIME_OPERATIONS.md 第 3 节两个 reload 代码块逐字同步的标准
-# 形态（结构性对照样例：这类「子 shell 内 unset→隐藏 read→stdin header
-# curl→捕获 rc→unset→exit rc」写法必须始终通过下方扫描器，防止规则
-# 收紧时误伤合法示例；文档块更新时同步此处）。
-_TRUSTED_KEYCHAIN_RELOAD_BLOCK = """\\
-  (                                # 子 shell：块内 exit 不退出当前交互 shell
-    unset KEY                      # 先清防继承已 export 的旧值
-    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
-    printf 'X-Key: %s\\n' "$KEY" | curl -sS -X POST --header @- \\
-      https://127.0.0.1:6171/v1/profiles/reload
-    rc=$?                          # 捕获 curl 退出码后再清理
-    unset KEY                      # 用完即清
-    exit "$rc"                     # curl 结果带回当前 shell 的 $?
-  )"""
-
-_CACERT_FALLBACK_RELOAD_BLOCK = """\\
-  (                                # 自包含：不依赖上一块，可单独复制执行
-    unset KEY CA_FILE              # 先清防继承已 export 的旧值
-    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
-    read -r CA_FILE                # 输入本机真实的 CA 文件路径
-    [ -f "$CA_FILE" ] || { echo "CA 文件不存在或不是普通文件" >&2; \\
-      unset KEY CA_FILE; exit 1; } # 验证失败同样清理 KEY/CA_FILE 再退出
-    printf 'X-Key: %s\\n' "$KEY" | curl -sS -X POST --header @- \\
-      --cacert "$CA_FILE" \\
-      https://127.0.0.1:6171/v1/profiles/reload
-    rc=$?                          # 捕获 curl 退出码后再清理
-    unset KEY CA_FILE              # 用完即清
-    exit "$rc"                     # curl 结果带回当前 shell 的 $?
-  )"""
-
 
 class TestHttpApiExampleSafety:
-    """Surge HTTP API / curl 示例片段的结构性安全约束（Fix Round 4）。
+    """Surge HTTP API / curl 示例片段的结构性安全约束（Fix Round 5）。
 
     解析 markdown 的 shell 类 fenced 代码块（bash/sh/shell/zsh，info
     string 大小写归一），行尾反斜杠续行拼接为完整逻辑命令，再用
-    ``shlex.shlex(..., punctuation_chars="|&;()<>")`` 分词——无空格的
-    ``|`` / ``&&`` / ``;`` 同样成为独立命令边界。对逻辑命令中的
-    **每一个** curl 命令段（含 ``/usr/bin/curl`` 等绝对路径形式、
-    一行多个 curl）独立检测：
+    ``shlex.shlex(..., punctuation_chars="|&;()<>")`` 分词。对逻辑
+    命令中的**每一个** curl 命令段（含 ``/usr/bin/curl`` 等绝对路径
+    形式、一行多个 curl）独立检测：
 
-    - TLS：``--insecure``、独立 ``-k``、含 k 的组合短选项（``-sk`` /
-      ``-fsSk``）；``--header`` / ``--cacert`` 等长选项与 ``-H<值>``
-      附着形式（含 ``:`` 或空格）天然不匹配短选项模式；
-    - X-Key argv：``-H 值`` / ``--header 值`` / ``-H值`` /
-      ``--header=值`` 四种形式携带 X-Key 头（头名大小写不敏感）一律
-      拒绝；唯一放行 stdin 形式 ``@-``；任何 ``@文件`` 头来源（防
-      临时 secret 文件）也拒绝；
+    - 命令边界只认真正控制运算符（``|`` / ``||`` / ``|&`` / ``&`` /
+      ``&&`` / ``;`` / ``;;`` / ``(`` / ``)``）；``<`` / ``>`` 等
+      重定向**不是**边界、不截断 curl 段；
+    - 重定向 fail-closed：curl 段内任何含 ``<`` / ``>`` 的 token 一律
+      报 ``curl-redirect``（不回显内容）——避免重定向位置截断段与
+      复杂重定向语义（``>&`` / 进程替换等）绕过；合法示例无需
+      curl 重定向；
+    - TLS：``--insecure`` 与按 curl 语义展开的组合短选项中位于 H
+      之前的 ``k``（``-sk`` / ``-fsSk``；``-sHk`` 的 k 属于 header
+      值，不误报）；
+    - X-Key argv：``-H`` / ``--header`` 的分离值、``--header=值``、
+      以及组合短选项中 H 的附着值（``-sSHX-Key:secret``）或下一
+      token 值（``-sSH 'X-Key: …'``）——头名大小写不敏感，一律
+      拒绝；唯一放行 stdin 形式 ``@-``；任何 ``@文件`` 头来源
+      （含 ``-sSH@secret``）也拒绝；
     - 6171：curl 任一 arg（含 ``--url`` 值与位置 URL）出现明文
-      ``http://`` 即拒绝。
+      ``http://`` 即拒绝（scheme 大小写不敏感，``HTTP://`` 同样命中）。
 
     失败消息只含 ``(文件, 规则类别)``，绝不回显命令或 header 内容；
     检测结构行为，不绑定具体措辞。
     """
 
     SHELL_LANGS = frozenset({"bash", "sh", "shell", "zsh"})
-    _PUNCT = frozenset("|&;()<>")
+    # 真正的 shell 控制运算符字符集：| || |& & && ; ;; ( )。
+    # < > 属于重定向而非命令边界——绝不当边界截断 curl 段。
+    _CONTROL = frozenset("|;&()")
 
     RULE_INSECURE = "insecure-curl"
     RULE_KEY_ARGV = "x-key-argv"
     RULE_HEADER_FILE = "header-from-file"
     RULE_PLAINTEXT_HTTP = "6171-plaintext-http"
+    # fail-closed：curl 命令段内任何 shell 重定向（< > 及其组合）一律报告，
+    # 避免重定向边界截断/复杂重定向语义绕过；合法示例不需要 curl 重定向
+    RULE_CURL_REDIRECT = "curl-redirect"
 
     # ===== 注入矩阵：每类常见绕过写法必须命中对应规则（红） =====
     # (fenced 语言, 块内容, 期望命中的规则类别)；语言覆盖大小写与
@@ -415,6 +399,42 @@ class TestHttpApiExampleSafety:
             'curl -sS --url http://127.0.0.1:6171/v1/profiles/reload',
             RULE_PLAINTEXT_HTTP,
             id="plain-http-via-url-option"),
+        pytest.param(
+            "bash",
+            'curl >/dev/null -k https://127.0.0.1:6171/v1/profiles/reload',
+            RULE_CURL_REDIRECT,
+            id="curl-redirect-inside-segment"),
+        pytest.param(
+            "bash",
+            'curl >/dev/null -k https://127.0.0.1:6171/v1/profiles/reload',
+            RULE_INSECURE,
+            id="curl-redirect-does-not-truncate-insecure"),
+        pytest.param(
+            "bash",
+            "curl -sSH 'X-Key: secret' "
+            "https://127.0.0.1:6171/v1/profiles/reload",
+            RULE_KEY_ARGV,
+            id="combined-short-h-separated-value"),
+        pytest.param(
+            "bash",
+            "curl -sSHX-Key:secret https://127.0.0.1:6171/v1/profiles/reload",
+            RULE_KEY_ARGV,
+            id="combined-short-h-attached-value"),
+        pytest.param(
+            "bash",
+            "curl -sSH@secret https://127.0.0.1:6171/v1/profiles/reload",
+            RULE_HEADER_FILE,
+            id="combined-short-h-attached-file"),
+        pytest.param(
+            "bash",
+            "curl -sS HTTP://127.0.0.1:6171/v1/profiles/reload",
+            RULE_PLAINTEXT_HTTP,
+            id="uppercase-scheme-positional-url"),
+        pytest.param(
+            "sh",
+            "curl -sS --url HTTP://127.0.0.1:6171/v1/profiles/reload",
+            RULE_PLAINTEXT_HTTP,
+            id="uppercase-scheme-url-option"),
     ]
 
     @classmethod
@@ -473,11 +493,14 @@ class TestHttpApiExampleSafety:
 
     @classmethod
     def _is_boundary(cls, token):
-        return bool(token) and all(c in cls._PUNCT for c in token)
+        """仅真正控制运算符（|/||/&/&&/;/;;/(/)）是命令边界。
+        重定向 token（>/>>/</&>/>& 等）含 < 或 >，不满足全字符
+        校验，既不当边界也不丢弃——留在段内由 fail-closed 规则报告。"""
+        return bool(token) and all(c in cls._CONTROL for c in token)
 
     @classmethod
     def _curl_segments(cls, tokens):
-        """逻辑命令中**每一个** curl 命令段的 argv（管道/&&/; 等边界
+        """逻辑命令中**每一个** curl 命令段的 argv（控制运算符边界
         截断；一行多个 curl 各自独立）。"""
         segments = []
         argv = None
@@ -499,28 +522,58 @@ class TestHttpApiExampleSafety:
         return segments
 
     @staticmethod
-    def _is_insecure_flag(token: str) -> bool:
-        if token in ("--insecure", "-k"):
-            return True
-        # 组合短选项：单 - 后纯字母且含 k（-sk / -fsSk 等）；
-        # --header/--cacert 等长选项与 -H<值> 附着（含 : 或空格）不匹配
-        return bool(re.fullmatch(r"-[a-zA-Z]*k[a-zA-Z]*", token))
+    def _is_short_cluster(token: str) -> bool:
+        """curl 组合短选项簇：``-`` 后以字母开头（``-sk`` / ``-sSH值``）；
+        长选项（``--`` 开头）、负数与其他附着形式不匹配。"""
+        return (token.startswith("-") and not token.startswith("--")
+                and len(token) > 1 and token[1].isalpha())
 
     @staticmethod
-    def _header_values(argv):
-        """argv 中 -H/--header 的全部值（分离 / 附着 / = 三类形式）。"""
+    def _expand_shorts(token: str):
+        """按 curl 语义展开短选项簇，返回 ``(H 前的标志字母, H 附着值,
+        是否含 H)``。curl 规则：短字母可连写；遇到带参选项 H 时，
+        其后剩余字符整体是 H 的参数（``-sHk`` 即 header 值 ``k``），
+        因此 H 之后的字母（含 k）属于 header 值，不是独立标志。"""
+        body = token[1:]
+        idx = body.find("H")
+        if idx == -1:
+            return body, "", False
+        return body[:idx], body[idx + 1:], True
+
+    @classmethod
+    def _is_insecure_flag(cls, token: str) -> bool:
+        if token == "--insecure":
+            return True
+        if not cls._is_short_cluster(token):
+            return False
+        letters, _attached, _has_h = cls._expand_shorts(token)
+        return "k" in letters
+
+    @classmethod
+    def _header_values(cls, argv):
+        """argv 中 -H/--header 的全部 header 值。
+
+        覆盖四类形式：``--header 值`` 分离、``--header=值``、短选项簇
+        中 H 的附着值（``-HX-Key:v`` / ``-sSHX-Key:v``）与 H 位于簇尾
+        时的下一 token 值（``-H 值`` / ``-sSH 值``）。"""
         values = []
         i = 0
         while i < len(argv):
             tok = argv[i]
-            if tok in ("-H", "--header"):
+            if tok == "--header":
                 if i + 1 < len(argv):
                     values.append(argv[i + 1])
                     i += 1
             elif tok.startswith("--header="):
                 values.append(tok[len("--header="):])
-            elif tok.startswith("-H") and len(tok) > 2:
-                values.append(tok[2:])
+            elif cls._is_short_cluster(tok):
+                _letters, attached, has_h = cls._expand_shorts(tok)
+                if has_h:
+                    if attached:
+                        values.append(attached)
+                    elif i + 1 < len(argv):
+                        values.append(argv[i + 1])
+                        i += 1
             i += 1
         return values
 
@@ -528,6 +581,10 @@ class TestHttpApiExampleSafety:
     def _segment_violations(cls, argv):
         """单 curl 段命中的规则类别集合。"""
         found = set()
+        # fail-closed：段内任何含 < / > 的 token 视为 shell 重定向
+        # （>、>>、>&、&>、<>、进程替换等一律覆盖）。
+        if any("<" in t or ">" in t for t in argv):
+            found.add(cls.RULE_CURL_REDIRECT)
         if any(cls._is_insecure_flag(t) for t in argv):
             found.add(cls.RULE_INSECURE)
         for value in cls._header_values(argv):
@@ -536,7 +593,7 @@ class TestHttpApiExampleSafety:
                     found.add(cls.RULE_HEADER_FILE)
             elif value.split(":", 1)[0].strip().lower() == "x-key":
                 found.add(cls.RULE_KEY_ARGV)
-        joined = " ".join(argv)
+        joined = " ".join(argv).lower()
         if "6171" in joined and "http://" in joined:
             found.add(cls.RULE_PLAINTEXT_HTTP)
         return found
@@ -580,6 +637,11 @@ class TestHttpApiExampleSafety:
         assert offenders == [], (
             f"默认 http-api-tls=true 的示例端口出现明文 http://: {offenders}")
 
+    def test_no_curl_redirects_in_examples(self, repo_text_files):
+        offenders = self._repo_rule_hits(repo_text_files, self.RULE_CURL_REDIRECT)
+        assert offenders == [], (
+            f"curl 命令段内出现 shell 重定向（fail-closed）: {offenders}")
+
     @pytest.mark.parametrize("lang,block,expected_rule", INJECTIONS)
     def test_injection_matrix_is_detected(self, tmp_path, lang, block,
                                           expected_rule):
@@ -590,12 +652,216 @@ class TestHttpApiExampleSafety:
         assert (str(doc), expected_rule) in hits, (
             f"注入样例未被检出: {hits}")
 
-    def test_documented_reload_blocks_stay_clean(self, tmp_path):
-        """文档标准两块（子 shell 自包含形态）必须始终通过扫描器。"""
+    def test_documented_reload_blocks_stay_clean(self, tmp_path, reload_blocks):
+        """从实际文档提取的 reload 块必须始终通过扫描器（结构性绿）。"""
         doc = tmp_path / "canonical.md"
         doc.write_text(
-            "# canonical reload blocks\n\n```bash\n"
-            + _TRUSTED_KEYCHAIN_RELOAD_BLOCK + "\n```\n\n```bash\n"
-            + _CACERT_FALLBACK_RELOAD_BLOCK + "\n```\n",
+            "# canonical reload blocks\n"
+            + "".join(f"\n```bash\n{block}\n```\n" for block in reload_blocks),
             encoding="utf-8")
         assert self._violations([(str(doc), doc)]) == []
+
+    def test_benign_curl_forms_not_flagged(self, tmp_path):
+        """合法形态不得误报：stdin header、普通头值、组合短选项中 H
+        吞掉后续字母（curl 语义：-sHk 的 k 属于 header 值而非 -k）。"""
+        benign = [
+            "curl --fail --silent --show-error -X POST --header @- "
+            "https://127.0.0.1:6171/v1/profiles/reload",
+            "curl -H 'Accept: application/json' "
+            "https://127.0.0.1:6171/v1/profiles/reload",
+            "curl -sHk https://127.0.0.1:6171/v1/profiles/reload",
+            "curl --header=@- -fsS https://127.0.0.1:6171/v1/profiles/reload",
+        ]
+        doc = tmp_path / "benign.md"
+        doc.write_text("```bash\n" + "\n".join(benign) + "\n```\n",
+                       encoding="utf-8")
+        assert self._violations([(str(doc), doc)]) == []
+
+# ===== 从实际文档提取 reload 块的行为验证（Fix Round 5） =====
+
+RELOAD_ENDPOINT = "/v1/profiles/reload"
+
+
+@pytest.fixture(scope="module")
+def reload_blocks():
+    """从实际 ``docs/RUNTIME_OPERATIONS.md`` 提取包含 reload 端点的
+    shell fenced 块（原始行）。按「shell 块 + 端点路径」结构性定位，
+    不复制文档全文常量：文档块更新后测试自动跟随真实内容。"""
+    doc = PROJECT_ROOT / "docs" / "RUNTIME_OPERATIONS.md"
+    blocks = []
+    current = None
+    for raw in doc.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if current is None:
+            if stripped.startswith("```") and len(stripped) > 3:
+                info = stripped[3:].split()
+                if info and info[0].lower() in TestHttpApiExampleSafety.SHELL_LANGS:
+                    current = []
+            continue
+        if stripped.startswith("```"):
+            if any(RELOAD_ENDPOINT in line for line in current):
+                blocks.append("\n".join(current))
+            current = None
+            continue
+        current.append(raw)
+    return blocks
+
+
+class TestDocumentedReloadBlocks:
+    """真实执行文档 reload 块（假 curl 经 PATH 注入）：key 经 header
+    stdin 到达且 argv 无 secret、curl 退出码（含模拟 HTTP 失败码）传播、
+    空 key / read EOF 不发起请求、备用 CA 有效/无效行为、块内 exit 不
+    退出父 shell 且父变量不受影响。bash 必测；zsh 存在时同矩阵执行。"""
+
+    SECRET = "sk-test-1234567890abcdef"
+    SHELLS = ["bash"] + (["zsh"] if shutil.which("zsh") else [])
+
+    @staticmethod
+    def _needs_ca(block):
+        return "CA_FILE" in block
+
+    def _stdin_lines(self, block, key, ca_path=None):
+        lines = [key]
+        if self._needs_ca(block):
+            lines.append(str(ca_path))
+        return lines
+
+    @staticmethod
+    def _run(shell, block, tmp_path, stdin_lines, fake_rc="0", prefix="",
+             suffix=""):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        argv_log = tmp_path / "curl-argv.log"
+        stdin_log = tmp_path / "curl-stdin.log"
+        fake = bin_dir / "curl"
+        fake.write_text(
+            "#!/bin/sh\n"
+            'cat > "$FAKE_CURL_STDIN_LOG"\n'
+            'printf \'%s\\n\' "$@" > "$FAKE_CURL_ARGV_LOG"\n'
+            'exit "${FAKE_CURL_RC:-0}"\n', encoding="utf-8")
+        fake.chmod(0o755)
+        script = tmp_path / "block.sh"
+        script.write_text(prefix + block + "\n" + suffix, encoding="utf-8")
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE_CURL_ARGV_LOG"] = str(argv_log)
+        env["FAKE_CURL_STDIN_LOG"] = str(stdin_log)
+        env["FAKE_CURL_RC"] = fake_rc
+        data = "\n".join(stdin_lines) + "\n" if stdin_lines else ""
+        return subprocess.run([shell, str(script)], input=data.encode(),
+                              capture_output=True, env=env, timeout=30)
+
+    def _valid_ca(self, tmp_path):
+        ca = tmp_path / "ca.pem"
+        ca.write_text("synthetic-ca\n", encoding="utf-8")
+        return ca
+
+    def test_exactly_two_reload_blocks(self, reload_blocks):
+        assert len(reload_blocks) == 2, (
+            f"文档 reload 块应为 2 个（系统信任 / 备用 CA）: "
+            f"{len(reload_blocks)}")
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("block_idx", [0, 1])
+    def test_success_sends_key_via_stdin_not_argv(self, tmp_path,
+                                                  reload_blocks, shell,
+                                                  block_idx):
+        block = reload_blocks[block_idx]
+        proc = self._run(shell, block, tmp_path,
+                         self._stdin_lines(block, self.SECRET,
+                                           self._valid_ca(tmp_path)))
+        assert proc.returncode == 0, proc.stderr
+        argv = (tmp_path / "curl-argv.log").read_text(encoding="utf-8")
+        stdin_data = (tmp_path / "curl-stdin.log").read_text(encoding="utf-8")
+        assert f"X-Key: {self.SECRET}" in stdin_data
+        assert self.SECRET not in argv
+        argv_tokens = argv.split()
+        assert "--fail" in argv_tokens
+        assert "--header" in argv_tokens and "@-" in argv_tokens
+        if self._needs_ca(block):
+            assert "--cacert" in argv_tokens
+
+    @pytest.mark.parametrize("fake_rc", ["7", "22"])
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("block_idx", [0, 1])
+    def test_curl_exit_code_propagates(self, tmp_path, reload_blocks, shell,
+                                       block_idx, fake_rc):
+        """7 = 连接失败；22 = ``--fail`` 下 HTTP 4xx/5xx 的 curl 退出码。"""
+        block = reload_blocks[block_idx]
+        proc = self._run(shell, block, tmp_path,
+                         self._stdin_lines(block, self.SECRET,
+                                           self._valid_ca(tmp_path)),
+                         fake_rc=fake_rc)
+        assert proc.returncode == int(fake_rc)
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("block_idx", [0, 1])
+    def test_empty_key_fails_without_invoking_curl(self, tmp_path,
+                                                   reload_blocks, shell,
+                                                   block_idx):
+        proc = self._run(shell, reload_blocks[block_idx], tmp_path, [""])
+        assert proc.returncode != 0
+        assert not (tmp_path / "curl-argv.log").exists()
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("block_idx", [0, 1])
+    def test_read_eof_fails_without_invoking_curl(self, tmp_path,
+                                                  reload_blocks, shell,
+                                                  block_idx):
+        proc = self._run(shell, reload_blocks[block_idx], tmp_path, [])
+        assert proc.returncode != 0
+        assert not (tmp_path / "curl-argv.log").exists()
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("ca_input", ["eof", "empty"])
+    def test_cacert_block_bad_ca_input_fails_without_curl(self, tmp_path,
+                                                          reload_blocks,
+                                                          shell, ca_input):
+        block = next(b for b in reload_blocks if self._needs_ca(b))
+        stdin = [self.SECRET] if ca_input == "eof" else [self.SECRET, ""]
+        proc = self._run(shell, block, tmp_path, stdin)
+        assert proc.returncode != 0
+        assert not (tmp_path / "curl-argv.log").exists()
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("bad_ca_kind", ["missing", "directory"])
+    def test_cacert_block_rejects_invalid_ca_path(self, tmp_path,
+                                                  reload_blocks, shell,
+                                                  bad_ca_kind):
+        block = next(b for b in reload_blocks if self._needs_ca(b))
+        bad = tmp_path / ("no-such-ca.pem" if bad_ca_kind == "missing"
+                          else "ca-as-dir")
+        if bad_ca_kind == "directory":
+            bad.mkdir()
+        proc = self._run(shell, block, tmp_path, [self.SECRET, str(bad)])
+        assert proc.returncode != 0
+        assert not (tmp_path / "curl-argv.log").exists()
+        assert proc.stderr != b""
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("block_idx", [0, 1])
+    def test_block_keeps_parent_shell_alive_and_vars_intact(self, tmp_path,
+                                                            reload_blocks,
+                                                            shell,
+                                                            block_idx):
+        block = reload_blocks[block_idx]
+        prefix = "KEY=parent-key-value\nCA_FILE=parent-ca-value\n"
+        suffix = ("echo BLOCK_COMPLETED_MARKER\n"
+                  "printf 'K=%s C=%s\\n' \"$KEY\" \"$CA_FILE\"\n")
+        proc = self._run(shell, block, tmp_path,
+                         self._stdin_lines(block, self.SECRET,
+                                           self._valid_ca(tmp_path)),
+                         prefix=prefix, suffix=suffix)
+        out = proc.stdout.decode("utf-8")
+        assert "BLOCK_COMPLETED_MARKER" in out
+        assert "K=parent-key-value C=parent-ca-value" in out
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("block_idx", [0, 1])
+    def test_failure_path_keeps_parent_alive(self, tmp_path, reload_blocks,
+                                             shell, block_idx):
+        """失败分支的块内 exit 只退出子 shell：父脚本继续执行 marker。
+        （脚本退出码由父脚本最后一条命令决定，存活即目的。）"""
+        proc = self._run(shell, reload_blocks[block_idx], tmp_path, [""],
+                         suffix="echo BLOCK_COMPLETED_MARKER\n")
+        assert "BLOCK_COMPLETED_MARKER" in proc.stdout.decode("utf-8")

@@ -88,12 +88,13 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
   ```bash
   (                                # 子 shell：块内 exit 不退出当前交互 shell
     unset KEY                      # 先清防继承已 export 的旧值
-    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
-    printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
-      https://127.0.0.1:6171/v1/profiles/reload
+    read -sr KEY || { unset KEY; exit 1; }  # read 失败（EOF/中断）同样清理后失败
+    [ -n "$KEY" ] || { unset KEY; exit 1; } # 空 key 直接失败，不发起请求
+    printf 'X-Key: %s\n' "$KEY" | curl --fail --silent --show-error \
+      -X POST --header @- https://127.0.0.1:6171/v1/profiles/reload
     rc=$?                          # 捕获 curl 退出码后再清理
     unset KEY                      # 用完即清
-    exit "$rc"                     # curl 结果带回当前 shell 的 $?
+    exit "$rc"                     # curl 结果带回 $?（--fail 下 HTTP 4xx/5xx 亦非零）
   )
   ```
   - 仓库默认 `http-api-tls = true`：示例必须走 `https://`，默认前提是
@@ -111,22 +112,28 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
   ```bash
   (                                # 自包含：不依赖上一块，可单独复制执行
     unset KEY CA_FILE              # 先清防继承已 export 的旧值
-    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
-    read -r CA_FILE                # 输入本机真实的 CA 文件路径
+    read -sr KEY || { unset KEY CA_FILE; exit 1; }  # read 失败同样清理后失败
+    [ -n "$KEY" ] || { unset KEY CA_FILE; exit 1; } # 空 key 直接失败，不发请求
+    read -r CA_FILE || { unset KEY CA_FILE; exit 1; }  # CA 路径读取失败同上
+    [ -n "$CA_FILE" ] || { unset KEY CA_FILE; exit 1; } # 空 CA 路径直接失败
     [ -f "$CA_FILE" ] || { echo "CA 文件不存在或不是普通文件" >&2; \
       unset KEY CA_FILE; exit 1; } # 验证失败同样清理 KEY/CA_FILE 再退出
-    printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
+    printf 'X-Key: %s\n' "$KEY" | curl --fail --silent --show-error \
+      -X POST --header @- \
       --cacert "$CA_FILE" \
       https://127.0.0.1:6171/v1/profiles/reload
     rc=$?                          # 捕获 curl 退出码后再清理
     unset KEY CA_FILE              # 用完即清
-    exit "$rc"                     # curl 结果带回当前 shell 的 $?
+    exit "$rc"                     # curl 结果带回 $?（含 HTTP 4xx/5xx）
   )
   ```
   （两个代码块各自自包含：复制任一块单独执行，都会在子 shell 内
-  完成「清理继承值 → 隐藏读取 → 发送 → 捕获退出码 → 清理变量」
-  闭环，KEY 不留在当前 shell 的变量里；块内 `exit` 只退出子 shell，
-  不会退出你正在使用的交互 shell，curl 退出码经 `$?` 带回。）
+  完成「清理继承值 → 隐藏读取（read 失败或空值即清理变量并以
+  非零退出，不发起请求）→ 发送 → 捕获退出码 → 清理变量」闭环，
+  KEY 不留在当前 shell 的变量里；curl 以 `--fail --silent
+  --show-error` 调用，HTTP 4xx/5xx 与连接错误都表现为非零退出码
+  并经 `$?` 带回；块内 `exit` 只退出子 shell，不会退出你正在
+  使用的交互 shell。）
 
 官方文档：[HTTP API](https://manual.nssurge.com/tools/http-api.html)、[Surge CLI](https://manual.nssurge.com/tools/cli.html)。
 
