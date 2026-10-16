@@ -1,13 +1,13 @@
 """系统设置端点：语言切换、数据重置、系统级配置。"""
 
-import os
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.bootstrap import seed_defaults
-from app.database import init_db, DB_PATH, get_db
+from app.database import database, get_db, init_db
 from app.i18n import DEFAULT_LOCALE
 from app.models import SystemConfig
 
@@ -26,8 +26,11 @@ async def set_locale(request: Request):
 @router.post("/reset")
 async def reset_data():
     """重置所有数据：删除数据库文件并重新初始化"""
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    # WAL 引入后需连同伴生文件一并删除，否则残留 -wal/-shm 会污染重建的新库
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{database.path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
     await init_db()
     await seed_defaults()
     return {"reset": True}
@@ -46,7 +49,6 @@ async def get_sys_config(db=Depends(get_db)):
 
 class SysConfigBatchUpdate(BaseModel):
     configs: dict[str, str]
-
 
 @router.put("/config/batch")
 async def update_sys_config_batch(data: SysConfigBatchUpdate, db=Depends(get_db)):

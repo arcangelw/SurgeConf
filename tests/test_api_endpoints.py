@@ -15,23 +15,28 @@ from app.models import ConfigProfile, CustomRule, HostMapping, ProxyNode
 
 
 @pytest_asyncio.fixture
-async def client(tmp_path):
+async def client(tmp_path, monkeypatch):
     """独立临时库 + 手动驱动 lifespan（ASGITransport 不触发 lifespan 事件）"""
     from app.main import app as fastapi_app
+    from app.database import DatabaseRuntime, get_db
 
-    db_file = tmp_path / "api_test.db"
-    test_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}", echo=False)
-    test_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "api_test.db")
 
-    with patch("app.database.engine", test_engine), \
-         patch("app.database.async_session", test_factory), \
-         patch("app.bootstrap.engine", test_engine):
+    async def override_get_db():
+        async with test_runtime.session_factory() as session:
+            yield session
+
+    fastapi_app.dependency_overrides[get_db] = override_get_db
+    with patch("app.database.database", test_runtime), \
+         patch("app.bootstrap.database", test_runtime):
         async with fastapi_app.router.lifespan_context(fastapi_app):
             async with AsyncClient(transport=ASGITransport(app=fastapi_app), base_url="http://test") as c:
-                c._test_factory = test_factory
+                c._test_factory = test_runtime.session_factory
                 yield c
 
-    await test_engine.dispose()
+    fastapi_app.dependency_overrides.pop(get_db, None)
+    await test_runtime.dispose()
 
 
 @pytest.mark.asyncio
@@ -57,7 +62,7 @@ async def test_delete_profile_cascades(client, tmp_path):
     assert all(p["id"] != pid for p in after.json())
 
     # 通过独立会话直查数据库：关联行已清零且已持久化
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/api_test.db")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/runtime/api_test.db")
     async with async_sessionmaker(engine, class_=AsyncSession)() as s:
         rules = (await s.execute(select(CustomRule).where(CustomRule.profile_id == pid))).scalars().all()
         hosts = (await s.execute(select(HostMapping).where(HostMapping.profile_id == pid))).scalars().all()
@@ -82,7 +87,7 @@ async def test_set_default_exactly_one(client):
     defaults = [p for p in profiles if p["is_default"]]
     assert len(defaults) == 1 and defaults[0]["id"] == pid
 
-    assert (await client.put("/api/configs/profiles/9999/set-default")).status_code == 404
+    assert (await client.put(f"/api/configs/profiles/9999/set-default")).status_code == 404
 
 
 @pytest.mark.asyncio

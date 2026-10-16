@@ -4,9 +4,9 @@ import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.database import engine, init_db
+from app.database import database, init_db
+from app.runtime_paths import configure_private_umask
 from app.models import RegionGroup, ServiceGroup, RuleSource, ConfigProfile, CustomRule, HostMapping, SystemConfig
 from app.default_config import (
     DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
@@ -21,8 +21,7 @@ async def seed_defaults():
     """首次启动时填充默认数据"""
     from sqlalchemy import select
 
-    async_session = async_sessionmaker(engine, expire_on_commit=False)
-    async with async_session() as db:
+    async with database.session_factory() as db:
         result = await db.execute(select(RegionGroup).limit(1))
         if result.scalar_one_or_none():
             # 已有数据，仅确保系统配置存在
@@ -62,7 +61,7 @@ async def seed_defaults():
     # 注：no_resolve_keywords 键由下方 apply_data_migrations 幂等补齐，此处不重复
     sys_config_keys = {"exclusion_keywords", "other_auto_enabled", "other_manual_enabled", "skip_proxy_custom"}
     existing_configs = set()
-    async with async_session() as db:
+    async with database.session_factory() as db:
         result = await db.execute(select(SystemConfig))
         for row in result.scalars().all():
             existing_configs.add(row.key)
@@ -80,12 +79,12 @@ async def seed_defaults():
             await db.commit()
 
     # 数据迁移：内置安全规则补齐 + 存量 ipv6-vif 修正（多设备部署，修复随代码分发）
-    async with async_session() as db:
+    async with database.session_factory() as db:
         await apply_data_migrations(db)
 
     # 数据维护：清理孤儿节点（修复旧版本删除订阅时未级联删除节点导致的残留）
     from app.services.subscription import cleanup_orphan_nodes
-    async with async_session() as db:
+    async with database.session_factory() as db:
         removed = await cleanup_orphan_nodes(db)
         if removed:
             print(f"[数据维护] 已清理 {removed} 个孤儿节点（归属订阅已删除的残留节点）", file=sys.stderr)
@@ -173,7 +172,7 @@ async def apply_data_migrations(db) -> None:
             if g.get(key) == old:
                 g[key] = new
                 changed = True
-        # 删除死配置：产物无 GEOIP 规则（国内判定走 domestic.ip/ChinaMax/ASN China 三集），
+        # 删除死配置：产物无 GEOIP 规则（国内判定走 domestic.ip/ChinaMax/ASN china 三集），
         # geoip-maxmind-url 指向的 mmdb 库不会被查询，白占一次下载与常驻内存
         if "geoip-maxmind-url" in g:
             del g["geoip-maxmind-url"]
@@ -213,10 +212,11 @@ async def lifespan(app: FastAPI):
 ║  使用前请阅读完整的免责声明:                              ║
 ║  github.com/arcangelw/SurgeConf#免责声明                ║
 ║                                                         ║
-║  继续使用即表示您接受免责声明的全部条款。                  ║
+║  继续使用即表示您接受免责声明的一切条款。                  ║
 ╚══════════════════════════════════════════════════════════╝
 """
     print(banner, file=sys.stderr)
+    configure_private_umask()
     await init_db()
     await seed_defaults()
     yield
