@@ -1036,3 +1036,58 @@ def test_none_sort_order_fails_closed_as_invalid_configuration():
     with pytest.raises(InvalidConfiguration) as ei:
         validate_rule_order([bad, _builtin_stub("AppStore", 5, 2)])
     assert any("sort_order" in e for e in ei.value.errors)
+
+
+# ════════════════════════════════════════════
+# 九、托管 UDP 规则纳入引用完整性校验（Task 4）
+# ════════════════════════════════════════════
+
+
+class TestManagedUdpActionRefs:
+    def test_builtin_managed_actions_pass_validation(self):
+        """托管行动作（DIRECT/REJECT 内置）：登记进 rule_actions 后校验通过"""
+        ctx = _ctx(combined=("手动选择",),
+                   actions=(RuleActionRef("托管 UDP 安全规则", "DIRECT"),
+                            RuleActionRef("托管 UDP 安全规则", "REJECT")))
+        validate_generated_references(ctx)  # 不抛即通过
+
+    def test_non_builtin_managed_action_fails_closed(self):
+        """若未来托管行动作漂移为不存在的策略：校验必须兜底拒绝（纳入即受检）"""
+        ctx = _ctx(combined=("手动选择",),
+                   actions=(RuleActionRef("托管 UDP 安全规则", "幽灵组"),))
+        with pytest.raises(InvalidConfiguration) as ei:
+            validate_generated_references(ctx)
+        assert any("幽灵组" in e for e in ei.value.errors)
+
+
+@pytest.mark.asyncio
+async def test_full_generation_with_managed_udp_passes_validation(full_default_sources):
+    """含托管注入的完整产物过校验管线：DIRECT/REJECT refs 不误报、
+    顺序与引用不变量在注入后仍共同成立"""
+    from app.models import UdpException
+    combos = [("mac_workstation", "scoped"), ("mac_workstation", "strict"),
+              ("mac_gateway", "scoped"), ("mac_gateway", "strict"),
+              ("mac_gateway", "compatible"), ("ios_mobile", "strict"),
+              ("ios_mobile", "compatible"), ("mac_workstation", "compatible")]
+    for i, (target, mode) in enumerate(combos):
+        profile = ConfigProfile(name=f"托管档{i}-{target}-{mode}", is_default=False,
+                                locale="zh", final_action="手动选择",
+                                target=target, udp_security_mode=mode)
+        full_default_sources.add(profile)
+        await full_default_sources.flush()
+        if mode == "scoped":
+            kind, value = (("process", "ExampleVideo")
+                           if target == "mac_workstation"
+                           else ("mac_address", "02:00:00:00:00:01"))
+            full_default_sources.add(UdpException(
+                profile_id=profile.id, match_type=kind, match_value=value,
+                enabled=True, sort_order=0))
+    await full_default_sources.commit()
+
+    for i, (target, mode) in enumerate(combos):
+        profile = (await full_default_sources.execute(
+            select(ConfigProfile).where(ConfigProfile.name == f"托管档{i}-{target}-{mode}")
+        )).scalar_one()
+        config = await generate_surge_config(full_default_sources, profile.id)
+        assert "FINAL,手动选择,dns-failed" in config
+        assert "[Rule]" in config and "[MITM]" in config

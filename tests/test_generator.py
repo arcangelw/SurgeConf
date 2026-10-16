@@ -866,20 +866,260 @@ async def test_locale_target_and_general_never_cross_profiles(db, two_profiles):
 
 
 @pytest.mark.asyncio
-async def test_generated_config_keeps_user_stun_without_managed_block(db):
-    """托管 STUN 阻断迁出默认值后（Task 4 动态注入前）：默认产物不补回
-    STUN 托管规则与全局 UDP/443 阻断；用户自建 STUN 规则照常输出"""
-    db.add(CustomRule(profile_id=None, position="pre", sort_order=50, enabled=True,
-                      rule_text="PROTOCOL,STUN,REJECT", comment="user-owned"))
+async def test_compatible_keeps_user_stun_without_managed_block(db):
+    """compatible 档案：不注入托管 STUN/UDP/443 阻断；用户自建 STUN 照常输出"""
+    compatible = await _add_target_profile(db, "兼容档", "mac_workstation", "compatible", {})
+    db.add(CustomRule(profile_id=compatible.id, position="pre", sort_order=50,
+                      enabled=True, rule_text="PROTOCOL,STUN,REJECT", comment="user-owned"))
     await db.commit()
 
-    config = await generate_surge_config(db)
+    config = await generate_surge_config(db, compatible.id)
 
-    # 用户自建 STUN 规则照常输出
+    # 用户自建 STUN 规则照常输出（明确配置保留，不受模式影响）
     assert "PROTOCOL,STUN,REJECT" in config
-    # 默认产物不含四条托管 STUN 与全局 UDP/443 阻断（生成器无硬编码注入）
+    # compatible 不注入四条托管 STUN 与全局 UDP/443 阻断
     assert "DOMAIN-KEYWORD,stun,REJECT" not in config
     assert "DEST-PORT,3478" not in config
     assert "DEST-PORT,19302" not in config
     assert "DEST-PORT,443" not in config
     assert "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT" not in config
+
+
+# ════════════════════════════════════════════
+# 七、托管 UDP 安全规则注入（Task 4）
+# ════════════════════════════════════════════
+
+import os
+import subprocess
+
+from sqlalchemy import text
+
+from app.default_config import MANAGED_STUN_RULES
+from app.models import ConfigProfile, UdpException
+from app.services.config_validation import InvalidConfiguration
+from app.services.udp_rules import build_udp_rules, managed_udp_line_action
+
+SURGE_CLI = "/Applications/Surge.app/Contents/Applications/surge-cli"
+
+
+def _add_udp_exception(db, profile_id, match_type, match_value,
+                       enabled=True, sort_order=0):
+    db.add(UdpException(profile_id=profile_id, match_type=match_type,
+                        match_value=match_value, enabled=enabled,
+                        sort_order=sort_order))
+
+
+def _rule_lines(config: str) -> list[str]:
+    section = config.split("[Rule]", 1)[1].split("[Host]", 1)[0]
+    return [l for l in section.splitlines() if l.strip() and not l.startswith("#")]
+
+
+@pytest.mark.asyncio
+async def test_scoped_workstation_injects_exceptions_then_blocks(db):
+    """scoped workstation：例外 DIRECT 行 + 四条阻断，位于 pre 之后、规则源之前"""
+    profile = await _add_target_profile(db, "注入档", "mac_workstation", "scoped", {})
+    _add_rule(db, profile.id, "DOMAIN,pre.example.com,DIRECT", position="pre")
+    _add_rule(db, profile.id, "DOMAIN-SUFFIX,general.example.com,Global", position="general")
+    _add_udp_exception(db, profile.id, "process", "ExampleVideo", sort_order=10)
+    await db.commit()
+
+    config = await generate_surge_config(db, profile.id)
+    lines = _rule_lines(config)
+
+    pre_idx = next(i for i, l in enumerate(lines) if "pre.example.com" in l)
+    exc_idx = next(i for i, l in enumerate(lines)
+                   if l == "AND,((PROCESS-NAME,ExampleVideo),(PROTOCOL,UDP)),DIRECT")
+    block_idx = next(i for i, l in enumerate(lines) if l == MANAGED_STUN_RULES[1])
+    src_idx = next(i for i, l in enumerate(lines) if l.startswith("RULE-SET,"))
+    general_idx = next(i for i, l in enumerate(lines) if "general.example.com" in l)
+    final_idx = next(i for i, l in enumerate(lines) if l.startswith("FINAL,"))
+    # 完整顺序不变量：pre < exceptions < managed blocks < rule sources < FINAL
+    assert pre_idx < exc_idx < block_idx < src_idx < general_idx < final_idx
+    # 例外行后紧跟四条阻断的精确集合
+    assert lines[exc_idx + 1:exc_idx + 5] == list(MANAGED_STUN_RULES)
+    assert len([l for l in lines if l.startswith("FINAL,")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_gateway_injects_mac_exception(db):
+    """scoped gateway：MAC 例外行按规范大写冒号输出 + 四条阻断"""
+    profile = await _add_target_profile(db, "网关注入档", "mac_gateway", "scoped", {})
+    _add_udp_exception(db, profile.id, "mac_address", "02:00:00:00:00:01")
+    await db.commit()
+
+    lines = _rule_lines(await generate_surge_config(db, profile.id))
+    assert "AND,((MAC-ADDRESS,02:00:00:00:00:01),(PROTOCOL,UDP)),DIRECT" in lines
+    assert all(l in lines for l in MANAGED_STUN_RULES)
+
+
+@pytest.mark.asyncio
+async def test_strict_ignores_exceptions_and_scoped_restores(db):
+    """strict：enabled 例外保留在库但不输出；切回 scoped 后恢复（不删除）"""
+    profile = await _add_target_profile(db, "切换档", "mac_workstation", "scoped", {})
+    _add_udp_exception(db, profile.id, "process", "ExampleVideo")
+    await db.commit()
+
+    profile.udp_security_mode = "strict"
+    await db.commit()
+    strict_lines = _rule_lines(await generate_surge_config(db, profile.id))
+    assert not any("ExampleVideo" in l for l in strict_lines)
+    assert all(l in strict_lines for l in MANAGED_STUN_RULES)
+
+    profile.udp_security_mode = "scoped"
+    await db.commit()
+    scoped_lines = _rule_lines(await generate_surge_config(db, profile.id))
+    assert "AND,((PROCESS-NAME,ExampleVideo),(PROTOCOL,UDP)),DIRECT" in scoped_lines
+
+
+@pytest.mark.asyncio
+async def test_disabled_exception_not_queried_into_output(db):
+    """disabled 例外不进入产物（生成查询只取 enabled）"""
+    profile = await _add_target_profile(db, "禁用档", "mac_workstation", "scoped", {})
+    _add_udp_exception(db, profile.id, "process", "ExampleVideo", enabled=False)
+    _add_udp_exception(db, profile.id, "process", "ActiveApp", enabled=True)
+    await db.commit()
+
+    lines = _rule_lines(await generate_surge_config(db, profile.id))
+    assert not any("ExampleVideo" in l for l in lines)
+    assert "AND,((PROCESS-NAME,ActiveApp),(PROTOCOL,UDP)),DIRECT" in lines
+
+
+@pytest.mark.asyncio
+async def test_udp_exceptions_scoped_to_current_profile(db, two_profiles):
+    """UDP 例外只属于所属档案：跨档案互不可见（无全局作用域）"""
+    first, second = two_profiles.first, two_profiles.second
+    _add_udp_exception(db, first.id, "process", "FirstApp")
+    _add_udp_exception(db, second.id, "process", "SecondApp")
+    await db.commit()
+
+    first_lines = _rule_lines(await generate_surge_config(db, first.id))
+    assert any("FirstApp" in l for l in first_lines)
+    assert not any("SecondApp" in l for l in first_lines)
+
+    second_lines = _rule_lines(await generate_surge_config(db, second.id))
+    assert any("SecondApp" in l for l in second_lines)
+    assert not any("FirstApp" in l for l in second_lines)
+
+
+@pytest.mark.asyncio
+async def test_bypassed_illegal_exception_fails_generation_closed(db):
+    """绕库直写非法例外值（无视写入端校验）：生成 fail closed 且错误不回显值"""
+    profile = await _add_target_profile(db, "绕库档", "mac_workstation", "scoped", {})
+    secret = "SECRET-INJECT,VALUE"
+    await db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    _add_udp_exception(db, profile.id, "process", secret)
+    await db.commit()
+    await db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+
+    with pytest.raises(InvalidConfiguration) as excinfo:
+        await generate_surge_config(db, profile.id)
+    joined = "\n".join(excinfo.value.errors)
+    assert "SECRET-INJECT" not in joined
+
+
+@pytest.mark.asyncio
+async def test_bypassed_ios_scoped_profile_fails_generation_closed(db):
+    """绕库写入 ios_mobile+scoped（无视 CHECK）：生成时被模式矩阵拒绝"""
+    await db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    db.add(ConfigProfile(name="绕库iOS档", is_default=False, locale="zh",
+                         final_action="手动选择", target="ios_mobile",
+                         udp_security_mode="scoped"))
+    await db.commit()
+    await db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+    bypassed = (await db.execute(
+        select(ConfigProfile).where(ConfigProfile.name == "绕库iOS档"))).scalar_one()
+
+    with pytest.raises(InvalidConfiguration):
+        await generate_surge_config(db, bypassed.id)
+
+
+@pytest.mark.asyncio
+async def test_user_udp443_lookalike_preserved_in_scoped(db):
+    """用户已存的 UDP/443 lookalike 自定义规则按 Task 3 语义保留，不做模糊删除"""
+    profile = await _add_target_profile(db, "lookalike档", "mac_workstation", "scoped", {})
+    lookalike = "AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT"
+    _add_rule(db, profile.id, lookalike, position="pre")
+    await db.commit()
+
+    lines = _rule_lines(await generate_surge_config(db, profile.id))
+    assert lookalike in lines
+    # 托管注入永不包含 UDP/443 阻断
+    assert sum(1 for l in lines if "DEST-PORT,443" in l) == 1
+
+
+@pytest.mark.asyncio
+async def test_ios_strict_managed_rules_carry_no_process_or_mac(db):
+    """iOS strict：托管行自身无 PROCESS/MAC 构造，[Rule] 段完整（唯一 FINAL）"""
+    profile = await _add_target_profile(db, "iOS严格档", "ios_mobile", "strict", {})
+    await db.commit()
+
+    config = await generate_surge_config(db, profile.id)
+    section = config.split("[Rule]", 1)[1].split("[Host]", 1)[0]
+    lines = _rule_lines(config)
+    assert "PROCESS-NAME" not in section and "PROCESS-PATH" not in section
+    assert "MAC-ADDRESS" not in section
+    assert all(l in lines for l in MANAGED_STUN_RULES)
+    assert [l for l in lines if l.startswith("FINAL,")] == ["FINAL,手动选择,dns-failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("target", "mode"), [
+    ("mac_workstation", "strict"), ("mac_workstation", "scoped"),
+    ("mac_gateway", "strict"), ("mac_gateway", "scoped"),
+    ("ios_mobile", "strict"),
+])
+async def test_general_forces_safe_udp_values_strict_scoped(db, target, mode):
+    """strict/scoped 全目标：General 仍强制 udp-policy-not-supported-behaviour=REJECT
+    与 block-quic=per-policy（托管规则注入不改变 General 安全底线）"""
+    profile = await _add_target_profile(
+        db, f"安全值档-{target}-{mode}", target, mode,
+        {"block-quic": "proxy", "udp-policy-not-supported-behaviour": "DROP"})
+    general = _general_section(await generate_surge_config(db, profile.id))
+    assert "block-quic = per-policy" in general
+    assert "udp-policy-not-supported-behaviour = REJECT" in general
+
+
+def test_managed_udp_lines_recorded_in_rule_actions():
+    """托管行动作经 managed_udp_line_action 登记进 record：纳入引用完整性校验"""
+    record: list[RuleActionRef] = []
+    udp_lines = build_udp_rules("mac_workstation", "scoped", [
+        UdpException(id=1, profile_id=1, match_type="process",
+                     match_value="ExampleVideo", enabled=True, sort_order=0)])
+    assert [managed_udp_line_action(l) for l in udp_lines] == \
+        ["DIRECT", "REJECT", "REJECT", "REJECT", "REJECT"]
+    _build_rules([], [], [], _t_zh, lambda k: CATEGORY_NAMES.get(k, k),
+                 lambda k: COMMENT_NAMES.get(k, (k, k))[0],
+                 final_action="兜底", udp_lines=udp_lines, record=record)
+    managed = [r for r in record if r.source == "托管 UDP 安全规则"]
+    assert [r.action for r in managed] == ["DIRECT", "REJECT", "REJECT", "REJECT", "REJECT"]
+    assert len(managed) == len(udp_lines)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not os.access(SURGE_CLI, os.X_OK), reason="本机无 surge-cli")
+@pytest.mark.parametrize(("target", "match_type", "values"), [
+    ("mac_workstation", "process", ["ExampleVideo", "Google Chrome"]),
+    ("mac_gateway", "mac_address", ["02:00:00:00:00:01"]),
+])
+async def test_scoped_configs_pass_surge_cli_check(db_with_nodes, tmp_path,
+                                                   target, match_type, values):
+    """两个 Mac scoped 产物（含例外行与四条阻断）通过 Surge CLI --check 语法校验
+
+    conftest 的 vmess/ss 桩（username=x / encrypt=x 非真实凭据形态）不被
+    真实 CLI 接受，与本任务规则无关：CLI 冒烟只保留合法 trojan 桩节点。
+    """
+    from sqlalchemy import update
+    await db_with_nodes.execute(
+        update(ProxyNode).where(ProxyNode.node_type != "trojan").values(enabled=False))
+    profile = await _add_target_profile(db_with_nodes, f"CLI档-{target}", target,
+                                        "scoped", {})
+    for i, value in enumerate(values):
+        _add_udp_exception(db_with_nodes, profile.id, match_type, value, sort_order=i)
+    await db_with_nodes.commit()
+
+    config = await generate_surge_config(db_with_nodes, profile.id)
+    artifact = tmp_path / f"{target}-scoped.conf"
+    artifact.write_text(config, encoding="utf-8")
+    result = subprocess.run([SURGE_CLI, "--check", str(artifact)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr

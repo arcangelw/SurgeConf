@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.models import (
     ProxyNode, RegionGroup, ServiceGroup,
     RuleSource, Subscription,
-    CustomRule, HostMapping, SystemConfig,
+    CustomRule, HostMapping, SystemConfig, UdpException,
 )
 from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, CATEGORY_NAMES, COMMENT_NAMES
 from app.profile_targets import ProfileTarget, filter_general_for_target
@@ -29,6 +29,7 @@ from app.services.config_validation import (
     validate_rule_order,
 )
 from app.services.profile_resolution import profile_scope, resolve_profile
+from app.services.udp_rules import build_udp_rules, managed_udp_line_action
 
 # 默认排除关键词（优先使用系统配置）
 DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
@@ -300,6 +301,17 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
         general_rules = [r for r in general_rules
                          if not rule_excluded_for_target(r.rule_text, profile.target)]
 
+    # 托管 UDP 安全规则（Task 4）：只读当前档案的 enabled 例外（无全局
+    # 作用域）；build_udp_rules 按模式矩阵输出，并对绕库非法值 fail closed
+    # （错误先于任何产物拼接抛出）
+    udp_exceptions = (await db.execute(
+        select(UdpException)
+        .where(UdpException.profile_id == profile.id, UdpException.enabled == True)
+        .order_by(UdpException.sort_order, UdpException.id)
+    )).scalars().all()
+    udp_rule_lines = build_udp_rules(
+        profile.target, profile.udp_security_mode, udp_exceptions)
+
     # FINAL 为生成器专属：任何 pre/general 自定义 FINAL（含绕过保存端直接
     # 写库的存量）fail closed——最终 [Rule] 的 FINAL 恰一条，且只来自
     # ConfigProfile.final_action，不允许自定义规则借道覆盖
@@ -314,7 +326,8 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     # 绝不把部分 [Rule] 段拼进产物（sections 只在校验通过后扩展）
     rule_refs: list[RuleActionRef] = []
     rule_lines = _build_rules(rule_sources, pre_rules, general_rules, tr, tc, tcomment,
-                              final_action=final_action, record=rule_refs)
+                              final_action=final_action, udp_lines=udp_rule_lines,
+                              record=rule_refs)
     validate_generated_references(GenerationContext(
         locale=locale,
         target=profile.target,
@@ -558,15 +571,27 @@ def _emit_custom_rule(rule_text: str, label: str, t, record: list[RuleActionRef]
     return translated if translated is not None else rule_text
 
 
-def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, *, final_action: str, record: list[RuleActionRef] | None = None) -> list[str]:
+def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, *, final_action: str, udp_lines: list[str] | None = None, record: list[RuleActionRef] | None = None) -> list[str]:
     lines = []
 
-    # 前置自定义规则
+    # 前置自定义规则（用户/企业的明确覆盖优先于项目托管注入）
     if pre_rules:
         lines.append(f"# >> {tcomment('pre_rules')}")
         for r in pre_rules:
             lines.append(_emit_custom_rule(
                 r.rule_text, f"前置自定义规则「{r.rule_text}」", t, record))
+        lines.append("")
+
+    # 项目托管 UDP 安全规则：例外 DIRECT → STUN 阻断（位于规则源之前，
+    # 全部在 FINAL 前）。行由 build_udp_rules 构建，此处只登记动作引用
+    # （内置 DIRECT/REJECT，不经过 translate/extract 管道）参与完整性校验
+    if udp_lines:
+        lines.append(f"# >> {tcomment('udp_managed')}")
+        for line in udp_lines:
+            if record is not None:
+                record.append(RuleActionRef("托管 UDP 安全规则",
+                                            managed_udp_line_action(line)))
+            lines.append(line)
         lines.append("")
 
     # 规则集

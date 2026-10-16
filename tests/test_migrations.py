@@ -768,14 +768,24 @@ async def test_udp_mode_migration_idempotent_records_once(db):
     assert after_second == after_first
     assert len(records) == 1
 
-    # 端到端：迁移后生成器不补回托管 STUN / 全局 UDP 443 阻断
+    # 端到端：迁移清除了存储副本；scoped 默认档案产物中的托管 STUN 来自
+    # 模式驱动动态注入（Task 4）而非存储规则复活——compatible 档案生成
+    # 不出现任何托管行，全局 UDP/443 阻断在任何模式下都不出现
     factory = _factory(db)
     async with factory() as fresh:
         config = await generate_surge_config(fresh)
-    assert "DOMAIN-KEYWORD,stun,REJECT" not in config
-    assert "DEST-PORT,3478" not in config
-    assert "DEST-PORT,19302" not in config
-    assert "DEST-PORT,443" not in config
+        assert "DOMAIN-KEYWORD,stun,REJECT" in config
+        assert "DEST-PORT,3478" in config and "DEST-PORT,19302" in config
+        assert "DEST-PORT,443" not in config
+        compatible = ConfigProfile(name="迁移兼容档", is_default=False, locale="zh",
+                                   final_action="手动选择", target="mac_workstation",
+                                   udp_security_mode="compatible")
+        fresh.add(compatible)
+        await fresh.commit()
+        clean = await generate_surge_config(fresh, compatible.id)
+        assert "DOMAIN-KEYWORD,stun,REJECT" not in clean
+        assert "DEST-PORT,3478" not in clean and "DEST-PORT,19302" not in clean
+        assert "DEST-PORT,443" not in clean
 
 
 @pytest.mark.asyncio
