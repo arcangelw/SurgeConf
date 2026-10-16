@@ -120,7 +120,7 @@ def _validate_current_schema(database_path: Path) -> None:
 
 # ===== SQLite Backup API 与发布 =====
 
-def _sqlite_backup(source: Path, target: Path) -> None:
+def sqlite_backup(source: Path, target: Path) -> None:
     """SQLite Backup API 复制（正确处理 WAL 与页级一致性），禁止 shutil.copyfile"""
     source_conn = sqlite3.connect(source)
     target_conn = sqlite3.connect(target)
@@ -132,10 +132,10 @@ def _sqlite_backup(source: Path, target: Path) -> None:
         source_conn.close()
 
 
-def _backup_database(source: Path, paths: RuntimePaths, schema_tag: str) -> Path:
+def backup_database(source: Path, paths: RuntimePaths, schema_tag: str) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     target = paths.backups / f"surge_conf_{timestamp}_{schema_tag}.db"
-    _sqlite_backup(source, target)
+    sqlite_backup(source, target)
     os.chmod(target, 0o600)
     return target
 
@@ -225,8 +225,8 @@ async def prepare_database(paths: RuntimePaths, legacy_path: Path) -> MigrationR
 
     if not live.exists() and legacy.exists():
         # 路径 2：仅旧仓库库存在 —— 备份未升级副本，staging 上完成后原子发布，旧库保持原样
-        backup = _backup_database(legacy, paths, "pre_alembic")
-        _sqlite_backup(legacy, staging)
+        backup = backup_database(legacy, paths, "pre_alembic")
+        sqlite_backup(legacy, staging)
         try:
             applied = await _upgrade_staging(staging)
             _verify_and_publish(staging, live)
@@ -244,8 +244,8 @@ async def prepare_database(paths: RuntimePaths, legacy_path: Path) -> MigrationR
         if not schema_pending and not data_pending:
             return MigrationResult("live", (), None)
         # 存在待执行项：时间戳备份 + staging 上完成后原子替换；失败删除 staging，live 字节不变
-        backup = _backup_database(live, paths, current or "pre_alembic")
-        _sqlite_backup(live, staging)
+        backup = backup_database(live, paths, current or "pre_alembic")
+        sqlite_backup(live, staging)
         try:
             applied = await _upgrade_staging(staging)
             _verify_and_publish(staging, live)

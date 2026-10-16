@@ -192,3 +192,96 @@ async def test_lifespan_prepares_database_before_binding_live_runtime(tmp_path, 
     monkeypatch.setattr(global_database, "bind", checked_bind)
     async with fastapi_app.router.lifespan_context(fastapi_app):
         assert bound["path"].exists()
+
+
+
+# ===== /reset 端点：删除活跃库文件前先异步 dispose，异常时恢复可用 live 库 =====
+
+
+@pytest.mark.asyncio
+async def test_reset_disposes_before_deleting_and_rebinds_runtime(tmp_path, monkeypatch):
+    """重置行为：dispose 先于文件删除与 prepare；完成后 runtime 重绑新库可用、旧数据消失"""
+    from sqlalchemy import select
+
+    from app.database import DatabaseRuntime
+    from app.models import SystemConfig
+    from app.routers import settings as settings_module
+
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "app-support"))
+    paths = runtime_paths(tmp_path / "app-support")
+    await prepare_database(paths, tmp_path / "missing.db")
+
+    runtime = DatabaseRuntime.create(paths.database)
+    monkeypatch.setattr(settings_module, "database", runtime)
+    async with runtime.session_factory() as db:  # 真实打开连接，让连接池持有该文件的 fd
+        db.add(SystemConfig(key="stale_marker", value="1"))
+        await db.commit()
+
+    order = []
+    original_dispose = runtime.dispose
+
+    async def traced_dispose():
+        order.append("dispose")
+        assert paths.database.exists(), "dispose 必须发生在任何数据库文件删除之前"
+        await original_dispose()
+
+    monkeypatch.setattr(runtime, "dispose", traced_dispose)
+    original_prepare = settings_module.prepare_database
+
+    async def traced_prepare(p, legacy):
+        order.append("prepare")
+        assert not paths.database.exists(), "prepare 前旧库文件必须已被删除"
+        return await original_prepare(p, legacy)
+
+    monkeypatch.setattr(settings_module, "prepare_database", traced_prepare)
+
+    result = await settings_module.reset_data()
+
+    assert order == ["dispose", "prepare"]
+    assert result["reset"] is True
+    assert result["source"] == "fresh"
+    assert runtime.path == paths.database
+    async with runtime.session_factory() as db:
+        stale = (await db.execute(
+            select(SystemConfig).where(SystemConfig.key == "stale_marker")
+        )).scalar_one_or_none()
+        assert stale is None, "重置后旧数据必须消失"
+        total = len((await db.execute(select(SystemConfig))).scalars().all())
+        assert total > 0, "重置后 runtime 必须绑定到含种子数据的新库"
+    await runtime.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reset_failure_restores_previous_live_database(tmp_path, monkeypatch):
+    """prepare 失败：runtime 恢复绑定重置前的 live 库（含用户数据），异常向上传播"""
+    from sqlalchemy import select
+
+    from app.database import DatabaseRuntime
+    from app.models import SystemConfig
+    from app.routers import settings as settings_module
+
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "app-support"))
+    paths = runtime_paths(tmp_path / "app-support")
+    await prepare_database(paths, tmp_path / "missing.db")
+
+    runtime = DatabaseRuntime.create(paths.database)
+    monkeypatch.setattr(settings_module, "database", runtime)
+    async with runtime.session_factory() as db:
+        db.add(SystemConfig(key="keep_me", value="yes"))
+        await db.commit()
+
+    async def broken_prepare(p, legacy):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(settings_module, "prepare_database", broken_prepare)
+    with pytest.raises(RuntimeError, match="boom"):
+        await settings_module.reset_data()
+
+    # 失败后 live 库文件已恢复、runtime 重新绑定且用户数据仍在
+    assert paths.database.exists()
+    async with runtime.session_factory() as db:
+        kept = (await db.execute(
+            select(SystemConfig).where(SystemConfig.key == "keep_me")
+        )).scalar_one_or_none()
+        assert kept is not None
+    await runtime.dispose()

@@ -1,6 +1,7 @@
 """系统设置端点：语言切换、数据重置、系统级配置。"""
 
 from pathlib import Path
+import os
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
@@ -10,7 +11,8 @@ from app.database import database, get_db
 from app.i18n import DEFAULT_LOCALE
 from app.models import SystemConfig
 from app.runtime_paths import resolve_runtime_paths
-from app.services.database_migration import PROJECT_ROOT, prepare_database
+from app.services.database_migration import (PROJECT_ROOT, backup_database,
+                                             prepare_database, sqlite_backup)
 
 router = APIRouter(prefix="/api/settings", tags=["系统设置"])
 
@@ -26,14 +28,32 @@ async def set_locale(request: Request):
 
 @router.post("/reset")
 async def reset_data():
-    """重置所有数据：删除数据库文件后走完整 staging 准备流程重建并重绑运行时"""
-    # WAL 引入后需连同伴生文件一并删除，否则残留 -wal/-shm 会污染重建的新库
-    for suffix in ("", "-wal", "-shm"):
-        candidate = Path(f"{database.path}{suffix}")
-        if candidate.exists():
-            candidate.unlink()
+    """重置所有数据：先异步关闭引擎并备份，再删除文件走完整 staging 准备流程重建。
+
+    任何失败都先从备份副本还原 live 库并重新绑定，再向上传播异常，
+    避免运行时停留在"引擎存活但文件已删"或未绑定状态。
+    """
     paths = resolve_runtime_paths()
-    result = await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
+    backup = None
+    try:
+        # 必须先 await dispose：同步 dispose 无法可靠关闭 aiosqlite 线程连接，
+        # 残留连接会继续写已删除文件的 fd；备份副本供失败路径还原
+        await database.dispose()
+        if paths.database.exists():
+            backup = backup_database(paths.database, paths, "reset")
+        # WAL 引入后需连同伴生文件一并删除，否则残留 -wal/-shm 会污染重建的新库
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{paths.database}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
+        result = await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
+    except BaseException:
+        if not paths.database.exists() and backup is not None and backup.exists():
+            sqlite_backup(backup, paths.database)
+            os.chmod(paths.database, 0o600)
+        if paths.database.exists():
+            database.bind(paths.database)
+        raise
     database.bind(paths.database)
     return {"reset": True, "source": result.source}
 
