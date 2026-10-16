@@ -19,14 +19,14 @@ from app.services.profile_resolution import (DefaultProfileMissing, ProfileNotFo
 router = APIRouter(prefix="/api/general", tags=["General 设置"])
 
 
-async def _resolve_or_404(db: AsyncSession, profile_id: int | None) -> ConfigProfile:
-    """档案解析唯一入口：显式 id 不存在或无默认档案均 404，绝不复制回退逻辑"""
+async def _resolve_or_http(db: AsyncSession, profile_id: int | None) -> ConfigProfile:
+    """档案解析唯一入口：显式 id 不存在 404；省略且无默认档案 422（与生成入口一致）"""
     try:
         return await resolve_profile(db, profile_id)
     except ProfileNotFound:
         raise HTTPException(404, "配置方案不存在")
     except DefaultProfileMissing:
-        raise HTTPException(404, "未找到默认配置方案")
+        raise HTTPException(422, "未指定 profile_id 且不存在默认配置方案")
 
 
 def _drop_empty(values: dict) -> dict:
@@ -37,7 +37,7 @@ def _drop_empty(values: dict) -> dict:
 @router.get("/fields")
 async def get_fields(profile_id: int | None = None, db: AsyncSession = Depends(get_db)):
     """返回当前目标可配置的字段元数据（驱动前端表单渲染）"""
-    profile = await _resolve_or_404(db, profile_id)
+    profile = await _resolve_or_http(db, profile_id)
     return general_groups_for_target(ProfileTarget(profile.target))
 
 
@@ -48,7 +48,7 @@ async def get_values(profile_id: int | None = None, db: AsyncSession = Depends(g
     只返回用户可配置键：生成期内部键（skip-proxy）与表外未知键
     的存量残留一律丢弃。
     """
-    profile = await _resolve_or_404(db, profile_id)
+    profile = await _resolve_or_http(db, profile_id)
     values = dict(DEFAULT_GENERAL)
     if profile.general:
         values.update(profile.general)
@@ -72,7 +72,7 @@ async def save_values(profile_id: int, values: dict, db: AsyncSession = Depends(
     - 持久层旧残留（他平台键/未知键/生成期内部键）：静默清理
     - 强制安全值随保存固化到持久层
     """
-    profile = await _resolve_or_404(db, profile_id)
+    profile = await _resolve_or_http(db, profile_id)
     target = ProfileTarget(profile.target)
 
     allowed = configurable_general_keys(target)

@@ -397,3 +397,36 @@ async def test_create_profile_explicit_null_mode_rejected(client):
     assert resp.status_code == 422
     after = (await client.get("/api/configs/profiles")).json()
     assert [p["name"] for p in after] == [p["name"] for p in before]
+
+
+# ===== 生成入口档案错误语义：显式 404 / 省略无默认 422 =====
+
+
+@pytest.mark.asyncio
+async def test_generate_and_preview_explicit_missing_profile_404(client):
+    """显式 id 不存在：/generate 与 /preview 均 404，不回退默认档案"""
+    assert (await client.get("/api/configs/generate?profile_id=99999")).status_code == 404
+    assert (await client.get("/api/configs/preview?profile_id=99999")).status_code == 404
+    # 显式 0 是显式 id：按不存在处理，而非省略
+    assert (await client.get("/api/configs/generate?profile_id=0")).status_code == 404
+    assert (await client.get("/api/configs/preview?profile_id=0")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_generate_preview_and_general_without_default_422(client):
+    """省略 id 且无默认档案：生成与 General 读取入口统一 422"""
+    profiles = (await client.get("/api/configs/profiles")).json()
+    for p in profiles:
+        assert (await client.delete(f"/api/configs/profiles/{p['id']}")).status_code == 200
+
+    assert (await client.get("/api/configs/generate")).status_code == 422
+    assert (await client.get("/api/configs/preview")).status_code == 422
+    assert (await client.get("/api/general/fields")).status_code == 422
+    assert (await client.get("/api/general/values")).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_general_endpoints_explicit_missing_profile_404(client):
+    """General 字段/值读取：显式 id 不存在 404（与生成入口一致）"""
+    assert (await client.get("/api/general/fields?profile_id=99999")).status_code == 404
+    assert (await client.get("/api/general/values?profile_id=99999")).status_code == 404

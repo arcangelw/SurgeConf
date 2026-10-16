@@ -19,7 +19,8 @@ from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
 from app.profile_targets import (ProfileTarget, UdpSecurityMode,
                                  default_udp_mode, validate_target_mode)
-from app.services.profile_resolution import ProfileNotFound, resolve_profile
+from app.services.profile_resolution import (DefaultProfileMissing, ProfileNotFound,
+                                             resolve_profile)
 from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
                                resolve_runtime_paths)
 from app.security import issue_profile_token, verify_profile_token
@@ -356,6 +357,15 @@ def _content_disposition(filename: str) -> str:
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe)}'
 
 
+async def _render_profile_config(db: AsyncSession, profile_id: Optional[int], locale: Optional[str]) -> str:
+    """生成入口统一错误语义：显式 id 不存在 404；省略且无默认档案 422"""
+    try:
+        return await generate_surge_config(db, profile_id, locale)
+    except ProfileNotFound as exc:
+        raise HTTPException(404, "配置方案不存在") from exc
+    except DefaultProfileMissing as exc:
+        raise HTTPException(422, "未指定 profile_id 且不存在默认配置方案") from exc
+
 @router.get("/generate")
 async def generate_config(
     profile_id: Optional[int] = None,
@@ -364,7 +374,7 @@ async def generate_config(
     db: AsyncSession = Depends(get_db),
 ):
     """内存生成配置：不写任何服务器文件（服务端导出走 POST /{profile_id}/exports）"""
-    content = await generate_surge_config(db, profile_id, locale)
+    content = await _render_profile_config(db, profile_id, locale)
     headers = {"Content-Disposition": _content_disposition(filename)} if filename else {}
     return PlainTextResponse(content, media_type="text/plain", headers=headers)
 
@@ -446,7 +456,7 @@ async def preview_config(
     locale: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    content = await generate_surge_config(db, profile_id, locale)
+    content = await _render_profile_config(db, profile_id, locale)
     return {"content": content, "size": len(content)}
 
 

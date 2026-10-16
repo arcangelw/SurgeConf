@@ -651,3 +651,159 @@ async def test_general_skips_none_and_empty_values(db):
     assert not any(l.startswith("http-api ") for l in general.splitlines())
     assert not any(l.startswith("internet-test-url ") for l in general.splitlines())
     assert "loglevel = info" in general
+
+
+# ════════════════════════════════════════════
+# 六、档案解析与数据作用域（全局 + 当前档案）
+# ════════════════════════════════════════════
+
+import pytest_asyncio
+from types import SimpleNamespace
+from sqlalchemy import select, event
+from app.models import ConfigProfile, HostMapping
+from app.services.profile_resolution import (
+    DefaultProfileMissing, ProfileNotFound, profile_scope, resolve_profile,
+)
+
+
+@pytest_asyncio.fixture
+async def two_profiles(db):
+    """默认档案(first) + 第二档案(second)，两者不共用任何定制数据"""
+    first = (await db.execute(
+        select(ConfigProfile).where(ConfigProfile.is_default == True)
+    )).scalar_one()
+    second = ConfigProfile(
+        name="第二档案", target="mac_workstation", udp_security_mode="scoped",
+        locale="zh",
+    )
+    db.add(second)
+    await db.commit()
+    return SimpleNamespace(first=first, second=second)
+
+
+def _add_rule(db, profile_id, rule_text, position="general", sort_order=0):
+    db.add(CustomRule(profile_id=profile_id, rule_text=rule_text,
+                      position=position, sort_order=sort_order, enabled=True))
+
+
+def _add_host(db, profile_id, domain, ip, skip_proxy=True, sort_order=0):
+    db.add(HostMapping(profile_id=profile_id, domain=domain,
+                       target=f"server:{ip}", skip_proxy=skip_proxy,
+                       enabled=True, sort_order=sort_order))
+
+
+@pytest.mark.asyncio
+async def test_explicit_missing_profile_never_falls_back(db):
+    """显式 id 不存在：抛 ProfileNotFound，绝不回退默认档案"""
+    with pytest.raises(ProfileNotFound):
+        await generate_surge_config(db, profile_id=99999)
+
+
+@pytest.mark.asyncio
+async def test_explicit_zero_profile_is_not_treated_as_omitted(db):
+    """显式 0 是显式 id：按不存在处理，不落入默认档案分支"""
+    with pytest.raises(ProfileNotFound):
+        await generate_surge_config(db, profile_id=0)
+
+
+@pytest.mark.asyncio
+async def test_omitted_profile_without_default_raises(db):
+    """省略 id 且无默认档案：DefaultProfileMissing，而不是静默空档案生成"""
+    default = (await db.execute(
+        select(ConfigProfile).where(ConfigProfile.is_default == True)
+    )).scalar_one()
+    await db.delete(default)
+    await db.commit()
+    with pytest.raises(DefaultProfileMissing):
+        await generate_surge_config(db)
+
+
+@pytest.mark.asyncio
+async def test_rules_and_hosts_are_global_plus_current_only(db, two_profiles):
+    """规则与 Host 作用域 = 全局(NULL) + 当前档案；其他档案一律不可见"""
+    _add_rule(db, None, "DOMAIN,global.example,DIRECT")
+    _add_rule(db, two_profiles.first.id, "DOMAIN,work.example,DIRECT")
+    _add_rule(db, two_profiles.second.id, "DOMAIN,private.example,DIRECT")
+    _add_host(db, None, "global-host.example", "203.0.113.10")
+    _add_host(db, two_profiles.first.id, "work-host.example", "203.0.113.11")
+    _add_host(db, two_profiles.second.id, "private-host.example", "203.0.113.12")
+    await db.commit()
+
+    config = await generate_surge_config(db, two_profiles.first.id)
+    assert "global.example" in config and "work.example" in config
+    assert "global-host.example" in config and "work-host.example" in config
+    assert "private.example" not in config and "private-host.example" not in config
+
+    # 省略 id 解析默认档案(=first)：作用域与显式 first 一致
+    config_default = await generate_surge_config(db)
+    assert "work.example" in config_default and "work-host.example" in config_default
+    assert "private.example" not in config_default and "private-host.example" not in config_default
+
+    # 换到 second：当前档案条目互换，全局条目始终在场
+    config_second = await generate_surge_config(db, two_profiles.second.id)
+    assert "private.example" in config_second and "private-host.example" in config_second
+    assert "global.example" in config_second and "global-host.example" in config_second
+    assert "work.example" not in config_second and "work-host.example" not in config_second
+
+
+@pytest.mark.asyncio
+async def test_rule_and_host_scope_applied_in_sql_not_python(db, two_profiles):
+    """作用域必须下推到 SQL：custom_rules / host_mappings 语句带 profile 谓词"""
+    bind = db.get_bind()
+    engine = getattr(bind, "sync_engine", bind)  # AsyncEngine 取底层；sync Engine 直接用
+    captured: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        captured.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        await generate_surge_config(db, two_profiles.first.id)
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    rule_stmts = [s for s in captured if "FROM custom_rules" in s]
+    host_stmts = [s for s in captured if "FROM host_mappings" in s]
+    assert rule_stmts, "生成器应从 custom_rules 表查询规则"
+    assert host_stmts, "生成器应从 host_mappings 表查询 Host"
+    for stmt in rule_stmts + host_stmts:
+        assert "profile_id IS NULL" in stmt
+        assert "profile_id =" in stmt
+
+
+def test_profile_scope_predicate_shape():
+    """profile_scope 产出 SQL 谓词：IS NULL OR = 当前档案"""
+    from sqlalchemy.dialects import sqlite
+    compiled = str(profile_scope(HostMapping, 7).compile(dialect=sqlite.dialect()))
+    assert "host_mappings.profile_id IS NULL" in compiled
+    assert "host_mappings.profile_id = ?" in compiled
+
+
+@pytest.mark.asyncio
+async def test_locale_target_and_general_never_cross_profiles(db, two_profiles):
+    """locale / target / General / MITM 只来自本次解析的档案实例"""
+    from app.default_config import DEFAULT_MITM
+    two_profiles.second.locale = "en"
+    two_profiles.second.target = "ios_mobile"
+    two_profiles.second.udp_security_mode = "compatible"
+    two_profiles.second.general = {"loglevel": "debug"}
+    two_profiles.second.mitm = {"hostname": "second.example"}
+    await db.commit()
+
+    second_config = await generate_surge_config(db, two_profiles.second.id)
+    second_general = _general_section(second_config)
+    # second：英文分组名 + iOS 强制键 + 自己的 General/MITM 值
+    assert "Automatic" in second_config and "自动选择" not in second_config
+    assert "compatibility-mode = 1" in second_general
+    assert "auto-suspend = true" in second_general
+    assert "loglevel = debug" in second_general
+    assert "hostname = second.example" in second_config
+
+    first_config = await generate_surge_config(db, two_profiles.first.id)
+    first_general = _general_section(first_config)
+    # first：中文 + workstation（无 iOS 强制键）+ 默认值，不串 second 的任何定制
+    assert "自动选择" in first_config and "Automatic" not in first_config
+    assert "compatibility-mode" not in first_general
+    assert "loglevel = debug" not in first_general
+    assert "second.example" not in first_config
+    assert DEFAULT_MITM["hostname"] in first_config

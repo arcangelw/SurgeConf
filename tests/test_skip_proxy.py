@@ -33,7 +33,7 @@ async def test_skip_proxy_merge_default_custom_host(db):
     # 其他方案的 host（即使勾选）不并入当前配置
     db.add(HostMapping(domain="other.example.com", target="server:1.1.1.1",
                        skip_proxy=True, enabled=True, sort_order=2, profile_id=default_pid + 1000))
-    # 规则管理的默认 host（profile_id=None）即使 skip_proxy=True 也不并入
+    # 全局 host（profile_id=None，规则管理的默认映射）勾选后同样并入
     db.add(HostMapping(domain="default.example.com", target="server:1.1.1.1",
                        skip_proxy=True, enabled=True, sort_order=3, profile_id=None))
     await db.commit()
@@ -52,8 +52,8 @@ async def test_skip_proxy_merge_default_custom_host(db):
     assert "drop.example.com" not in items
     # 其他方案的 host 不并入
     assert "other.example.com" not in items
-    # 规则管理的默认 host 不并入 skip-proxy
-    assert "default.example.com" not in items
+    # 全局勾选的默认 host 也并入（作用域 = 全局 + 当前档案）
+    assert "default.example.com" in items
     # 去重
     assert len(items) == len(set(items))
 

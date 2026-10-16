@@ -9,11 +9,12 @@ from sqlalchemy import select
 
 from app.models import (
     ProxyNode, RegionGroup, ServiceGroup,
-    ConfigProfile, RuleSource, Subscription,
+    RuleSource, Subscription,
     CustomRule, HostMapping, SystemConfig,
 )
 from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
 from app.profile_targets import ProfileTarget, filter_general_for_target
+from app.services.profile_resolution import profile_scope, resolve_profile
 
 # 默认排除关键词（优先使用系统配置）
 DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
@@ -93,15 +94,10 @@ def _display_name(node: ProxyNode, sub_map: dict) -> str:
 
 
 async def generate_surge_config(db: AsyncSession, profile_id: int | None = None, locale_override: str | None = None) -> str:
-    profile = None
-    if profile_id:
-        result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
-        profile = result.scalar_one_or_none()
-    if not profile:
-        result = await db.execute(select(ConfigProfile).where(ConfigProfile.is_default == True).limit(1))
-        profile = result.scalar_one_or_none()
+    # 唯一档案解析：显式 id（含 0/负数）不存在即 ProfileNotFound，仅省略时取默认
+    profile = await resolve_profile(db, profile_id)
 
-    locale = locale_override or (profile.locale if profile else "zh")
+    locale = locale_override or (profile.locale or "zh")
 
     def t(name: str) -> str:
         return locale_translate(name, locale)
@@ -152,7 +148,7 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     # Host 映射（提前查询：[Host] 段与 skip-proxy 合并共用）
     host_result = await db.execute(
         select(HostMapping)
-        .where(HostMapping.enabled == True)
+        .where(HostMapping.enabled == True, profile_scope(HostMapping, profile.id))
         .order_by(HostMapping.sort_order)
     )
     host_mappings = host_result.scalars().all()
@@ -167,12 +163,12 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     env_http_api = validated_access_env("SURGE_HTTP_API")
     if env_http_api:
         general["http-api"] = env_http_api
-    if profile and profile.general:
+    if profile.general:
         general.update(profile.general)
     # skip-proxy：默认条目 + 旧残留 + 系统级自定义 + host 勾选域名，合并去重
     general["skip-proxy"] = ", ".join(_build_skip_proxy(profile, sys_config, host_mappings))
     # 目标能力过滤：跳过 None/空字符串后，丢弃平台不支持键并强制安全值
-    profile_target = ProfileTarget(profile.target) if profile else ProfileTarget.MAC_WORKSTATION
+    profile_target = ProfileTarget(profile.target)
     general = filter_general_for_target(
         profile_target, {k: v for k, v in general.items() if v is not None and v != ""})
 
@@ -218,14 +214,16 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     # 从新表读取自定义规则
     pre_rules_result = await db.execute(
         select(CustomRule)
-        .where(CustomRule.enabled == True, CustomRule.position == "pre")
+        .where(CustomRule.enabled == True, CustomRule.position == "pre",
+               profile_scope(CustomRule, profile.id))
         .order_by(CustomRule.sort_order)
     )
     pre_rules = pre_rules_result.scalars().all()
 
     general_rules_result = await db.execute(
         select(CustomRule)
-        .where(CustomRule.enabled == True, CustomRule.position == "general")
+        .where(CustomRule.enabled == True, CustomRule.position == "general",
+               profile_scope(CustomRule, profile.id))
         .order_by(CustomRule.sort_order)
     )
     general_rules = general_rules_result.scalars().all()
@@ -242,14 +240,14 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # URL Rewrite
     sections.append("[URL Rewrite]")
-    rewrites = profile.url_rewrites if (profile and profile.url_rewrites) else DEFAULT_URL_REWRITES
+    rewrites = profile.url_rewrites if profile.url_rewrites else DEFAULT_URL_REWRITES
     for rule in rewrites:
         sections.append(rule)
     sections.append("")
 
     # Header Rewrite
     sections.append("[Header Rewrite]")
-    header_rewrites = profile.header_rewrites if (profile and profile.header_rewrites) else DEFAULT_HEADER_REWRITES
+    header_rewrites = profile.header_rewrites if profile.header_rewrites else DEFAULT_HEADER_REWRITES
     for rule in header_rewrites:
         sections.append(rule)
     sections.append("")
@@ -260,7 +258,7 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # MITM
     sections.append("[MITM]")
-    mitm = {**DEFAULT_MITM, **(profile.mitm or {})} if profile else DEFAULT_MITM
+    mitm = {**DEFAULT_MITM, **(profile.mitm or {})}
     for key, value in mitm.items():
         if isinstance(value, bool):
             sections.append(f"{key} = {'true' if value else 'false'}")
@@ -470,7 +468,7 @@ def _build_skip_proxy(profile, sys_config: dict, host_mappings) -> list[str]:
     items = list(DEFAULT_SKIP_PROXY)
 
     # 旧版 profile.general 中残留的 skip-proxy（升级兼容）
-    if profile and profile.general:
+    if profile.general:
         legacy = profile.general.get("skip-proxy")
         if isinstance(legacy, str):
             items.extend(x.strip() for x in legacy.split(",") if x.strip())
@@ -483,11 +481,10 @@ def _build_skip_proxy(profile, sys_config: dict, host_mappings) -> list[str]:
     except (ValueError, TypeError):
         pass
 
-    # 仅「当前配置方案」中勾选的自定义 host 参与联动；
-    # 规则管理的默认 host（profile_id 为空）与其他方案的 host 都不并入
-    current_pid = profile.id if profile else None
+    # host_mappings 已在 SQL 层按「全局 + 当前档案」作用域过滤；
+    # 勾选 skip_proxy 的映射全部并入，其他档案不会出现在产物中
     for m in host_mappings:
-        if m.profile_id is not None and m.profile_id == current_pid and getattr(m, "skip_proxy", True):
+        if m.skip_proxy:
             domain = (m.domain or "").strip()
             if domain:
                 items.append(domain)

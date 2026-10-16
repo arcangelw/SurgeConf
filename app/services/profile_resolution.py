@@ -5,10 +5,19 @@
 ``resolve_profile``，禁止各自再实现隐式回退。
 """
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import ConfigProfile
+
+
+def profile_scope(model, profile_id: int):
+    """档案作用域 SQL 谓词：全局（profile_id IS NULL）或属于当前档案。
+
+    CustomRule / HostMapping 的生成查询必须在数据库层应用该谓词，
+    禁止先加载全部行再在 Python 过滤。
+    """
+    return or_(model.profile_id.is_(None), model.profile_id == profile_id)
 
 
 class ProfileNotFound(Exception):
