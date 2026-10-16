@@ -86,11 +86,15 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
   请求带 `X-Key: <key>` 头认证。注意 `external-controller-access` **不会**
   启用 HTTP API 端点（两者是独立配置）：
   ```bash
-  unset KEY                        # 先清防继承已 export 的旧值
-  read -sr KEY                     # 手动输入 key：不回显、不进 shell 历史
-  printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
-    https://127.0.0.1:6171/v1/profiles/reload
-  unset KEY                        # 用完即清
+  (                                # 子 shell：块内 exit 不退出当前交互 shell
+    unset KEY                      # 先清防继承已 export 的旧值
+    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
+    printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
+      https://127.0.0.1:6171/v1/profiles/reload
+    rc=$?                          # 捕获 curl 退出码后再清理
+    unset KEY                      # 用完即清
+    exit "$rc"                     # curl 结果带回当前 shell 的 $?
+  )
   ```
   - 仓库默认 `http-api-tls = true`：示例必须走 `https://`，默认前提是
     **已将 Surge MITM CA 加入系统钥匙串并信任**（Surge 导出 CA 后双击
@@ -102,18 +106,27 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
     加密通道），执行后必须 `unset` 清理变量；禁止把真实 key 写进
     命令行参数、临时文件、URL query、环境导出或粘贴到任何工单。
   - 若 Surge MITM CA **尚未**装入系统信任，用下面的可执行分支显式
-    指定 CA 文件（交互输入真实路径，验证为普通文件；结束后同样
-    `unset` 清理；不得用占位路径充当实际参数）：
+    指定 CA 文件（同样自包含，独立读取并验证路径；不得用占位路径
+    充当实际参数）：
   ```bash
-  unset CA_FILE                    # 先清防继承已 export 的旧值
-  read -r CA_FILE                  # 输入本机真实的 CA 文件路径
-  [ -f "$CA_FILE" ] || { echo "CA 文件不存在或不是普通文件" >&2; exit 1; }
-  printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
-    --cacert "$CA_FILE" \
-    https://127.0.0.1:6171/v1/profiles/reload
-  unset CA_FILE
+  (                                # 自包含：不依赖上一块，可单独复制执行
+    unset KEY CA_FILE              # 先清防继承已 export 的旧值
+    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
+    read -r CA_FILE                # 输入本机真实的 CA 文件路径
+    [ -f "$CA_FILE" ] || { echo "CA 文件不存在或不是普通文件" >&2; \
+      unset KEY CA_FILE; exit 1; } # 验证失败同样清理 KEY/CA_FILE 再退出
+    printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
+      --cacert "$CA_FILE" \
+      https://127.0.0.1:6171/v1/profiles/reload
+    rc=$?                          # 捕获 curl 退出码后再清理
+    unset KEY CA_FILE              # 用完即清
+    exit "$rc"                     # curl 结果带回当前 shell 的 $?
+  )
   ```
-  （分支沿用上一块已读入的 `$KEY`；用完记得再 `unset KEY`。）
+  （两个代码块各自自包含：复制任一块单独执行，都会在子 shell 内
+  完成「清理继承值 → 隐藏读取 → 发送 → 捕获退出码 → 清理变量」
+  闭环，KEY 不留在当前 shell 的变量里；块内 `exit` 只退出子 shell，
+  不会退出你正在使用的交互 shell，curl 退出码经 `$?` 带回。）
 
 官方文档：[HTTP API](https://manual.nssurge.com/tools/http-api.html)、[Surge CLI](https://manual.nssurge.com/tools/cli.html)。
 

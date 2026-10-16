@@ -301,36 +301,143 @@ class TestDocumentCoverage:
             for name, rule_id in violations)
 
 
-class TestHttpApiExampleSafety:
-    """Surge HTTP API / curl 示例片段的结构性安全约束（Fix Round 3）。
+# 与 docs/RUNTIME_OPERATIONS.md 第 3 节两个 reload 代码块逐字同步的标准
+# 形态（结构性对照样例：这类「子 shell 内 unset→隐藏 read→stdin header
+# curl→捕获 rc→unset→exit rc」写法必须始终通过下方扫描器，防止规则
+# 收紧时误伤合法示例；文档块更新时同步此处）。
+_TRUSTED_KEYCHAIN_RELOAD_BLOCK = """\\
+  (                                # 子 shell：块内 exit 不退出当前交互 shell
+    unset KEY                      # 先清防继承已 export 的旧值
+    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
+    printf 'X-Key: %s\\n' "$KEY" | curl -sS -X POST --header @- \\
+      https://127.0.0.1:6171/v1/profiles/reload
+    rc=$?                          # 捕获 curl 退出码后再清理
+    unset KEY                      # 用完即清
+    exit "$rc"                     # curl 结果带回当前 shell 的 $?
+  )"""
 
-    解析 markdown 的 bash 代码块，先把反斜杠续行拼成完整逻辑命令，
-    再 ``shlex`` 分词检测 curl argv：``--insecure``、独立 ``-k``、含
-    k 的组合短选项（如 ``-sk`` / ``-fsSk``）、X-Key 头值进 argv；
-    另按逻辑命令（含续行拼接结果）检查示例端口 6171 不得出现明文
-    ``http://``。检测的是结构行为，不绑定具体措辞。
+_CACERT_FALLBACK_RELOAD_BLOCK = """\\
+  (                                # 自包含：不依赖上一块，可单独复制执行
+    unset KEY CA_FILE              # 先清防继承已 export 的旧值
+    read -sr KEY                   # 手动输入 key：不回显、不进 shell 历史
+    read -r CA_FILE                # 输入本机真实的 CA 文件路径
+    [ -f "$CA_FILE" ] || { echo "CA 文件不存在或不是普通文件" >&2; \\
+      unset KEY CA_FILE; exit 1; } # 验证失败同样清理 KEY/CA_FILE 再退出
+    printf 'X-Key: %s\\n' "$KEY" | curl -sS -X POST --header @- \\
+      --cacert "$CA_FILE" \\
+      https://127.0.0.1:6171/v1/profiles/reload
+    rc=$?                          # 捕获 curl 退出码后再清理
+    unset KEY CA_FILE              # 用完即清
+    exit "$rc"                     # curl 结果带回当前 shell 的 $?
+  )"""
+
+
+class TestHttpApiExampleSafety:
+    """Surge HTTP API / curl 示例片段的结构性安全约束（Fix Round 4）。
+
+    解析 markdown 的 shell 类 fenced 代码块（bash/sh/shell/zsh，info
+    string 大小写归一），行尾反斜杠续行拼接为完整逻辑命令，再用
+    ``shlex.shlex(..., punctuation_chars="|&;()<>")`` 分词——无空格的
+    ``|`` / ``&&`` / ``;`` 同样成为独立命令边界。对逻辑命令中的
+    **每一个** curl 命令段（含 ``/usr/bin/curl`` 等绝对路径形式、
+    一行多个 curl）独立检测：
+
+    - TLS：``--insecure``、独立 ``-k``、含 k 的组合短选项（``-sk`` /
+      ``-fsSk``）；``--header`` / ``--cacert`` 等长选项与 ``-H<值>``
+      附着形式（含 ``:`` 或空格）天然不匹配短选项模式；
+    - X-Key argv：``-H 值`` / ``--header 值`` / ``-H值`` /
+      ``--header=值`` 四种形式携带 X-Key 头（头名大小写不敏感）一律
+      拒绝；唯一放行 stdin 形式 ``@-``；任何 ``@文件`` 头来源（防
+      临时 secret 文件）也拒绝；
+    - 6171：curl 任一 arg（含 ``--url`` 值与位置 URL）出现明文
+      ``http://`` 即拒绝。
+
+    失败消息只含 ``(文件, 规则类别)``，绝不回显命令或 header 内容；
+    检测结构行为，不绑定具体措辞。
     """
 
-    @staticmethod
-    def _bash_logical_lines(files):
-        """全部 md 文档 ```bash 代码块内续行拼接后的逻辑命令。"""
-        for name in files:
-            if not (name.endswith(".md") or name == "README.md"):
-                continue
-            text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
+    SHELL_LANGS = frozenset({"bash", "sh", "shell", "zsh"})
+    _PUNCT = frozenset("|&;()<>")
+
+    RULE_INSECURE = "insecure-curl"
+    RULE_KEY_ARGV = "x-key-argv"
+    RULE_HEADER_FILE = "header-from-file"
+    RULE_PLAINTEXT_HTTP = "6171-plaintext-http"
+
+    # ===== 注入矩阵：每类常见绕过写法必须命中对应规则（红） =====
+    # (fenced 语言, 块内容, 期望命中的规则类别)；语言覆盖大小写与
+    # bash/sh/shell/zsh 变体。
+    INJECTIONS = [
+        pytest.param(
+            "bash",
+            'printf \'X-Key: %s\\n\' "$KEY" | curl -sk '
+            'https://127.0.0.1:6171/v1/profiles/reload|jq .',
+            RULE_INSECURE,
+            id="nospace-pipe-combined-short-sk"),
+        pytest.param(
+            "bash",
+            'printf \'X-Key: %s\\n\' "$KEY" | curl -sS -X POST --header @- \\\n'
+            '  --insecure \\\n'
+            '  https://127.0.0.1:6171/v1/profiles/reload',
+            RULE_INSECURE,
+            id="insecure-on-continuation-line"),
+        pytest.param(
+            "zsh",
+            '/usr/bin/curl -sS https://example.invalid/ && '
+            'curl -k https://127.0.0.1:6171/v1/profiles/reload',
+            RULE_INSECURE,
+            id="second-curl-on-line-insecure"),
+        pytest.param(
+            "SH",
+            'curl -sS -HX-Key: hunter2 https://127.0.0.1:6171/v1/profiles/reload',
+            RULE_KEY_ARGV,
+            id="attached-h-option"),
+        pytest.param(
+            "bash",
+            "curl -sS --header='X-Key: hunter2' "
+            "https://127.0.0.1:6171/v1/profiles/reload",
+            RULE_KEY_ARGV,
+            id="long-header-equals"),
+        pytest.param(
+            "bash",
+            "curl -sS -H 'x-key: hunter2' "
+            "https://127.0.0.1:6171/v1/profiles/reload",
+            RULE_KEY_ARGV,
+            id="lowercase-header-name"),
+        pytest.param(
+            "shell",
+            'curl -sS --header @/tmp/secret-headers '
+            'https://127.0.0.1:6171/v1/profiles/reload',
+            RULE_HEADER_FILE,
+            id="header-from-temp-file"),
+        pytest.param(
+            "sh",
+            'curl -sS --url http://127.0.0.1:6171/v1/profiles/reload',
+            RULE_PLAINTEXT_HTTP,
+            id="plain-http-via-url-option"),
+    ]
+
+    @classmethod
+    def _bash_logical_lines(cls, paths):
+        """``paths`` 为 ``(展示名, Path)`` 序列；产出每个 shell 代码块内
+        续行拼接后的逻辑命令。"""
+        for display, path in paths:
+            text = path.read_text(encoding="utf-8")
             in_block = False
             buffer: list[str] = []
             for raw in text.splitlines():
                 stripped = raw.strip()
                 if not in_block:
-                    if stripped.startswith("```bash"):
-                        in_block = True
-                        buffer = []
+                    if stripped.startswith("```") and len(stripped) > 3:
+                        info = stripped[3:].split()
+                        if info and info[0].lower() in cls.SHELL_LANGS:
+                            in_block = True
+                            buffer = []
                     continue
                 if stripped.startswith("```"):
                     in_block = False
-                    for line in TestHttpApiExampleSafety._joined(buffer):
-                        yield name, line
+                    for line in cls._joined(buffer):
+                        yield display, line
                     buffer = []
                     continue
                 buffer.append(raw)
@@ -350,49 +457,145 @@ class TestHttpApiExampleSafety:
             yield current
 
     @staticmethod
-    def _curl_argv(logical_line):
-        """逻辑命令中 curl 的 argv 段（到下一个管道边界）；无 curl 为 None。"""
+    def _tokens(logical_line):
+        """带标点边界的分词：无空格 ``|``/``&&``/``;`` 也成独立 token。"""
         try:
-            tokens = shlex.split(logical_line)
+            lex = shlex.shlex(logical_line, posix=True,
+                              punctuation_chars="|&;()<>")
+            lex.whitespace_split = True
+            return list(lex)
         except ValueError:
-            tokens = logical_line.split()
-        if "curl" not in tokens:
-            return None
-        argv = []
-        for token in tokens[tokens.index("curl") + 1:]:
-            if token == "|":
-                break
-            argv.append(token)
-        return argv
+            return logical_line.split()
+
+    @classmethod
+    def _is_curl(cls, token):
+        return token == "curl" or token.endswith("/curl")
+
+    @classmethod
+    def _is_boundary(cls, token):
+        return bool(token) and all(c in cls._PUNCT for c in token)
+
+    @classmethod
+    def _curl_segments(cls, tokens):
+        """逻辑命令中**每一个** curl 命令段的 argv（管道/&&/; 等边界
+        截断；一行多个 curl 各自独立）。"""
+        segments = []
+        argv = None
+        for tok in tokens:
+            if argv is None:
+                if cls._is_curl(tok):
+                    argv = []
+                continue
+            if cls._is_boundary(tok):
+                segments.append(argv)
+                argv = None
+            elif cls._is_curl(tok):
+                segments.append(argv)
+                argv = []
+            else:
+                argv.append(tok)
+        if argv is not None:
+            segments.append(argv)
+        return segments
 
     @staticmethod
     def _is_insecure_flag(token: str) -> bool:
         if token in ("--insecure", "-k"):
             return True
         # 组合短选项：单 - 后纯字母且含 k（-sk / -fsSk 等）；
-        # --header/--cacert 等长选项以 -- 开头，天然不匹配
+        # --header/--cacert 等长选项与 -H<值> 附着（含 : 或空格）不匹配
         return bool(re.fullmatch(r"-[a-zA-Z]*k[a-zA-Z]*", token))
 
+    @staticmethod
+    def _header_values(argv):
+        """argv 中 -H/--header 的全部值（分离 / 附着 / = 三类形式）。"""
+        values = []
+        i = 0
+        while i < len(argv):
+            tok = argv[i]
+            if tok in ("-H", "--header"):
+                if i + 1 < len(argv):
+                    values.append(argv[i + 1])
+                    i += 1
+            elif tok.startswith("--header="):
+                values.append(tok[len("--header="):])
+            elif tok.startswith("-H") and len(tok) > 2:
+                values.append(tok[2:])
+            i += 1
+        return values
+
+    @classmethod
+    def _segment_violations(cls, argv):
+        """单 curl 段命中的规则类别集合。"""
+        found = set()
+        if any(cls._is_insecure_flag(t) for t in argv):
+            found.add(cls.RULE_INSECURE)
+        for value in cls._header_values(argv):
+            if value.startswith("@"):
+                if value != "@-":
+                    found.add(cls.RULE_HEADER_FILE)
+            elif value.split(":", 1)[0].strip().lower() == "x-key":
+                found.add(cls.RULE_KEY_ARGV)
+        joined = " ".join(argv)
+        if "6171" in joined and "http://" in joined:
+            found.add(cls.RULE_PLAINTEXT_HTTP)
+        return found
+
+    @classmethod
+    def _violations(cls, paths):
+        """全部 ``(文件, 规则类别)``（按出现去重，不回显命令/header）。"""
+        seen: list[tuple[str, str]] = []
+        for display, line in cls._bash_logical_lines(paths):
+            for argv in cls._curl_segments(cls._tokens(line)):
+                for rule in cls._segment_violations(argv):
+                    item = (display, rule)
+                    if item not in seen:
+                        seen.append(item)
+        return seen
+
+    @staticmethod
+    def _repo_md_paths(files):
+        return [(name, PROJECT_ROOT / name) for name in files
+                if name.endswith(".md")]
+
+    def _repo_rule_hits(self, repo_text_files, rule):
+        return [v for v in self._violations(self._repo_md_paths(repo_text_files))
+                if v[1] == rule]
+
     def test_no_insecure_curl_flags(self, repo_text_files):
-        offenders = []
-        for name, line in self._bash_logical_lines(repo_text_files):
-            argv = self._curl_argv(line)
-            if argv and any(self._is_insecure_flag(t) for t in argv):
-                offenders.append(f"{name}: {line[:90]}")
+        offenders = self._repo_rule_hits(repo_text_files, self.RULE_INSECURE)
         assert offenders == [], f"curl 跳过证书校验的示例: {offenders}"
 
     def test_no_key_in_curl_argv(self, repo_text_files):
-        offenders = []
-        for name, line in self._bash_logical_lines(repo_text_files):
-            argv = self._curl_argv(line)
-            if argv and any(t.startswith("X-Key") for t in argv):
-                offenders.append(f"{name}: {line[:90]}")
+        offenders = self._repo_rule_hits(repo_text_files, self.RULE_KEY_ARGV)
         assert offenders == [], f"X-Key 经 curl argv 注入: {offenders}"
 
+    def test_no_header_values_from_files(self, repo_text_files):
+        offenders = self._repo_rule_hits(repo_text_files, self.RULE_HEADER_FILE)
+        assert offenders == [], f"curl 头值来自 @文件（临时 secret 风险）: {offenders}"
+
     def test_http_api_port_never_plaintext_http(self, repo_text_files):
-        offenders = [
-            f"{name}: {line[:90]}"
-            for name, line in self._bash_logical_lines(repo_text_files)
-            if "6171" in line and "http://" in line]
+        offenders = self._repo_rule_hits(repo_text_files,
+                                         self.RULE_PLAINTEXT_HTTP)
         assert offenders == [], (
             f"默认 http-api-tls=true 的示例端口出现明文 http://: {offenders}")
+
+    @pytest.mark.parametrize("lang,block,expected_rule", INJECTIONS)
+    def test_injection_matrix_is_detected(self, tmp_path, lang, block,
+                                          expected_rule):
+        """矩阵里每类绕过写法都必须被扫描器命中（结构性红）。"""
+        doc = tmp_path / "injected.md"
+        doc.write_text(f"```{lang}\n{block}\n```\n", encoding="utf-8")
+        hits = self._violations([(str(doc), doc)])
+        assert (str(doc), expected_rule) in hits, (
+            f"注入样例未被检出: {hits}")
+
+    def test_documented_reload_blocks_stay_clean(self, tmp_path):
+        """文档标准两块（子 shell 自包含形态）必须始终通过扫描器。"""
+        doc = tmp_path / "canonical.md"
+        doc.write_text(
+            "# canonical reload blocks\n\n```bash\n"
+            + _TRUSTED_KEYCHAIN_RELOAD_BLOCK + "\n```\n\n```bash\n"
+            + _CACERT_FALLBACK_RELOAD_BLOCK + "\n```\n",
+            encoding="utf-8")
+        assert self._violations([(str(doc), doc)]) == []
