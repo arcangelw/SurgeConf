@@ -595,3 +595,68 @@ async def test_rule_source_ip_flags_roundtrip(tmp_path):
     finally:
         conn.close()
     assert restored == sum(1 for rs in DEFAULT_RULE_SOURCES if rs.get("ip_rules"))
+
+
+# ===== Round 2：0004 downgrade 无记账表 / nullable 指纹 =====
+
+
+def test_0004_downgrade_without_records_table_succeeds(tmp_path):
+    """无 data_migration_records 表（外部工具建库 / 尚未跑业务迁移）时，
+    0004 downgrade 不因 DELETE 解析缺失表报错；ip_rules 列照常删除、数据行保留"""
+    db_path = tmp_path / "no-records.db"
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("DROP TABLE data_migration_records")
+        conn.execute(
+            "INSERT INTO rule_sources (name, url, action, rule_type, enabled, sort_order, ip_rules) "
+            "VALUES ('X', 'https://x', 'DIRECT', 'RULE-SET', 1, 5, 1)")
+    conn.close()
+
+    # 不抛 no such table：Python 层先查 sqlite_master 再 DELETE
+    command.downgrade(database_migration._alembic_config(db_path), "0003_profile_targets")
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(rule_sources)").fetchall()}
+        rows = conn.execute("SELECT name, sort_order FROM rule_sources").fetchall()
+    finally:
+        conn.close()
+    assert "ip_rules" not in columns
+    assert rows == [("X", 5)]
+
+
+def test_unversioned_0003_nullable_sort_order_still_identified(tmp_path):
+    """旧 0003 库（sort_order 本就可空）仍精确识别为 0003：
+    0004 的 nullable 收紧要求不回溯误伤更早 revision"""
+    db_path = tmp_path / "old-0003.db"
+    command.upgrade(database_migration._alembic_config(db_path), "0003_profile_targets")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("DROP TABLE alembic_version")
+    conn.close()
+    assert database_migration.identify_unversioned_schema(db_path) == "0003_profile_targets"
+
+
+@pytest.mark.asyncio
+async def test_unversioned_nullable_sort_order_not_stamped_as_0004(tmp_path):
+    """表/列/CHECK 与 0004 完全一致但 sort_order 可空（外部工具加列）：
+    fail closed 拒绝识别与 stamp，诊断含列名，live 不受影响"""
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    command.upgrade(database_migration._alembic_config(legacy), "0003_profile_targets")
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("ALTER TABLE rule_sources "
+                     "ADD COLUMN ip_rules BOOLEAN NOT NULL DEFAULT 0")
+        conn.execute("DROP TABLE alembic_version")
+    conn.close()
+
+    assert database_migration.identify_unversioned_schema(legacy) is None
+
+    paths = runtime_paths(tmp_path / "app-support")
+    before = paths.database.read_bytes() if paths.database.exists() else None
+    with pytest.raises(RuntimeError, match="sort_order"):
+        await prepare_database(paths, legacy)
+    # 诊断内容已由 match 校验（sort_order 列名进入错误消息）
+    assert (paths.database.read_bytes() if paths.database.exists() else None) == before

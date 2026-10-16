@@ -139,6 +139,14 @@ SCHEMA_REVISION_CHECKS: dict[str, dict[str, dict[str, str]]] = {
     },
 }
 
+# 各 revision 相对更早 revision 新增/收紧的列可空性要求：(表, 列) → 期望 nullable。
+# **新增带列属性要求的 revision 时在此登记**；识别时按 revision 顺序累积
+#（后续 revision 继承更早要求），更早 revision 不被后续要求回溯误伤。
+# True = 可空，False = NOT NULL。
+SCHEMA_REVISION_COLUMN_NULLABILITY: dict[str, dict[tuple[str, str], bool]] = {
+    "0004_rule_source_ip_rules": {("rule_sources", "sort_order"): False},
+}
+
 # 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建
 _IDENTIFY_IGNORED_TABLES = {"alembic_version", "data_migration_records"}
 
@@ -155,11 +163,14 @@ def schema_fingerprints() -> dict[str, dict[str, frozenset[str]]]:
     return fingerprints
 
 
-def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]]:
+def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]],
+                                                  dict[str, dict[str, str]],
+                                                  dict[str, dict[str, bool]]]:
     assert_sqlite_database_safe(database_path)
-    """实际库的表集合、表→列集合、表→命名 CHECK 约束集合（排除簿记表）。
+    """实际库的表集合、表→列集合、表→命名 CHECK 约束集合、表→列 nullable
+    （均排除簿记表）。
 
-    约束经 SQLAlchemy inspector 读取，不解析 sqlite_master DDL 文本
+    约束与列属性经 SQLAlchemy inspector 读取，不解析 sqlite_master DDL 文本
     （避免依赖空白/顺序的脆弱正则）。
     """
     engine = sqlalchemy.create_engine(f"sqlite:///{database_path}")
@@ -168,12 +179,14 @@ def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]], 
         tables = {t for t in inspector.get_table_names()
                   if t not in _IDENTIFY_IGNORED_TABLES}
         columns = {t: {c["name"] for c in inspector.get_columns(t)} for t in tables}
+        nullability = {t: {c["name"]: bool(c["nullable"]) for c in inspector.get_columns(t)}
+                       for t in tables}
         checks = {t: {cc["name"]: cc["sqltext"] for cc in
                       inspector.get_check_constraints(t)}
                   for t in tables}
     finally:
         engine.dispose()
-    return tables, columns, checks
+    return tables, columns, checks, nullability
 
 
 def _normalize_check_expression(sqltext: str) -> str:
@@ -233,6 +246,23 @@ def _accumulated_required_checks(revision: str) -> dict[str, dict[str, str]]:
     return accumulated
 
 
+def _accumulated_column_nullability(revision: str) -> dict[tuple[str, str], bool]:
+    """截至该 revision（含）累积的全部列可空性要求。
+
+    列属性随结构继承：识别 revision 须满足自身及更早 revision 收紧的全部
+    nullable 要求；baseline / 未登记的 revision 返回空（不施加额外要求）。
+    """
+    revisions = list(SCHEMA_REVISION_DELTAS)
+    if revision not in revisions:
+        return {}
+    accumulated: dict[tuple[str, str], bool] = {}
+    for known in revisions:
+        accumulated.update(SCHEMA_REVISION_COLUMN_NULLABILITY.get(known, {}))
+        if known == revision:
+            break
+    return accumulated
+
+
 def _required_check_problems(revision: str,
                              actual_checks: dict[str, dict[str, str]]
                              ) -> tuple[set[str], set[str]]:
@@ -257,7 +287,7 @@ def identify_unversioned_schema(database_path: Path) -> str | None:
     额外列、缺失列、混合多个 revision 的列或缺任一必需约束都返回 None
     （绝不猜测性 stamp）。
     """
-    actual_tables, actual_columns, actual_checks = _actual_schema(database_path)
+    actual_tables, actual_columns, actual_checks, actual_nullability = _actual_schema(database_path)
     for revision, fingerprint in schema_fingerprints().items():
         if actual_tables != set(fingerprint):
             continue
@@ -267,6 +297,11 @@ def identify_unversioned_schema(database_path: Path) -> str | None:
         missing, mismatched = _required_check_problems(revision, actual_checks)
         if missing or mismatched:
             continue
+        # 列可空性（累积要求）：不满足同样 fail closed，绝不猜测性 stamp
+        if any(actual_nullability.get(table, {}).get(column) != expected
+               for (table, column), expected
+               in _accumulated_column_nullability(revision).items()):
+            continue
         return revision
     return None
 
@@ -275,7 +310,7 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
     """与最近 revision 指纹的差异描述：只含表/列/约束名，绝不含数据值"""
     head = _head_revision()
     fingerprint = schema_fingerprints()[head]
-    actual_tables, actual_columns, actual_checks = _actual_schema(database_path)
+    actual_tables, actual_columns, actual_checks, actual_nullability = _actual_schema(database_path)
     problems: list[str] = []
     for table in sorted(set(fingerprint) - actual_tables):
         problems.append(f"缺表 {table}")
@@ -297,6 +332,12 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
         if mismatched:
             problems.append(
                 f"{table} CHECK 约束表达式不一致: {', '.join(sorted(mismatched))}")
+    for (table, column), expected in sorted(_accumulated_column_nullability(head).items()):
+        actual = actual_nullability.get(table, {}).get(column)
+        if actual != expected:
+            describe = "缺失" if actual is None else ("NOT NULL" if not actual else "nullable")
+            wanted = "NOT NULL" if not expected else "nullable"
+            problems.append(f"{table}.{column} 列可空性不符: 期望 {wanted}，实际 {describe}")
     if not problems:
         problems.append("schema 与已知 revision 指纹均不一致（混合列）")
     return problems

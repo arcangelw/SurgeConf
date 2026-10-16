@@ -8,7 +8,7 @@ rule_source_ip_flags_v1 按稳定内置签名 (name + url + rule_type) 完成，
 本迁移只负责 schema 推进。
 
 downgrade 可逆：恢复 sort_order 可空、删除 ip_rules 列，并删除
-rule_source_ip_flags_v1 业务迁移记账（data_migration_records 表存在时），
+rule_source_ip_flags_v1 业务迁移记账（表存在时；不存在直接跳过），
 使 downgrade → upgrade 后回填迁移可以重新执行。
 
 Revision ID: 0004_rule_source_ip_rules
@@ -26,13 +26,6 @@ down_revision = "0003_profile_targets"
 branch_labels = None
 depends_on = None
 
-# data_migration_records 不在 Alembic 管辖（由运行时 _sync_schema 补建），
-# 表不存在时 DELETE 通过 EXISTS 子查询静默 no-op
-_DELETE_IP_FLAGS_RECORD = (
-    "DELETE FROM data_migration_records WHERE key = 'rule_source_ip_flags_v1' "
-    "AND EXISTS (SELECT 1 FROM sqlite_master "
-    "WHERE type = 'table' AND name = 'data_migration_records')")
-
 
 def upgrade() -> None:
     # 存量 NULL sort_order 收敛为 0（NULL 在 SQLite ASC 排序中最小、本就排最前，
@@ -45,9 +38,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # 删除 ip_flags 回填记账：downgrade → upgrade 后迁移可重新回填；
-    # order / retire 迁移记账不随本列删除，保持其语义独立
-    op.execute(_DELETE_IP_FLAGS_RECORD)
+    # 撤销 ip_flags 回填记账：downgrade → upgrade 后迁移可重新回填；
+    # order / retire 迁移记账不随本列删除，保持其语义独立。
+    # data_migration_records 不在 Alembic 管辖（由运行时 _sync_schema 补建），
+    # SQLite 对缺失表的 DELETE 即使谓词恒假也会在解析期报 no such table——
+    # 必须在 Python 层先查 sqlite_master 确认表存在才执行 DELETE。
+    conn = op.get_bind()
+    records_table_exists = conn.execute(sa.text(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'data_migration_records'")).fetchone()
+    if records_table_exists:
+        conn.execute(sa.text(
+            "DELETE FROM data_migration_records WHERE key = 'rule_source_ip_flags_v1'"))
     with op.batch_alter_table("rule_sources") as batch_op:
         batch_op.drop_column("ip_rules")
         batch_op.alter_column("sort_order", existing_type=sa.Integer(), nullable=True)
