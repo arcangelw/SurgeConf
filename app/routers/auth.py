@@ -103,7 +103,7 @@ async def session_info(request: Request):
 
 
 class AccessUpdate(BaseModel):
-    installation_role: Literal["home_gateway"]
+    installation_role: Literal["work_computer", "home_gateway"]
     admin_access: Literal["local_only", "lan_authenticated"]
     current_password: str | None = Field(default=None, max_length=128)
     new_password: str | None = Field(default=None, max_length=128)

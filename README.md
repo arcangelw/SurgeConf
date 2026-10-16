@@ -118,7 +118,8 @@ http://127.0.0.1:61830/docs
 需要在其他设备上管理时，切换为 `lan_authenticated`：
 
 ```bash
-# 1. 设置页（本机访问）→ 访问模式：安装角色 home_gateway + lan_authenticated，
+# 1. 设置页（本机访问）→ 实例角色 + 访问模式 lan_authenticated（实例角色可选
+#    work_computer / home_gateway，只影响新建档案的默认目标设备），
 #    首次切换必须同时设置管理密码（仅保存 scrypt 哈希）
 # 2. 以局域网监听启动：
 SURGE_HOST=0.0.0.0 ./surgeconf.sh run
@@ -143,6 +144,18 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 ```
 
 访问模式切换为 `lan_authenticated` 并设置管理密码后，局域网设备通过 `http://<主机地址>:61830` 登录管理。
+
+### 档案目标设备
+
+每个配置档案面向一个目标设备生成产物，三目标与最低版本：
+
+| 目标 | 用途 | 最低版本 |
+|---|---|---|
+| `mac_workstation` | 单台 Mac 桌面使用 | Surge Mac 5.10.3 |
+| `mac_gateway` | Mac 作为局域网网关（强制 `gateway-restricted-to-lan`） | Surge Mac 5.10.3 |
+| `ios_mobile` | iPhone / iPad（UDP 模式仅 strict / compatible） | Surge iOS 5.14.6 |
+
+实例角色（设置页 → 访问控制）决定**新建档案省略目标时的默认值**（工作电脑 → Mac 工作站，家庭网关 → Mac 网关），不改写已有档案，也不是 Surge 网关（Gateway VM）开关。General 字段按目标裁剪：iOS 产物不含 Mac-only 键，网关强制仅本网段访问。两实例部署、能力矩阵、UDP 阶段边界与 Token 安全详见 [docs/PROFILE_TARGETS.md](docs/PROFILE_TARGETS.md)。
 
 ### launchd 配置持久化
 

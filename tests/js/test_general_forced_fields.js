@@ -197,6 +197,8 @@ function regProfileModal(page, id, name) {
   page.reg("profile-desc", { value: "" });
   page.reg("profile-default", { checked: false });
   page.reg("profile-locale", { value: "zh" });
+  page.reg("profile-target", { value: "mac_workstation" });
+  page.reg("profile-mode", { value: "scoped" });
 }
 
 const generalPuts = (page) =>

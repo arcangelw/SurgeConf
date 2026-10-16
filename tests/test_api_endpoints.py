@@ -257,7 +257,8 @@ async def test_profiles_list_and_detail_contract(client):
     data = (await client.get("/api/configs/profiles")).json()
     assert data
     assert set(data[0]) == {"id", "name", "description", "is_default", "locale",
-                            "target", "token_configured"}
+                            "target", "udp_security_mode", "token_configured"}
+    assert data[0]["udp_security_mode"] in {"strict", "scoped", "compatible"}
     assert data[0]["token_configured"] is False  # 未生成过 token 的档案
 
     detail = (await client.get("/api/configs/profiles/1")).json()
@@ -283,8 +284,9 @@ async def _create(client, name: str, **extra) -> int:
 
 @pytest.mark.asyncio
 async def test_create_profile_fills_mode_by_target_default(client):
-    """创建未传模式：mac_workstation→scoped，ios_mobile→compatible"""
-    mac = await _detail(client, await _create(client, "mac档"))
+    """创建显式 target 未传模式：mac_workstation→scoped，ios_mobile→compatible
+    （省略 target 的角色默认行为见下方实例角色用例）"""
+    mac = await _detail(client, await _create(client, "mac档", target="mac_workstation"))
     assert mac["target"] == "mac_workstation"
     assert mac["udp_security_mode"] == "scoped"
 
@@ -334,7 +336,7 @@ async def test_update_target_without_mode_resets_default(client):
 @pytest.mark.asyncio
 async def test_update_target_and_mode_validated_together(client):
     """同时提供不兼容组合：422 且原值原样保留"""
-    pid = await _create(client, "组合档")
+    pid = await _create(client, "组合档", target="mac_workstation")
     resp = await client.put(f"/api/configs/profiles/{pid}",
                             json={"target": "ios_mobile", "udp_security_mode": "scoped"})
     assert resp.status_code == 422
@@ -456,3 +458,103 @@ async def test_generate_unexpected_error_is_not_swallowed(client, monkeypatch):
     monkeypatch.setattr("app.routers.configs.generate_surge_config", _boom)
     with pytest.raises(ValueError):
         await client.get("/api/configs/generate?profile_id=1")
+
+
+# ===== 实例角色 → 新档案默认目标 =====
+
+
+async def _set_instance_role(client, role: str) -> dict:
+    """local_only 无密码下直接改角色：真实提交 + 断言回显"""
+    resp = await client.put("/api/settings/access", json={
+        "installation_role": role, "admin_access": "local_only",
+        "current_password": None, "new_password": None})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["installation_role"] == role
+    return body
+
+
+@pytest.mark.asyncio
+async def test_new_profile_defaults_follow_instance_role(client):
+    """省略 target 的创建按实例角色取默认目标：work→workstation，home→gateway；
+    mode 省略按最终目标默认（mac_gateway → scoped）"""
+    await _set_instance_role(client, "work_computer")
+    created = await client.post("/api/configs/profiles", json={"name": "Work"})
+    assert created.status_code == 200, created.text
+    work = await _detail(client, created.json()["id"])
+    assert work["target"] == "mac_workstation"
+    assert work["udp_security_mode"] == "scoped"
+
+    await _set_instance_role(client, "home_gateway")
+    created = await client.post("/api/configs/profiles", json={"name": "Gateway"})
+    assert created.status_code == 200, created.text
+    gateway = await _detail(client, created.json()["id"])
+    assert gateway["target"] == "mac_gateway"
+    assert gateway["udp_security_mode"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_new_profile_omitted_target_uses_default_role(client):
+    """角色从未设置（缺 SystemConfig 行）时收敛到默认角色 home_gateway → mac_gateway"""
+    created = await client.post("/api/configs/profiles", json={"name": "未设置角色"})
+    assert created.status_code == 200, created.text
+    profile = await _detail(client, created.json()["id"])
+    assert profile["target"] == "mac_gateway"
+    assert profile["udp_security_mode"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_explicit_target_overrides_instance_role(client):
+    """显式 target 优先于角色默认：home_gateway 实例仍可显式创建 iOS 档案"""
+    await _set_instance_role(client, "home_gateway")
+    pid = await _create(client, "显式iOS", target="ios_mobile")
+    profile = await _detail(client, pid)
+    assert profile["target"] == "ios_mobile"
+    assert profile["udp_security_mode"] == "compatible"
+
+
+@pytest.mark.asyncio
+async def test_role_change_never_touches_existing_profiles(client):
+    """角色变化只影响此后创建；已有档案逐条保持原目标与模式"""
+    await _set_instance_role(client, "work_computer")
+    old = await _detail(client, await _create(client, "旧档案"))
+    assert old["target"] == "mac_workstation"
+
+    await _set_instance_role(client, "home_gateway")
+    # 已有档案不被改写
+    assert (await _detail(client, old["id"]))["target"] == "mac_workstation"
+    # 此后省略 target 的创建用新角色默认
+    fresh = await _detail(client, await _create(client, "新档案"))
+    assert fresh["target"] == "mac_gateway"
+
+
+@pytest.mark.asyncio
+async def test_access_update_rejects_unknown_role(client):
+    """非法 installation_role 由请求模型拒绝（422），合法角色真实落库并在会话回显"""
+    bad = await client.put("/api/settings/access", json={
+        "installation_role": "linux_toaster", "admin_access": "local_only"})
+    assert bad.status_code == 422
+
+    ok = await _set_instance_role(client, "work_computer")
+    session = (await client.get("/api/auth/session")).json()
+    assert session["installation_role"] == "work_computer"
+    assert ok["installation_role"] == "work_computer"
+
+
+@pytest.mark.asyncio
+async def test_create_profile_explicit_null_target_rejected(client):
+    """显式 null target 与显式 null mode 同语义：422（省略才使用默认值）"""
+    resp = await client.post("/api/configs/profiles",
+                             json={"name": "空目标", "target": None})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_role_target_mapping_covers_all_valid_roles(client):
+    """角色→目标映射与安全层合法角色集合保持一致（防两处登记漂移）"""
+    from app.profile_targets import DEFAULT_TARGET_BY_ROLE
+    from app.security import VALID_INSTALLATION_ROLES
+
+    assert set(DEFAULT_TARGET_BY_ROLE) == VALID_INSTALLATION_ROLES
+    assert DEFAULT_TARGET_BY_ROLE["work_computer"].value == "mac_workstation"
+    assert DEFAULT_TARGET_BY_ROLE["home_gateway"].value == "mac_gateway"

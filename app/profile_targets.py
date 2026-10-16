@@ -24,6 +24,24 @@ def default_udp_mode(target: ProfileTarget) -> UdpSecurityMode:
     return UdpSecurityMode.COMPATIBLE if target is ProfileTarget.IOS_MOBILE else UdpSecurityMode.SCOPED
 
 
+# 实例角色 → 新档案默认目标（单向映射）。键集合与 app.security 的
+# VALID_INSTALLATION_ROLES 一致，由测试锁定防漂移；角色变化只影响
+# 此后未显式传 target 的创建请求，绝不回写已有档案。
+DEFAULT_TARGET_BY_ROLE: dict[str, ProfileTarget] = {
+    "work_computer": ProfileTarget.MAC_WORKSTATION,
+    "home_gateway": ProfileTarget.MAC_GATEWAY,
+}
+
+
+def default_target_for_role(role: str) -> ProfileTarget:
+    """实例角色对应的新档案默认目标；未知角色 fail-closed 回落默认角色映射。
+
+    上游 load_access_settings 已把库中非法角色收敛为默认角色，此处的
+    回落仅作防御（不该被触达）。
+    """
+    return DEFAULT_TARGET_BY_ROLE.get(role, ProfileTarget.MAC_GATEWAY)
+
+
 def validate_target_mode(target: ProfileTarget, mode: UdpSecurityMode) -> None:
     """组合校验：唯一被拒绝的是 ios_mobile + scoped"""
     target = ProfileTarget(target)

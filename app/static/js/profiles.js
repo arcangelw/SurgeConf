@@ -21,6 +21,47 @@ const openSections = new Map();
 const currentLocale = document.documentElement.lang === "en" ? "en" : "zh";
 const SERVER_PORT = location.port || (location.protocol === "https:" ? "443" : "80");
 
+// ===== 目标设备与 UDP 安全模式（规则与后端 profile_targets.py 一致）=====
+// iOS 不允许 scoped：切换到 iOS 时选项裁剪并纠正当前值；默认模式随目标。
+const ROLE_DEFAULT_TARGET = { work_computer: "mac_workstation", home_gateway: "mac_gateway" };
+const UDP_MODES_BY_TARGET = {
+  mac_workstation: ["strict", "scoped", "compatible"],
+  mac_gateway: ["strict", "scoped", "compatible"],
+  ios_mobile: ["strict", "compatible"],
+};
+const DEFAULT_UDP_MODE_BY_TARGET = { mac_workstation: "scoped", mac_gateway: "scoped", ios_mobile: "compatible" };
+const TARGET_HINT_KEYS = {
+  mac_workstation: "profile.target_hint_ws",
+  mac_gateway: "profile.target_hint_gw",
+  ios_mobile: "profile.target_hint_ios",
+};
+const TARGET_BADGE_KEYS = {
+  mac_workstation: "profile.badge_target_ws",
+  mac_gateway: "profile.badge_target_gw",
+  ios_mobile: "profile.badge_target_ios",
+};
+const TARGET_BADGE_CLASS = { mac_workstation: "badge-primary", mac_gateway: "badge-success", ios_mobile: "" };
+const MODE_LABEL_KEYS = { strict: "profile.mode_strict", scoped: "profile.mode_scoped", compatible: "profile.mode_compatible" };
+const MODE_BADGE_KEYS = { strict: "profile.mode_short_strict", scoped: "profile.mode_short_scoped", compatible: "profile.mode_short_compatible" };
+
+/** 按目标重建模式选项；preferred 在该目标下非法（iOS+scoped）时纠正为目标默认 */
+function fillProfileModeOptions(target, preferred) {
+  const sel = document.getElementById("profile-mode");
+  if (!sel) return;
+  const modes = UDP_MODES_BY_TARGET[target] || UDP_MODES_BY_TARGET.mac_workstation;
+  sel.innerHTML = modes.map(m => `<option value="${m}">${I18N[MODE_LABEL_KEYS[m]]}</option>`).join("");
+  sel.value = modes.includes(preferred) ? preferred : DEFAULT_UDP_MODE_BY_TARGET[target];
+}
+
+/** 目标切换联动：说明文案 + 模式选项裁剪（默认纠正为目标默认模式）。
+ *  editProfile 显式传入档案现存模式以便回显；onchange 不带参 → 目标默认。 */
+function onProfileTargetChange(preferredMode) {
+  const target = document.getElementById("profile-target").value;
+  const hint = document.getElementById("profile-target-hint");
+  if (hint) hint.textContent = I18N[TARGET_HINT_KEYS[target]] || "";
+  fillProfileModeOptions(target, preferredMode);
+}
+
 // ===== 基础数据 =====
 
 async function loadProfileGroups() {
@@ -108,11 +149,17 @@ async function loadData() {
     container.innerHTML = profiles.map(p => {
       const localeLabel = p.locale === 'en' ? 'English' : I18N["settings.lang_zh"];
       const activeTab = activeTabOf(p.id);
+      // 目标 / UDP 模式 / Token 徽标：全部来自列表最小披露字段，无敏感值
+      const targetBadge = p.target
+        ? ` <span class="badge ${TARGET_BADGE_CLASS[p.target] || "badge-primary"}">${I18N[TARGET_BADGE_KEYS[p.target]] || escapeHtml(p.target)}</span>` : "";
+      const modeBadge = p.udp_security_mode
+        ? ` <span class="badge">${I18N[MODE_BADGE_KEYS[p.udp_security_mode]] || escapeHtml(p.udp_security_mode)}</span>` : "";
+      const tokenBadge = ` <span class="badge ${p.token_configured ? "badge-success" : "badge-warning"}">${p.token_configured ? I18N["profile.token_configured"] : I18N["profile.token_not_configured"]}</span>`;
       return `
       <div class="card" style="margin-bottom:16px;">
         <div class="card-header">
           <div>
-            <h3>${escapeHtml(p.name)} ${p.is_default ? `<span class="badge badge-warning">${I18N["profile.default"]}</span>` : ''} <span class="badge badge-primary">${localeLabel}</span></h3>
+            <h3>${escapeHtml(p.name)} ${p.is_default ? `<span class="badge badge-warning">${I18N["profile.default"]}</span>` : ''} <span class="badge badge-primary">${localeLabel}</span>${targetBadge}${modeBadge}${tokenBadge}</h3>
             ${p.description ? `<p style="font-size:12px;color:var(--text2);margin-top:2px;">${escapeHtml(p.description)}</p>` : ''}
           </div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -728,13 +775,22 @@ async function loadProfileStats(profileId) {
 
 // ===== Profile 基础 CRUD =====
 
-function showAddProfile() {
+async function showAddProfile() {
   document.getElementById("profile-modal-title").textContent = I18N["profile.new"];
   document.getElementById("profile-edit-id").value = "";
   document.getElementById("profile-name").value = "";
   document.getElementById("profile-desc").value = "";
   document.getElementById("profile-locale").value = document.documentElement.lang === "en" ? "en" : "zh";
   document.getElementById("profile-default").checked = false;
+  // 新建默认目标 = 实例角色映射（与后端省略 target 时同一规则）；会话读取
+  // 失败按默认角色 fail-closed 回落 mac_gateway
+  let role = "home_gateway";
+  try {
+    const s = await API.get("/api/auth/session");
+    if (s && s.authenticated && ROLE_DEFAULT_TARGET[s.installation_role]) role = s.installation_role;
+  } catch (e) { /* 会话不可得：用默认角色 */ }
+  document.getElementById("profile-target").value = ROLE_DEFAULT_TARGET[role];
+  onProfileTargetChange();
   showModal("profile-modal");
 }
 
@@ -745,6 +801,9 @@ function editProfile(p) {
   document.getElementById("profile-desc").value = p.description || "";
   document.getElementById("profile-locale").value = p.locale || "zh";
   document.getElementById("profile-default").checked = p.is_default;
+  // 回显目标与模式：模式选项先按目标裁剪，再取档案现存值（目标下非法时纠正）
+  document.getElementById("profile-target").value = p.target || "mac_workstation";
+  onProfileTargetChange(p.udp_security_mode);
   showModal("profile-modal");
 }
 
@@ -759,12 +818,15 @@ async function saveProfile() {
     description: document.getElementById("profile-desc").value || null,
     is_default: document.getElementById("profile-default").checked,
     locale: document.getElementById("profile-locale").value,
+    target: document.getElementById("profile-target").value,
+    udp_security_mode: document.getElementById("profile-mode").value,
   };
   try {
     if (id) {
       await API.put(`/api/configs/profiles/${id}`, data);
       // 档案已更新（PUT 可改 target 等字段）：General metadata 可能随 target
-      // 变化，立即失效——在途响应按旧 generation 丢弃，下次打开/保存重拉
+      // 变化，立即失效——在途响应按旧 generation 丢弃，下次打开/保存重拉；
+      // loadData 重渲染会按新 target 重新 GET /api/general/fields?profile_id=
       invalidateGeneralMeta(id);
       toast(I18N["msg.updated"]);
     } else {

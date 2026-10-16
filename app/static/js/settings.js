@@ -98,6 +98,9 @@ async function loadAccess() {
     if (!s.authenticated) return;
     accessConfigured = !!s.password_configured;
     document.getElementById("access-mode").value = s.admin_access;
+    // 实例角色回显：仅决定新建档案默认目标，非法/缺失值回落默认角色
+    const roleSel = document.getElementById("installation-role");
+    if (roleSel) roleSel.value = s.installation_role === "work_computer" ? "work_computer" : "home_gateway";
     updateAccessUI();
   } catch (e) { /* 静默：设置页本身已受访问矩阵保护 */ }
 }
@@ -114,6 +117,8 @@ function updateAccessUI() {
 
 async function saveAccess(btn) {
   const mode = document.getElementById("access-mode").value;
+  const roleSel = document.getElementById("installation-role");
+  const role = roleSel ? roleSel.value : "home_gateway";
   const current = document.getElementById("access-current-password").value || null;
   const next = document.getElementById("access-new-password").value || null;
   if (mode === "lan_authenticated" && !accessConfigured && !next) {
@@ -123,7 +128,7 @@ async function saveAccess(btn) {
   await withLoading(btn, async () => {
     try {
       await API.put("/api/settings/access", {
-        installation_role: "home_gateway",
+        installation_role: role,
         admin_access: mode,
         current_password: current,
         new_password: next,

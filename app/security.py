@@ -30,7 +30,7 @@ COOKIE_NAME = "surgeconf_session"
 SESSION_MAX_AGE = 7 * 86400
 DEFAULT_INSTALLATION_ROLE = "home_gateway"
 DEFAULT_ADMIN_ACCESS = "local_only"
-VALID_INSTALLATION_ROLES = {"home_gateway"}
+VALID_INSTALLATION_ROLES = {"work_computer", "home_gateway"}
 VALID_ADMIN_ACCESS = {"local_only", "lan_authenticated"}
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}

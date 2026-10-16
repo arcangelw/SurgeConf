@@ -18,12 +18,13 @@ from typing import Optional
 from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
 from app.profile_targets import (ProfileTarget, UdpSecurityMode,
-                                 default_udp_mode, validate_target_mode)
+                                 default_target_for_role, default_udp_mode,
+                                 validate_target_mode)
 from app.services.profile_resolution import (DefaultProfileMissing, ProfileNotFound,
                                              resolve_profile)
 from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
                                resolve_runtime_paths)
-from app.security import issue_profile_token, verify_profile_token
+from app.security import issue_profile_token, load_access_settings, verify_profile_token
 from app.services.backups import unique_path
 from app.services.config_validation import InvalidConfiguration, validate_rule_order
 from app.services.generator import generate_surge_config
@@ -39,7 +40,7 @@ class ConfigProfileCreate(BaseModel):
     name: str
     description: Optional[str] = None
     is_default: bool = False
-    target: ProfileTarget = ProfileTarget.MAC_WORKSTATION
+    target: Optional[ProfileTarget] = None
     udp_security_mode: Optional[UdpSecurityMode] = None
     locale: Optional[str] = "zh"
     final_action: Optional[str] = "手动选择"
@@ -111,6 +112,7 @@ async def list_profiles(db: AsyncSession = Depends(get_db)):
             "is_default": p.is_default,
             "locale": p.locale,
             "target": p.target,
+            "udp_security_mode": p.udp_security_mode,
             "token_configured": bool(p.subscription_token_hash),
         }
         for p in profiles
@@ -153,6 +155,14 @@ async def get_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/profiles")
 async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(get_db)):
+    # 显式 null 不等于省略：区分「未提供」（用实例角色默认目标）与「显式非法值」
+    if data.target is None and "target" in data.model_fields_set:
+        raise HTTPException(422, "target 不允许显式 null：省略该字段以使用实例角色默认目标")
+    if data.target is None:
+        # 未显式指定 target：按实例角色单向映射取默认（显式 target 优先；
+        # 角色变化只影响此后创建，已有档案不受影响）
+        settings = await load_access_settings()
+        data.target = default_target_for_role(settings.installation_role)
     # 显式 null 不等于省略：区分「未提供」（用目标默认模式）与「显式非法值」
     if data.udp_security_mode is None and "udp_security_mode" in data.model_fields_set:
         raise HTTPException(422, "udp_security_mode 不允许显式 null：省略该字段以使用目标默认模式")
