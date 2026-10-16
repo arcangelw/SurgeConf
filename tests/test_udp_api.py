@@ -448,3 +448,200 @@ async def test_validation_errors_never_echo_request_input(
     assert resp.status_code == 422
     assert "a" * 256 not in resp.text
     assert '"input"' not in resp.text
+
+
+# ===== Fix round 1：掩码碰撞 / 严格 MAC 契约 / 静态校验消息 / DB 异常 =====
+
+@pytest.mark.asyncio
+async def test_process_mask_collision_falls_back_on_all_paths(
+        admin_client, workstation_profiles):
+    """值本身形如掩码候选（ab**cd）时 create/list/update 全文不含原值"""
+    profile, _ = workstation_profiles
+    secret = "ab**cd"
+    created = await admin_client.post(_base(profile), json={
+        "match_type": "process", "match_value": secret})
+    assert created.status_code == 201
+    assert secret not in created.text
+    assert created.json()["match_value_masked"] == "***"
+    item_id = created.json()["id"]
+
+    listed = await admin_client.get(_base(profile))
+    assert secret not in listed.text
+    assert listed.json()[0]["match_value_masked"] == "***"
+
+    updated = await admin_client.put(f"{_base(profile)}/{item_id}",
+                                     json={"match_value": "xy**zw"})
+    assert updated.status_code == 200
+    assert "xy**zw" not in updated.text
+    assert updated.json()["match_value_masked"] == "***"
+
+
+@pytest.mark.asyncio
+async def test_noncanonical_mac_stock_masked(admin_client, gateway_profile):
+    """绕库直插的 MAC 存量：小写冒号→大写契约掩码；其余非法形态一律 ***"""
+    from app.models import UdpException
+
+    rows = [
+        "aa:bb:cc" + ":dd:ee:ff",   # 存量小写：接受，输出大写契约掩码
+        "0G:00:00:00:00:01",   # 非 hex
+        "aa-bb-cc" + "-dd-ee-ff",   # 错误分隔（未规范化的横线存量）
+        "AA:BB:**:**:**:FF",   # 六组但含 **（掩码形字面量）
+    ]
+    async with admin_client._test_factory() as db:
+        for value in rows:
+            db.add(UdpException(profile_id=gateway_profile.id,
+                                match_type="mac_address", match_value=value))
+        await db.commit()
+    resp = await admin_client.get(_base(gateway_profile))
+    masked = [item["match_value_masked"] for item in resp.json()]
+    assert masked.count("AA:BB:**:**:**:FF") == 1
+    # 掩码形字面量与首行合法掩码同形，只能作为首行掩码出现一次；
+    # 其余原值（含小写全形）一律不在响应文本
+    for value in ("aa:bb:cc" + ":dd:ee:ff", "0G:00:00:00:00:01",
+                  "aa-bb-cc" + "-dd-ee-ff"):
+        assert value not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_validation_errors_use_static_messages(
+        admin_client, workstation_profiles):
+    """422 仅含 loc/type/静态中文 msg；不透传动态 msg/input/ctx"""
+    profile, _ = workstation_profiles
+    checks = [
+        ({"match_type": "process"}, "missing", "缺少必填字段"),
+        ({"match_type": "device", "match_value": "x"},
+         "enum", "字段值不在允许的取值范围内"),
+        ({"match_type": "process", "match_value": "a" * 300},
+         "string_too_long", "字符串长度不符合要求"),
+        ({"match_type": "process", "match_value": "ok", "enabled": "banana"},
+         "bool_parsing", "字段类型不正确"),
+    ]
+    for payload, want_type, want_msg in checks:
+        resp = await admin_client.post(_base(profile), json=payload)
+        assert resp.status_code == 422, (payload.keys(), resp.text)
+        detail = resp.json()["detail"]
+        assert all(set(e) == {"loc", "type", "msg"} for e in detail)
+        assert any(e["type"] == want_type and e["msg"] == want_msg
+                   for e in detail), (want_type, detail)
+        assert "Input should" not in resp.text
+        assert '"input"' not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_display_name_control_chars_rejected_statically(
+        admin_client, workstation_profiles):
+    """自定义 validator（value_error 路径）走静态映射，不回显输入"""
+    profile, _ = workstation_profiles
+    resp = await admin_client.post(_base(profile), json={
+        "match_type": "process", "match_value": "ok",
+        "display_name": "bad\x01name"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any(e["type"] == "value_error" and e["msg"] == "字段值不合法"
+               for e in detail)
+    assert "bad\x01name" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_validation_handler_never_passes_dynamic_msg():
+    """直接调用生产处理器：msg 含秘密时输出只有静态映射，无 input/ctx"""
+    import json as jsonlib
+
+    from fastapi.exceptions import RequestValidationError
+    from app.main import validation_error_handler
+
+    secret = "SuperSecretToken123"
+    exc = RequestValidationError([{
+        "type": "value_error",
+        "loc": ("body", "match_value"),
+        "msg": f"Value error, invalid {secret}",
+        "input": secret,
+        "ctx": {"error": ValueError(f"{secret} boom")},
+    }])
+    resp = await validation_error_handler(None, exc)
+    assert resp.status_code == 422
+    body = jsonlib.loads(resp.body)
+    assert secret not in resp.body.decode()
+    assert body["detail"] == [{
+        "loc": ["body", "match_value"], "type": "value_error",
+        "msg": "字段值不合法"}]
+
+
+@pytest.mark.asyncio
+async def test_db_operational_error_static_503_and_connection_reusable(
+        admin_client, gateway_profile, monkeypatch, caplog):
+    """OperationalError 含秘密参数：503 静态文案，日志只有异常类型名，
+    rollback 后同一工厂连接继续可用"""
+    import logging as logginglib
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    secret = "TOPSECRET-mac-value"
+    orig_commit = AsyncSession.commit
+    calls = {"n": 0}
+
+    async def flaky(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OperationalError(
+                "INSERT INTO udp_exceptions", {"match_value": secret},
+                RuntimeError(f"disk error near {secret}"))
+        return await orig_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", flaky)
+    with caplog.at_level(logginglib.ERROR, logger="app.routers.udp"):
+        resp = await admin_client.post(_base(gateway_profile), json={
+            "match_type": "mac_address", "match_value": "02:00:00:00:00:01"})
+    assert resp.status_code == 503
+    assert "服务暂时不可用" in resp.text
+    assert secret not in resp.text
+    assert secret not in caplog.text
+    assert "OperationalError" in caplog.text  # 只记类型名
+    # rollback 生效：工厂健康，同值重试成功且库里只有一条
+    retry = await admin_client.post(_base(gateway_profile), json={
+        "match_type": "mac_address", "match_value": "02:00:00:00:00:01"})
+    assert retry.status_code == 201
+    assert len((await admin_client.get(_base(gateway_profile))).json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_db_statement_error_update_rolls_back(
+        admin_client, workstation_profiles, monkeypatch):
+    """StatementError 含秘密参数：update 503；rollback 使属性修改未持久化"""
+    from sqlalchemy.exc import StatementError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    profile, _ = workstation_profiles
+    item_id = await create_process_exception(admin_client, profile_id=profile.id)
+    secret = "TOPSECRET-stmt"
+    orig_commit = AsyncSession.commit
+
+    async def flaky(self):
+        raise StatementError(
+            f"update failed with {secret}",
+            "UPDATE udp_exceptions", {"match_value": secret},
+            RuntimeError("boom"))
+
+    monkeypatch.setattr(AsyncSession, "commit", flaky)
+    resp = await admin_client.put(f"{_base(profile)}/{item_id}",
+                                  json={"enabled": False})
+    monkeypatch.undo()
+    assert resp.status_code == 503
+    assert secret not in resp.text
+    row = (await admin_client.get(_base(profile))).json()[0]
+    assert row["enabled"] is True  # rollback：修改未落库
+
+
+def test_runtime_engine_hides_bound_parameters(tmp_path):
+    """运行时引擎（含 rebind 路径）一律 hide_parameters：异常不带绑定值"""
+    from app.database import DatabaseRuntime
+
+    runtime = DatabaseRuntime.create(tmp_path / "hide.db")
+    try:
+        assert runtime.engine.sync_engine.hide_parameters is True
+        runtime.bind(tmp_path / "hide2.db")  # rebind 同一创建点
+        assert runtime.engine.sync_engine.hide_parameters is True
+    finally:
+        import asyncio
+        asyncio.run(runtime.dispose())

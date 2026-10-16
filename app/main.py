@@ -24,19 +24,40 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 校验错误的静态中文消息映射（按 Pydantic v2 error type）。
+# 绝不透传动态 msg —— 自定义 validator 的 ValueError 消息可能拼入
+# 原始输入值；未知 type 统一兜底文案，*_type 归为类型错误。
+_VALIDATION_MESSAGES = {
+    "missing": "缺少必填字段",
+    "enum": "字段值不在允许的取值范围内",
+    "string_too_short": "字符串长度不符合要求",
+    "string_too_long": "字符串长度不符合要求",
+    "string_pattern_mismatch": "字段格式不符合要求",
+    "value_error": "字段值不合法",
+    "json_invalid": "请求体不是合法 JSON",
+    "greater_than_equal": "数值不在允许范围内",
+    "less_than_equal": "数值不在允许范围内",
+}
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    """校验错误最小披露：只保留字段路径/消息/类型，不回显任何输入值。
+    """校验错误最小披露：只保留字段路径/类型与静态映射消息。
 
-    Pydantic v2 默认错误结构携带原始 ``input``（如超长 match_value 的
-    完整原值）与 ``ctx``，任何端点的 422 都不得回显请求体内容。
+    Pydantic v2 默认错误结构携带原始 ``input``、``ctx`` 与动态 ``msg``
+    （如超长 match_value 的完整原值、枚举合法值列表、自定义 validator
+    拼入的输入值），任何端点的 422 都不得回显请求体内容。
     """
-    errors = [
-        {"loc": list(err.get("loc", ())), "msg": err.get("msg", ""),
-         "type": err.get("type", "")}
-        for err in exc.errors()
-    ]
+    errors = []
+    for err in exc.errors():
+        err_type = str(err.get("type", ""))
+        message = _VALIDATION_MESSAGES.get(err_type)
+        if message is None:
+            message = ("字段类型不正确"
+                       if err_type.endswith(("_type", "_parsing"))
+                       else "输入校验失败")
+        errors.append({"loc": list(err.get("loc", ())), "type": err_type,
+                       "msg": message})
     return JSONResponse(status_code=422, content={"detail": errors})
 
 @app.middleware("http")

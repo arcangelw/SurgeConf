@@ -11,18 +11,23 @@
   统一中间件承担，本路由不重复认证逻辑。
 """
 
+import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import ConfigProfile, UdpException
 from app.services.profile_resolution import ProfileNotFound, resolve_profile
-from app.udp_policy import UdpMatchType, normalize_udp_match
+from app.udp_policy import (UdpMatchType, _contains_control_character,
+                            normalize_udp_match)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/configs", tags=["UDP 例外"])
 
@@ -36,19 +41,42 @@ _REQUIRED_UPDATE_FIELDS = ("match_type", "match_value", "enabled", "sort_order")
 # 唯一约束 uq_udp_exceptions_profile_match 冲突的稳定消息（不回显值）
 _DUPLICATE_MESSAGE = "已存在相同的 UDP 例外（同档案同类型同匹配值）"
 
+# 其他数据库错误的静态文案（绝不拼接异常文本/语句/参数）
+_DB_UNAVAILABLE = "服务暂时不可用，请稍后重试"
 
-class UdpExceptionCreate(BaseModel):
+# MAC 掩码前必须 fullmatch 的规范存储形态：6 组 2 位十六进制、冒号分隔
+#（接受存量小写；掩码输出以 normalize 契约的大写为准）
+_MAC_CANONICAL = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+
+
+class _DisplayNameChecked(BaseModel):
+    """display_name 公共字段与校验（Create/Update 共用）。
+
+    拒绝换行/控制字符（列表注入防护），消息为静态文案；即使未来有人
+    把值拼进 ValueError，全局 RequestValidationError 处理器也只回
+    静态映射消息。
+    """
+
+    display_name: Optional[str] = Field(default=None, max_length=100)
+
+    @field_validator("display_name")
+    @classmethod
+    def _no_control_characters(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and _contains_control_character(value):
+            raise ValueError("display_name 不得包含换行或控制字符")
+        return value
+
+
+class UdpExceptionCreate(_DisplayNameChecked):
     match_type: UdpMatchType
     match_value: str = Field(min_length=1, max_length=255)
-    display_name: Optional[str] = Field(default=None, max_length=100)
     enabled: bool = True
     sort_order: int = 0
 
 
-class UdpExceptionUpdate(BaseModel):
+class UdpExceptionUpdate(_DisplayNameChecked):
     match_type: Optional[UdpMatchType] = None
     match_value: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    display_name: Optional[str] = Field(default=None, max_length=100)
     enabled: Optional[bool] = None
     sort_order: Optional[int] = None
 
@@ -76,19 +104,23 @@ async def _require_exception(db: AsyncSession, profile_id: int,
 def _mask_match_value(match_type: str, value: str) -> str:
     """匹配值脱敏：固定形态掩码，不泄露长度与内容。
 
-    - mac_address：仅保留首两组与末组（``02:00:**:**:**:01`` 形态）；
-      非 6 组 2 位的标准存储形态（绕过 API 直插的存量）统一 ``***``
-    - process：仅保留首尾各 2 字符；长度不足 5 时首尾即拼出完整值，
-      掩码形同虚设，统一 ``***``
+    - mac_address：先 fullmatch 规范 6 组 2 位十六进制（接受存量小写），
+      输出以 normalize 契约的大写为据（``02:00:**:**:**:01`` 形态）；
+      非 hex、横线/点分等错误分隔、含 ``**`` 的六组一律 ``***``
+    - process：仅保留首尾各 2 字符；长度不足 5 统一 ``***``
+    - 任何分支的掩码候选若逐字等于原值（值本身形如 ``ab**cd``），
+      掩码形同虚设，回退 ``***``
     """
     if match_type == UdpMatchType.MAC_ADDRESS.value:
-        parts = value.split(":")
-        if len(parts) != 6 or any(len(part) != 2 for part in parts):
+        if not _MAC_CANONICAL.fullmatch(value):
             return "***"
-        return f"{parts[0]}:{parts[1]}:**:**:**:{parts[5]}"
+        head0, head1, _, _, _, tail = value.split(":")
+        candidate = f"{head0.upper()}:{head1.upper()}:**:**:**:{tail.upper()}"
+        return candidate if candidate != value else "***"
     if len(value) < 5:
         return "***"
-    return f"{value[:2]}**{value[-2:]}"
+    candidate = f"{value[:2]}**{value[-2:]}"
+    return candidate if candidate != value else "***"
 
 
 def _exception_view(exception: UdpException) -> dict:
@@ -103,6 +135,21 @@ def _exception_view(exception: UdpException) -> dict:
         "enabled": exception.enabled,
         "sort_order": exception.sort_order,
     }
+
+
+async def _commit_or_http_error(db: AsyncSession) -> None:
+    """写路径统一提交：唯一冲突 409；其他 SQLAlchemy 错误 rollback 后
+    静态 503。日志仅记异常类型名（语句/参数/异常文本一律不落盘，
+    引擎层另以 hide_parameters 兜底隐藏绑定参数）。"""
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(409, _DUPLICATE_MESSAGE) from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.error("UDP 例外数据库写入失败: %s", type(exc).__name__)
+        raise HTTPException(503, _DB_UNAVAILABLE) from exc
 
 
 @router.get("/profiles/{profile_id}/udp-exceptions")
@@ -137,13 +184,7 @@ async def create_udp_exception(profile_id: int, data: UdpExceptionCreate,
         sort_order=data.sort_order,
     )
     db.add(exception)
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        # 唯一约束冲突：rollback 后稳定 409，绝不回显输入/存储值；
-        # 其他 DB 错误类型不在此捕获
-        await db.rollback()
-        raise HTTPException(409, _DUPLICATE_MESSAGE) from exc
+    await _commit_or_http_error(db)
     await db.refresh(exception)
     return _exception_view(exception)
 
@@ -182,11 +223,7 @@ async def update_udp_exception(profile_id: int, exception_id: int,
     if "sort_order" in fields_set:
         exception.sort_order = data.sort_order
 
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(409, _DUPLICATE_MESSAGE) from exc
+    await _commit_or_http_error(db)
     await db.refresh(exception)
     return _exception_view(exception)
 
@@ -198,4 +235,4 @@ async def delete_udp_exception(profile_id: int, exception_id: int,
     await _require_profile(db, profile_id)
     exception = await _require_exception(db, profile_id, exception_id)
     await db.delete(exception)
-    await db.commit()
+    await _commit_or_http_error(db)

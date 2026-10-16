@@ -38,7 +38,10 @@ class DatabaseRuntime:
         if self.engine is not None:
             self.engine.sync_engine.dispose()
         path = Path(path)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{path}", echo=False)
+        # hide_parameters：异常 str/repr 不携带绑定参数（match_value 等
+        # 敏感列值绝不进入日志/错误文本）；bind/rebind 唯一创建点
+        engine = create_async_engine(f"sqlite+aiosqlite:///{path}",
+                                     echo=False, hide_parameters=True)
 
         @event.listens_for(engine.sync_engine, "connect")
         def _apply_pragma(dbapi_conn, _connection_record):
