@@ -570,3 +570,162 @@ def _fake_fetch_ok():
     async def fake_fetch(url):
         return [NODE_PAYLOAD]
     return fake_fetch
+
+
+async def _add_keep_node(runtime, sub_id, name="Keep"):
+    from app.models import ProxyNode
+    from app.services.node_identity import stable_node_key
+    config = f"{name} = trojan, 1.1.1.1, 443, password=x"
+    async with runtime.session_factory() as db:
+        db.add(ProxyNode(name=name, subscription_id=sub_id, node_type="trojan",
+                         server="1.1.1.1", port=443, config=config,
+                         stable_key=stable_node_key({"name": name, "config": config}),
+                         enabled=True, pinned_services=[]))
+        await db.commit()
+
+
+FRESH_PAYLOAD = {"name": "Fresh", "node_type": "trojan", "server": "8.8.8.8",
+                 "port": 443,
+                 "config": "Fresh = trojan, 8.8.8.8, 443, password=z"}
+
+
+@pytest.mark.asyncio
+async def test_scheduled_skip_wins_over_stale_url_when_both_mutated(
+        sched_db, tmp_path, monkeypatch):
+    """双 session 交错：URL+interval 同时更新且旧拉取成功——写事务守卫
+    先于 URL 比较，判 SCHEDULE_SKIPPED；新 URL/新排期/节点与既有
+    成功状态全部保留，无失败记录"""
+    from sqlalchemy import update as sa_update
+
+    from app.models import ProxyNode
+
+    sub_id = await add_subscription(sched_db, url=f"{URL}?old",
+                                   next_update_at=UTC_NOW_NAIVE)
+    await _add_keep_node(sched_db, sub_id)
+    baseline_attempt = UTC_NOW_NAIVE - timedelta(hours=2)
+    baseline_success = UTC_NOW_NAIVE - timedelta(hours=2)
+    async with sched_db.session_factory() as db:
+        await db.execute(sa_update(Subscription).where(Subscription.id == sub_id)
+                         .values(last_attempt_at=baseline_attempt,
+                                 last_success_at=baseline_success,
+                                 last_node_count=1))
+        await db.commit()
+    new_next = UTC_NOW_NAIVE + timedelta(seconds=7200)
+
+    async def mutating_fetch(url):
+        async with sched_db.session_factory() as db:
+            await db.execute(sa_update(Subscription)
+                             .where(Subscription.id == sub_id)
+                             .values(url=f"{URL}?new", update_interval=7200,
+                                     next_update_at=new_next))
+            await db.commit()
+        return [FRESH_PAYLOAD]
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", mutating_fetch)
+    scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                               clock=lambda: UTC_NOW)
+    assert await scheduler.run_due_once() == []
+
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+        nodes = (await db.execute(sa_select(ProxyNode)
+                                  .where(ProxyNode.subscription_id == sub_id))
+                 ).scalars().all()
+    assert sub.url == f"{URL}?new"
+    assert sub.next_update_at == new_next
+    assert [n.name for n in nodes] == ["Keep"], "Fresh 不得落库"
+    assert sub.last_attempt_at == baseline_attempt, "基线 attempt 不得覆盖"
+    assert sub.last_success_at == baseline_success
+    assert sub.last_error_code is None and sub.last_node_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "empty"])
+async def test_scheduled_failure_record_skipped_after_reschedule(
+        sched_db, tmp_path, monkeypatch, failure):
+    """双 session 交错：next 重排后旧拉取 timeout/空结果——失败短事务
+    守卫拒绝，不记 attempt/error/next；manual timeout 无守卫仍正常记状态"""
+    from sqlalchemy import update as sa_update
+
+    import httpx as httpx_mod
+    from app.services.subscription import sync_subscription
+
+    sub_id = await add_subscription(sched_db, next_update_at=UTC_NOW_NAIVE)
+    far = UTC_NOW_NAIVE + timedelta(days=7)
+
+    async def failing_fetch(url):
+        async with sched_db.session_factory() as db:
+            await db.execute(sa_update(Subscription)
+                             .where(Subscription.id == sub_id)
+                             .values(next_update_at=far))
+            await db.commit()
+        if failure == "timeout":
+            raise httpx_mod.TimeoutException("synthetic timeout")
+        return []
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", failing_fetch)
+    scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                               clock=lambda: UTC_NOW)
+    assert await scheduler.run_due_once() == []
+
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+    assert sub.last_attempt_at is None, "守卫跳过不得记录尝试"
+    assert sub.last_error_code is None
+    assert sub.next_update_at == far, "重排后的新排期不得覆盖"
+
+    # manual timeout（无守卫）：仍正常记录失败状态
+    async def manual_timeout_fetch(url):
+        raise httpx_mod.TimeoutException("synthetic manual timeout")
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        manual_timeout_fetch)
+    async with sched_db.session_factory() as db:
+        result = await sync_subscription(db, sub_id, now=UTC_NOW_NAIVE)
+    assert result.success is False and result.error_code == "timeout"
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+    assert sub.last_attempt_at == UTC_NOW_NAIVE
+    assert sub.last_error_code == "timeout"
+    assert sub.next_update_at == UTC_NOW_NAIVE + timedelta(seconds=900)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_url_only_change_keeps_stale_url_failure(
+        sched_db, tmp_path, monkeypatch):
+    """双 session 交错：仅 URL 改、next 仍为 expected——守卫通过，走原
+    stale URL 失败语义（internal_error + attempt/error/next=+900），旧结果
+    拒写、新 URL 保留"""
+    from sqlalchemy import update as sa_update
+
+    from app.models import ProxyNode
+
+    sub_id = await add_subscription(sched_db, url=f"{URL}?old",
+                                   next_update_at=UTC_NOW_NAIVE)
+    await _add_keep_node(sched_db, sub_id)
+
+    async def mutating_fetch(url):
+        async with sched_db.session_factory() as db:
+            await db.execute(sa_update(Subscription)
+                             .where(Subscription.id == sub_id)
+                             .values(url=f"{URL}?new"))
+            await db.commit()
+        return [FRESH_PAYLOAD]
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", mutating_fetch)
+    scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                               clock=lambda: UTC_NOW)
+    results = await scheduler.run_due_once()
+    assert [(r.subscription_id, r.success, r.error_code) for r in results] == [
+        (sub_id, False, "internal_error")]
+
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+        nodes = (await db.execute(sa_select(ProxyNode)
+                                  .where(ProxyNode.subscription_id == sub_id))
+                 ).scalars().all()
+    assert sub.url == f"{URL}?new"
+    assert sub.last_attempt_at == UTC_NOW_NAIVE
+    assert sub.last_error_code == "internal_error"
+    assert sub.next_update_at == UTC_NOW_NAIVE + timedelta(seconds=900)
+    assert [n.name for n in nodes] == ["Keep"], "旧拉取结果不得写入"

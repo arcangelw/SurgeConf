@@ -338,10 +338,13 @@ class _FailureRecord(NamedTuple):
 
     记录事务自身失败时保守返回 exists=True（避免把并发删除误判为
     404），last_node_count=None 表示未知（调用方回退阶段 1 快照值）。
+    skipped=True：调度模式下排期守卫未满足（未写任何状态，调用方转
+    SCHEDULE_SKIPPED；其余字段无意义）。
     """
 
     exists: bool
     last_node_count: int | None
+    skipped: bool = False
 
 
 async def _safe_rollback(db: AsyncSession) -> None:
@@ -463,13 +466,20 @@ def _prepare_incoming(nodes: list[dict]) -> list[tuple[str, dict]]:
 
 
 async def _record_failed_attempt(db: AsyncSession, sub_id: int,
-                                  now: datetime, code: str) -> _FailureRecord:
+                                  now: datetime, code: str,
+                                  scheduled_next: datetime | None = None
+                                  ) -> _FailureRecord:
     """失败状态短事务：只更新 attempt/error_code/next。
 
     不触碰 last_success_at/last_node_count 与任何节点；enabled+auto 时
     next = now + min(interval, 900)，否则 NULL。订阅并发删除时返回
     exists=False（调用方转 404/跳过，不泄漏）；本事务自身失败仅记录
     错误码并保守返回 exists=True。
+
+    scheduled_next（调度模式）：同一写事务内重查并原子校验仍
+    enabled+auto、next==expected 且对 now 仍到期；不满足返回
+    skipped=True（绝不改 attempt/error/next，调用方转 SCHEDULE_SKIPPED）。
+    校验与写入依赖同一事务内的 SQLite 写锁串行化（无先查后另事务写）。
     """
     try:
         # populate_existing：绕过 identity map 缓存，读到并发修改后的最新值
@@ -480,6 +490,12 @@ async def _record_failed_attempt(db: AsyncSession, sub_id: int,
         if sub is None:
             await db.rollback()
             return _FailureRecord(exists=False, last_node_count=None)
+        if scheduled_next is not None and not _scheduled_guard_ok(
+                sub.enabled, sub.auto_update, sub.next_update_at,
+                scheduled_next, now):
+            await db.rollback()
+            return _FailureRecord(exists=True, last_node_count=None,
+                                  skipped=True)
         sub.last_attempt_at = now
         sub.last_error_code = code
         if sub.enabled and sub.auto_update:
@@ -507,7 +523,10 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
     scheduled_next（naive UTC，库内口径）：调度器传入的排期快照守卫，
     拉取前与成功写事务内均校验订阅仍 enabled+auto、next 未被并发改动
     且仍到期；任一不满足返回 SCHEDULE_SKIPPED（跳过本轮：不拉取、不
-    记失败状态、不覆盖新排期）。手动调用（默认 None）完全无守卫。
+    记失败状态、不覆盖新排期）。所有失败记录同样携带守卫：失败短事务
+    在同一写事务内原子校验，排期已变则同样转 SCHEDULE_SKIPPED，绝不
+    改写 attempt/error/next。手动调用（默认 None）完全无守卫、保持
+    原失败状态行为。
 
     成功写事务：重查订阅与现有节点并校验 URL 未被并发修改（快照过期
     则拒绝写入旧结果），按 stable_key 匹配——匹配项只更新 provider 字段
@@ -549,7 +568,10 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
         await _safe_rollback(db)
         code, message = safe_sync_error(exc)
         logger.error("subscription %s snapshot failed: code=%s", sub_id, code)
-        record = await _record_failed_attempt(db, sub_id, now, code)
+        record = await _record_failed_attempt(db, sub_id, now, code,
+                                               scheduled_next)
+        if record.skipped:
+            return SCHEDULE_SKIPPED
         if not record.exists:
             return None
         return SyncResult(sub_id, False, record.last_node_count, 0, 0, 0,
@@ -569,7 +591,10 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
     except Exception as exc:
         code, message = safe_sync_error(exc)
         logger.error("subscription %s sync failed: code=%s", sub_id, code)
-        record = await _record_failed_attempt(db, sub_id, now, code)
+        record = await _record_failed_attempt(db, sub_id, now, code,
+                                               scheduled_next)
+        if record.skipped:
+            return SCHEDULE_SKIPPED
         if not record.exists:
             return None
         count = (record.last_node_count if record.last_node_count is not None
@@ -586,15 +611,17 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
         if sub is None:
             await _safe_rollback(db)
             return None
-        if sub.url != url:
-            # 快照过期：URL 已被并发修改，绝不把旧拉取结果写入
-            raise _StaleSnapshotError()
         if scheduled_next is not None and not _scheduled_guard_ok(
                 sub.enabled, sub.auto_update, sub.next_update_at,
                 scheduled_next, now):
-            # 排期在拉取期间被并发改动：拒写旧结果与新排期（跳过非失败）
+            # 排期/开关在拉取期间被并发改动：优先跳过（非失败，不记状态、
+            # 不覆盖新排期），不进入 URL 竞态失败语义
             await _safe_rollback(db)
             return SCHEDULE_SKIPPED
+        if sub.url != url:
+            # 快照过期（排期仍为 expected 而 URL 独立变化）：拒绝把旧
+            # 拉取结果写入，走安全失败语义
+            raise _StaleSnapshotError()
         existing = {
             node.stable_key: node
             for node in (await db.execute(
@@ -649,7 +676,10 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
         await _safe_rollback(db)
         code, message = safe_sync_error(exc)
         logger.error("subscription %s sync write failed: code=%s", sub_id, code)
-        record = await _record_failed_attempt(db, sub_id, now, code)
+        record = await _record_failed_attempt(db, sub_id, now, code,
+                                               scheduled_next)
+        if record.skipped:
+            return SCHEDULE_SKIPPED
         if not record.exists:
             return None
         count = (record.last_node_count if record.last_node_count is not None
