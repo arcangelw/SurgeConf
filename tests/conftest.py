@@ -14,6 +14,10 @@ from app.default_config import (DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
                                 DEFAULT_PRE_RULES, DEFAULT_GENERAL_RULES,
                                 DEFAULT_HOST_MAPPINGS)
 from app.services.generator import DEFAULT_EXCLUSION_KEYWORDS
+from app.services.node_identity import stable_node_key
+
+# 订阅节点的公共连接文本：stable_key 统一由 canonicalizer 计算
+_HK01_CONFIG = "HK-01 = trojan, 1.1.1.1, 443, password=x"
 
 
 @pytest.fixture(scope="session")
@@ -82,8 +86,9 @@ async def db_with_nodes(db):
     """在 db fixture 基础上添加模拟节点"""
     nodes = [
         ProxyNode(name="HK-01", node_type="trojan", server="1.1.1.1", port=443,
-                  config="HK-01 = trojan, 1.1.1.1, 443, password=x", region_auto="香港",
-                  region_manual="香港", enabled=True, subscription_id=10),
+                  config=_HK01_CONFIG, region_auto="香港",
+                  region_manual="香港", enabled=True, subscription_id=10,
+                  stable_key=stable_node_key({"config": _HK01_CONFIG})),
         ProxyNode(name="HK-02", node_type="trojan", server="1.1.1.2", port=443,
                   config="HK-02 = trojan, 1.1.1.2, 443, password=x", region_auto="香港",
                   enabled=True),

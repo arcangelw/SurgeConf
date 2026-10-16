@@ -125,6 +125,19 @@ SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
                             ("udp_exceptions", "display_name"),
                             ("udp_exceptions", "enabled"),
                             ("udp_exceptions", "sort_order")},
+    "0006_subscription_lifecycle": {
+        ("subscriptions", "last_attempt_at"),
+        ("subscriptions", "last_success_at"),
+        ("subscriptions", "next_update_at"),
+        ("subscriptions", "last_error_code"),
+        ("subscriptions", "last_node_count"),
+        ("proxy_nodes", "stable_key")},
+}
+
+# 各 revision 相对前一 revision 删除的 (表, 列)。指纹推导时先应用新增再
+# 应用删除；**带删列的 revision 在此登记**（0006 删除 subscriptions.last_update）。
+SCHEMA_REVISION_REMOVED_COLUMNS: dict[str, set[tuple[str, str]]] = {
+    "0006_subscription_lifecycle": {("subscriptions", "last_update")},
 }
 
 # 各 revision 必需的命名 CHECK 约束（表 → 约束名 → 冻结的规范化表达式）。
@@ -150,6 +163,12 @@ SCHEMA_REVISION_CHECKS: dict[str, dict[str, dict[str, str]]] = {
                 "match_type IN ('process', 'mac_address')",
         },
     },
+    "0006_subscription_lifecycle": {
+        "proxy_nodes": {
+            "ck_proxy_nodes_subscription_stable_key":
+                "subscription_id IS NULL OR stable_key IS NOT NULL",
+        },
+    },
 }
 
 # 各 revision 相对更早 revision 新增/收紧的列可空性要求：(表, 列) → 期望 nullable。
@@ -166,6 +185,15 @@ SCHEMA_REVISION_COLUMN_NULLABILITY: dict[str, dict[tuple[str, str], bool]] = {
                             # display_name 登记为可空：伪结构（被建成 NOT NULL）
                             # 同样拒绝， nullable 要求不单向收紧
                             ("udp_exceptions", "display_name"): True},
+    "0006_subscription_lifecycle": {
+        # 新列全部显式登记 nullable=True：被建成 NOT NULL 的伪结构同样拒绝
+        ("subscriptions", "last_attempt_at"): True,
+        ("subscriptions", "last_success_at"): True,
+        ("subscriptions", "next_update_at"): True,
+        ("subscriptions", "last_error_code"): True,
+        ("subscriptions", "last_node_count"): True,
+        ("proxy_nodes", "stable_key"): True,
+    },
 }
 
 # 各 revision 必需的结构化外键（revision → 表 → 约束名 → 冻结定义）。
@@ -205,6 +233,17 @@ SCHEMA_REVISION_INDEXES: dict[str, dict[str, dict[str, dict[str, object]]]] = {
             },
         },
     },
+    "0006_subscription_lifecycle": {
+        "proxy_nodes": {
+            # 部分唯一索引：sqlite_where 冻结 WHERE 表达式（规范化后比较），
+            # 缺 WHERE 或 WHERE 不符同样 fail closed
+            "uq_proxy_nodes_subscription_stable_key": {
+                "column_names": ("subscription_id", "stable_key"),
+                "unique": True,
+                "sqlite_where": "stable_key IS NOT NULL",
+            },
+        },
+    },
 }
 
 # 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建
@@ -212,13 +251,15 @@ _IDENTIFY_IGNORED_TABLES = {"alembic_version", "data_migration_records"}
 
 
 def schema_fingerprints() -> dict[str, dict[str, frozenset[str]]]:
-    """revision → 表→列指纹：0001 基线 + 逐 revision 冻结增量推导"""
+    """revision → 表→列指纹：0001 基线 + 逐 revision 冻结增量（新增/删除）推导"""
     fingerprints: dict[str, dict[str, frozenset[str]]] = {}
     tables = {table: set(columns) for table, columns in _BASELINE_TABLE_COLUMNS.items()}
     fingerprints[BASELINE_REVISION] = {t: frozenset(c) for t, c in tables.items()}
     for revision, additions in SCHEMA_REVISION_DELTAS.items():
         for table, column in additions:
             tables.setdefault(table, set()).add(column)
+        for table, column in SCHEMA_REVISION_REMOVED_COLUMNS.get(revision, set()):
+            tables.get(table, set()).discard(column)
         fingerprints[revision] = {t: frozenset(c) for t, c in tables.items()}
     return fingerprints
 
@@ -267,7 +308,13 @@ def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]],
                        for u in inspector.get_unique_constraints(t) if u.get("name")}
                    for t in tables}
         indexes = {t: {i["name"]: {"column_names": tuple(i.get("column_names") or ()),
-                                    "unique": bool(i.get("unique"))}
+                                    "unique": bool(i.get("unique")),
+                                    "sqlite_where": _normalize_check_expression(
+                                        str((i.get("dialect_options") or {})
+                                            .get("sqlite_where")))
+                                    if (i.get("dialect_options") or {})
+                                            .get("sqlite_where") is not None
+                                    else None}
                        for i in inspector.get_indexes(t) if i.get("name")}
                    for t in tables}
     finally:
@@ -423,7 +470,10 @@ def _structure_requirements_satisfied(revision: str,
             entry = actual.get(name)
             if (not entry
                     or entry["column_names"] != tuple(req["column_names"])
-                    or entry["unique"] != bool(req["unique"])):
+                    or entry["unique"] != bool(req["unique"])
+                    or entry.get("sqlite_where") != (
+                        _normalize_check_expression(req["sqlite_where"])
+                        if req.get("sqlite_where") is not None else None)):
                 return False
     return True
 
@@ -529,7 +579,10 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
             entry = actual_indexes.get(table, {}).get(name)
             if (not entry
                     or entry["column_names"] != tuple(req["column_names"])
-                    or entry["unique"] != bool(req["unique"])):
+                    or entry["unique"] != bool(req["unique"])
+                    or entry.get("sqlite_where") != (
+                        _normalize_check_expression(req["sqlite_where"])
+                        if req.get("sqlite_where") is not None else None)):
                 problems.append(f"{table} 索引缺失或定义不符: {name}")
     for (table, column), expected in sorted(_accumulated_column_nullability(head).items()):
         actual = actual_nullability.get(table, {}).get(column)

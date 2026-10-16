@@ -302,7 +302,7 @@ async function renderSubDetail(subId) {
           <p style="font-size:12px;color:var(--text2);margin-top:4px;word-break:break-all;">${escapeHtml(subUrl)}</p>
           <p style="font-size:12px;color:var(--text2);margin-top:2px;">
             ${sub.tag ? `<span class="badge" style="background:${sub.color}22;color:${sub.color};border:1px solid ${sub.color}44;">${escapeHtml(sub.tag)}</span> ` : ""}
-            ${I18N["sub.last_update"]}: ${escapeHtml(sub.last_update || I18N["sub.not_synced"])}
+            ${I18N["sub.last_success"]}: ${escapeHtml(sub.last_success_at || I18N["sub.not_synced"])}
           </p>
         </div>
         <div class="px-info-actions">

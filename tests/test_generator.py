@@ -8,6 +8,7 @@ from app.services.generator import (
 from app.models import ProxyNode, RegionGroup, ServiceGroup, RuleSource, CustomRule
 from app.default_config import locale_translate, CATEGORY_NAMES, COMMENT_NAMES
 from app.services.config_validation import RuleActionRef
+from app.services.node_identity import stable_node_key
 
 
 # ────────────────────────────────────────────
@@ -32,6 +33,8 @@ def _make_node(name, region_manual=None, sub_id=None):
         name=name, node_type="trojan", server="0.0.0.0", port=443,
         config=f"{name} = trojan, 0.0.0.0, 443, password=x",
         region_manual=region_manual, enabled=True,
+        stable_key=stable_node_key({"config": f"{name} = trojan, 0.0.0.0, 443, password=x"})
+        if sub_id is not None else None,
     )
     n.subscription_id = sub_id
     return n
@@ -80,7 +83,8 @@ class TestDisplayName:
     def test_with_subscription(self):
         node = ProxyNode(name="HK-01", node_type="trojan", server="0.0.0.0", port=443,
                          config="HK-01 = trojan, 0.0.0.0, 443, password=x",
-                         subscription_id=5)
+                         subscription_id=5,
+                         stable_key=stable_node_key({"config": "HK-01 = trojan, 0.0.0.0, 443, password=x"}))
         assert _display_name(node, {5: "机场A"}) == "(机场A) HK-01"
 
 
@@ -617,7 +621,8 @@ async def test_full_config_subscription_prefix(db):
     db.add(Subscription(name="测试机场", url="https://sub.example.com"))
     db.add(ProxyNode(name="HK-01", node_type="trojan", server="1.1.1.1", port=443,
                      config="HK-01 = trojan, 1.1.1.1, 443, password=x",
-                     enabled=True, subscription_id=1))
+                     enabled=True, subscription_id=1,
+                     stable_key=stable_node_key({"config": "HK-01 = trojan, 1.1.1.1, 443, password=x"})))
     await db.commit()
 
     config = await generate_surge_config(db)

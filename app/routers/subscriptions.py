@@ -48,7 +48,11 @@ async def list_subscriptions(db: AsyncSession = Depends(get_db)):
             "enabled": s.enabled,
             "auto_update": s.auto_update,
             "update_interval": s.update_interval,
-            "last_update": s.last_update.isoformat() if s.last_update else None,
+            "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
+            "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
+            "next_update_at": s.next_update_at.isoformat() if s.next_update_at else None,
+            "last_error_code": s.last_error_code,
+            "last_node_count": s.last_node_count,
             "created_at": s.created_at.isoformat() if s.created_at else None,
         }
         for s in subs
@@ -71,7 +75,11 @@ async def get_subscription(sub_id: int, db: AsyncSession = Depends(get_db)):
         "enabled": sub.enabled,
         "auto_update": sub.auto_update,
         "update_interval": sub.update_interval,
-        "last_update": sub.last_update.isoformat() if sub.last_update else None,
+        "last_attempt_at": sub.last_attempt_at.isoformat() if sub.last_attempt_at else None,
+        "last_success_at": sub.last_success_at.isoformat() if sub.last_success_at else None,
+        "next_update_at": sub.next_update_at.isoformat() if sub.next_update_at else None,
+        "last_error_code": sub.last_error_code,
+        "last_node_count": sub.last_node_count,
         "created_at": sub.created_at.isoformat() if sub.created_at else None,
     }
 

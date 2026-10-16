@@ -1,6 +1,6 @@
 from sqlalchemy import (CheckConstraint, Column, Integer, String, Boolean, Text,
                          DateTime, JSON, ForeignKeyConstraint,
-                         Index, UniqueConstraint)
+                         Index, UniqueConstraint, text)
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -16,13 +16,26 @@ class Subscription(Base):
     enabled = Column(Boolean, default=True, comment="是否启用")
     auto_update = Column(Boolean, default=True, comment="自动更新")
     update_interval = Column(Integer, default=86400, comment="更新间隔(秒)")
-    last_update = Column(DateTime, nullable=True, comment="上次更新时间")
+    last_attempt_at = Column(DateTime, nullable=True, comment="上次同步尝试时间(UTC)")
+    last_success_at = Column(DateTime, nullable=True, comment="上次同步成功时间(UTC)")
+    next_update_at = Column(DateTime, nullable=True, comment="下次计划同步时间(UTC，仅启用+自动)")
+    last_error_code = Column(String(100), nullable=True, comment="上次失败错误码")
+    last_node_count = Column(Integer, nullable=True, comment="上次成功同步的节点数(去重后)")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class ProxyNode(Base):
     __tablename__ = "proxy_nodes"
+    __table_args__ = (
+        # 订阅节点必须有稳定身份；手动节点（subscription_id 为 NULL）允许 NULL
+        CheckConstraint("subscription_id IS NULL OR stable_key IS NOT NULL",
+                        name="ck_proxy_nodes_subscription_stable_key"),
+        # 部分唯一索引：仅对非 NULL stable_key 生效（多个手动节点可为 NULL）
+        Index("uq_proxy_nodes_subscription_stable_key",
+              "subscription_id", "stable_key", unique=True,
+              sqlite_where=text("stable_key IS NOT NULL")),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(500), nullable=False, comment="节点名称")
@@ -34,6 +47,7 @@ class ProxyNode(Base):
     region_auto = Column(String(100), nullable=True, comment="自动识别的地区")
     region_manual = Column(String(100), nullable=True, comment="手动指定的地区")
     pinned_services = Column(JSON, default=list, comment="手动钉选到的服务分组名列表")
+    stable_key = Column(String(64), nullable=True, comment="连接规范化SHA256身份(订阅节点必填)")
     enabled = Column(Boolean, default=True, comment="是否启用")
     created_at = Column(DateTime, server_default=func.now())
 

@@ -73,6 +73,7 @@ async def _create_second_profile(admin_client) -> int:
 async def _seed_subscription_and_node(admin_client) -> int:
     """直插数据库：含敏感 URL 的订阅 + 含密码配置行的节点"""
     from app.models import Subscription, ProxyNode
+    from app.services.node_identity import stable_node_key
 
     async with admin_client._test_factory() as db:
         sub = Subscription(name="测试订阅", url="https://secret.example/clash?token=SECRET")
@@ -83,6 +84,8 @@ async def _seed_subscription_and_node(admin_client) -> int:
             name="HK-01", node_type="trojan", server="1.2.3.4", port=443,
             config="HK-01 = trojan, 1.2.3.4, 443, password=topsecret",
             subscription_id=sub.id, enabled=True,
+            stable_key=stable_node_key(
+                {"config": "HK-01 = trojan, 1.2.3.4, 443, password=topsecret"}),
         ))
         await db.commit()
         return sub.id

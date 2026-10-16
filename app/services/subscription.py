@@ -4,11 +4,12 @@ import re
 import base64
 import logging
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from app.models import Subscription, ProxyNode
+from app.services.node_identity import stable_node_key
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +306,12 @@ async def fetch_subscription(sub: Subscription) -> list[dict]:
 
 
 async def sync_subscription(db: AsyncSession, sub_id: int) -> dict:
-    """同步单个订阅：拉取、解析、存入数据库"""
+    """同步单个订阅：拉取、解析、存入数据库。
+
+    现有破坏式重建路径的过渡实现：插入前按 stable_key 对本次拉取结果
+    确定性去重（相同连接不同显示名只保留首个），并记录成功状态。
+    事务化 upsert 与失败状态保留由后续任务接管。
+    """
     result = await db.execute(select(Subscription).where(Subscription.id == sub_id))
     sub = result.scalar_one_or_none()
     if not sub:
@@ -317,8 +323,14 @@ async def sync_subscription(db: AsyncSession, sub_id: int) -> dict:
         # 删除该订阅的旧节点
         await db.execute(delete(ProxyNode).where(ProxyNode.subscription_id == sub_id))
 
-        # 插入新节点
+        # 插入新节点（同一次拉取内相同连接确定性去重）
+        seen_keys: set[str] = set()
+        inserted = 0
         for node_data in nodes:
+            key = stable_node_key(node_data)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             node = ProxyNode(
                 name=node_data["name"],
                 subscription_id=sub_id,
@@ -326,14 +338,20 @@ async def sync_subscription(db: AsyncSession, sub_id: int) -> dict:
                 server=node_data["server"],
                 port=node_data["port"],
                 config=node_data["config"],
+                stable_key=key,
                 enabled=True,
             )
             db.add(node)
+            inserted += 1
 
-        sub.last_update = datetime.now()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        sub.last_attempt_at = now
+        sub.last_success_at = now
+        sub.last_error_code = None
+        sub.last_node_count = inserted
         await db.commit()
 
-        return {"subscription": sub.name, "node_count": len(nodes)}
+        return {"subscription": sub.name, "node_count": inserted}
     except Exception as e:
         await db.rollback()
         return {"error": str(e)}

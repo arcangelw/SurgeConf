@@ -694,7 +694,7 @@ async def test_legacy_0004_upgrades_to_0005_udp_exceptions(tmp_path):
     result = await prepare_database(paths, legacy)
     assert result.source == "legacy"
     assert sqlite_scalar(paths.database, "SELECT version_num FROM alembic_version") \
-        == "0005_udp_exceptions"
+        == database_migration._head_revision()
 
     c = _udp_exceptions_constraints(paths.database)
     fk = c["fk"]["fk_udp_exceptions_profile_id"]
@@ -736,7 +736,7 @@ async def test_unversioned_0005_complete_identified(tmp_path):
         conn.execute("DROP TABLE data_migration_records")
     conn.close()
     assert database_migration.identify_unversioned_schema(legacy) == \
-        "0005_udp_exceptions"
+        database_migration._head_revision()
 
 
 def _make_unversioned_0005_sans_constraints(db_path: Path, ddl: str) -> None:
@@ -1019,3 +1019,377 @@ def test_udp_exception_structures_match_metadata(tmp_path):
     ix = c["index"]["ix_udp_exceptions_profile_enabled_sort"]
     assert ix["column_names"] == ["profile_id", "enabled", "sort_order"]
     assert bool(ix["unique"]) is False
+
+
+# ===== 0006：订阅生命周期 + 节点稳定身份 =====
+
+def _make_0005_database(db_path: Path) -> Path:
+    """0005 形状库（schema 完整、无数据）"""
+    command.upgrade(database_migration._alembic_config(db_path),
+                    "0005_udp_exceptions")
+    return db_path
+
+
+def _insert_subscription(conn, *, sub_id: int, enabled=1, auto_update=1,
+                          interval=86400, last_update=None,
+                          created="2026-09-01 00:00:00"):
+    conn.execute(
+        "INSERT INTO subscriptions (id, name, url, enabled, auto_update, "
+        "update_interval, last_update, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (sub_id, f"sub{sub_id}", f"https://example.com/{sub_id}", enabled,
+         auto_update, interval, last_update, created))
+
+
+def _insert_node(conn, *, node_id: int, sub_id, config: str,
+                 region_manual=None, pins=None, enabled=1,
+                 name=None, node_type="trojan", server="edge.example.com", port=443):
+    import json as _json
+    conn.execute(
+        "INSERT INTO proxy_nodes (id, name, subscription_id, node_type, server, "
+        "port, config, region_manual, pinned_services, enabled) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (node_id, name or f"node{node_id}", sub_id, node_type, server, port,
+         config, region_manual,
+         _json.dumps(pins) if pins is not None else None, enabled))
+
+
+def _proxy_nodes_columns(path: Path) -> list:
+    return [row[1] for row in sqlite_rows(path, "PRAGMA table_info(proxy_nodes)")]
+
+
+def test_legacy_0005_upgrades_to_0006_subscription_lifecycle(tmp_path):
+    """0005 → head：生命周期字段落盘、last_update 消失、stable_key 计算、
+    订阅节点去重合并、manual 节点 NULL、部分唯一索引与条件 CHECK 落盘"""
+    db_path = _make_0005_database(tmp_path / "legacy0005.db")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        _insert_subscription(conn, sub_id=1)
+        # 同一订阅内两条同连接节点（不同显示名/大小写/端口形态） + 一条独一节点
+        _insert_node(conn, node_id=1, sub_id=1,
+                     config="A1 = trojan, edge.example.com, 443, password=x")
+        _insert_node(conn, node_id=2, sub_id=1, region_manual="香港",
+                     config="A2 = TROJAN, EDGE.example.com, 0443, password=x")
+        _insert_node(conn, node_id=3, sub_id=1,
+                     config="A3 = trojan, other.example.com, 443, password=y")
+        # manual 节点：不参与计算
+        _insert_node(conn, node_id=4, sub_id=None,
+                     config="M = ss, 8.8.8.8, 1")
+    conn.close()
+
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+
+    assert sqlite_scalar(db_path, "SELECT version_num FROM alembic_version") \
+        == database_migration._head_revision()
+
+    sub_cols = [row[1] for row in sqlite_rows(db_path, "PRAGMA table_info(subscriptions)")]
+    for column in ("last_attempt_at", "last_success_at", "next_update_at",
+                   "last_error_code", "last_node_count"):
+        assert column in sub_cols
+    assert "last_update" not in sub_cols
+    assert "stable_key" in _proxy_nodes_columns(db_path)
+
+    rows = sqlite_rows(db_path, "SELECT id, stable_key, region_manual FROM proxy_nodes ORDER BY id")
+    # 去重后：survivor 是带手动地区的 node2；node1 被合并删除
+    assert [r[0] for r in rows] == [2, 3, 4]
+    key2, key3, key4 = rows[0][1], rows[1][1], rows[2][1]
+    assert len(key2) == 64 and len(key3) == 64
+    assert key2 != key3
+    assert rows[0][2] == "香港"
+    assert key4 is None  # manual 节点保持 NULL
+
+    # 结构：条件 CHECK + 部分唯一索引
+    checks = {row[0]: row[1] for row in sqlite_rows(
+        db_path, "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='proxy_nodes'")}
+    assert "ck_proxy_nodes_subscription_stable_key" in checks["proxy_nodes"]
+    index_sql = sqlite_scalar(
+        db_path, "SELECT sql FROM sqlite_master WHERE name='uq_proxy_nodes_subscription_stable_key'")
+    assert "stable_key IS NOT NULL" in index_sql
+
+
+def test_0006_duplicate_merge_survivor_ranking(tmp_path):
+    """survivor 字典序：手动地区 → 钉选非空 → 被禁用 → id 小；
+    合并取首个非空 region、钉选并集、任一禁用即禁用"""
+    db_path = _make_0005_database(tmp_path / "dup.db")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        _insert_subscription(conn, sub_id=1)
+        # 无任何人工痕迹（最低优先级，id 最小也不该赢）
+        _insert_node(conn, node_id=1, sub_id=1,
+                     config="n1 = trojan, edge.example.com, 443, password=x")
+        # 被禁用
+        _insert_node(conn, node_id=2, sub_id=1, enabled=0,
+                     config="n2 = trojan, edge.example.com, 443, password=x")
+        # 钉选非空
+        _insert_node(conn, node_id=3, sub_id=1, pins=["流媒体"],
+                     config="n3 = trojan, edge.example.com, 443, password=x")
+        # 手动地区（最高优先级）+ 钉选，survivor
+        _insert_node(conn, node_id=4, sub_id=1, region_manual="美国", pins=["AI服务"],
+                     config="n4 = trojan, edge.example.com, 443, password=x")
+        # 同优先级比 id：id=6 手动地区但 id 更大，输给 id=4
+        _insert_node(conn, node_id=6, sub_id=1, region_manual="日本", pins=["下载"],
+                     enabled=0,
+                     config="n6 = trojan, edge.example.com, 443, password=x")
+    conn.close()
+
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+
+    rows = sqlite_rows(db_path,
+                       "SELECT id, region_manual, pinned_services, enabled FROM proxy_nodes")
+    assert len(rows) == 1
+    survivor_id, region, pins, enabled = rows[0]
+    # 6 与 4 同有 region+pins，6 因"被禁用优先"赢过 id 更小的 4；
+    # 4/6（有 region）赢 3（仅 pins）赢 2（仅禁用）赢 1（无人工痕迹）
+    assert survivor_id == 6
+    # region 取排序后的首个非空（node6 自己的日本）
+    assert region == "日本"
+    import json as _json
+    assert _json.loads(pins) == ["AI服务", "下载", "流媒体"]  # 确定性并集排序
+    assert enabled == 0  # 任一禁用 → 最严格
+
+
+def test_0006_interval_and_state_backfill(tmp_path):
+    """interval 范围外归一 86400（边界保留）；旧 last_update → attempt+success；
+    enabled+auto：success+interval / 从未同步 created_at；否则 next 为 NULL；
+    last_node_count 为去重后节点数"""
+    db_path = _make_0005_database(tmp_path / "backfill.db")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        # sub1: 正常 interval、有 last_update、enabled+auto → next = last + interval
+        _insert_subscription(conn, sub_id=1, interval=3600,
+                             last_update="2026-10-01 00:00:00")
+        _insert_node(conn, node_id=1, sub_id=1,
+                     config="a = trojan, a.example.com, 443, password=x")
+        _insert_node(conn, node_id=2, sub_id=1,
+                     config="b = trojan, b.example.com, 443, password=x")
+        # sub2: interval 越界（过小）→ 86400；从未同步 → next = created_at
+        _insert_subscription(conn, sub_id=2, interval=100,
+                             created="2026-09-05 08:00:00")
+        # sub3: interval NULL → 86400；disabled → next NULL
+        _insert_subscription(conn, sub_id=3, interval=None, enabled=0,
+                             last_update="2026-10-02 00:00:00")
+        # sub4: 边界值保留：300 / 604800
+        _insert_subscription(conn, sub_id=4, interval=300,
+                             last_update="2026-10-03 00:00:00")
+        _insert_subscription(conn, sub_id=5, interval=604800,
+                             last_update="2026-10-03 00:00:00")
+        # sub6: interval 越界（过大）→ 86400；auto_update=0 → next NULL
+        _insert_subscription(conn, sub_id=6, interval=9999999, auto_update=0,
+                             last_update="2026-10-04 00:00:00")
+    conn.close()
+
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+
+    rows = {r[0]: r for r in sqlite_rows(
+        db_path, "SELECT id, update_interval, last_attempt_at, last_success_at, "
+                 "next_update_at, last_node_count FROM subscriptions")}
+    s1 = rows[1]
+    assert s1[1] == 3600
+    assert s1[2] == "2026-10-01 00:00:00" and s1[3] == "2026-10-01 00:00:00"
+    assert s1[4] == "2026-10-01 01:00:00"
+    assert s1[5] == 2
+
+    s2 = rows[2]
+    assert s2[1] == 86400
+    assert s2[2] is None and s2[3] is None
+    assert s2[4] == "2026-09-05 08:00:00"  # 从未同步 → created_at
+    assert s2[5] == 0
+
+    s3 = rows[3]
+    assert s3[1] == 86400
+    assert s3[3] == "2026-10-02 00:00:00"
+    assert s3[4] is None  # disabled
+
+    assert rows[4][1] == 300
+    assert rows[5][1] == 604800
+
+    s6 = rows[6]
+    assert s6[1] == 86400
+    assert s6[4] is None  # auto_update=0
+
+
+@pytest.mark.asyncio
+async def test_0006_invalid_subscription_node_config_aborts_and_keeps_source(tmp_path):
+    """订阅节点 config 非法：staging 迁移失败，prepare 抛错，源库字节不变"""
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    _make_0005_database(legacy)
+    conn = sqlite3.connect(legacy)
+    with conn:
+        _insert_subscription(conn, sub_id=1)
+        _insert_node(conn, node_id=1, sub_id=1,
+                     config="broken = trojan, edge.example.com, notaport")
+    conn.close()
+    before = legacy.read_bytes()
+
+    paths = runtime_paths(tmp_path / "app-support")
+    with pytest.raises(RuntimeError):
+        await prepare_database(paths, legacy)
+
+    assert legacy.read_bytes() == before
+    assert sqlite_scalar(legacy, "SELECT COUNT(*) FROM proxy_nodes") == 1
+    # 直接对副本升级同样失败（staging 上的失败不产生 0006 产物）
+    copy = tmp_path / "copy.db"
+    copy.write_bytes(before)
+    with pytest.raises(Exception):
+        command.upgrade(database_migration._alembic_config(copy), "head")
+    assert sqlite_scalar(copy, "SELECT version_num FROM alembic_version") \
+        == "0005_udp_exceptions"
+
+
+@pytest.mark.asyncio
+async def test_0006_prepared_head_enforces_identity_invariants(tmp_path):
+    """head 库 DB 层不变量：同订阅同 stable_key 拒绝；订阅节点缺 stable_key 拒绝；
+    多个 manual 节点 stable_key 均为 NULL 合法（部分唯一索引不约束 NULL）"""
+    paths = runtime_paths(tmp_path / "app-support")
+    await prepare_database(paths, tmp_path / "missing.db")
+    db_path = paths.database
+
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO subscriptions (id, name, url) VALUES (1, 's', 'https://a')")
+        conn.execute(
+            "INSERT INTO proxy_nodes (name, subscription_id, node_type, server, port, "
+            "config, stable_key, enabled) VALUES ('a', 1, 'trojan', 'h', 443, "
+            "'a = trojan, h, 443, password=x', 'key-1', 1)")
+    with pytest.raises(sqlite3.IntegrityError):
+        with conn:
+            conn.execute(
+                "INSERT INTO proxy_nodes (name, subscription_id, node_type, server, "
+                "port, config, stable_key, enabled) VALUES ('b', 1, 'trojan', 'h', "
+                "443, 'b = trojan, h, 443, password=x', 'key-1', 1)")
+    with pytest.raises(sqlite3.IntegrityError):
+        with conn:
+            conn.execute(
+                "INSERT INTO proxy_nodes (name, subscription_id, node_type, server, "
+                "port, config, enabled) VALUES ('c', 1, 'trojan', 'h', 443, "
+                "'c = trojan, h, 443, password=x', 1)")
+    # 两个 manual NULL 不违反部分唯一
+    with conn:
+        conn.execute(
+            "INSERT INTO proxy_nodes (name, node_type, server, port, config, enabled) "
+            "VALUES ('m1', 'ss', '8.8.8.8', 1, 'm1 = ss, 8.8.8.8, 1', 1)")
+        conn.execute(
+            "INSERT INTO proxy_nodes (name, node_type, server, port, config, enabled) "
+            "VALUES ('m2', 'ss', '8.8.4.4', 1, 'm2 = ss, 8.8.4.4, 1', 1)")
+    conn.close()
+
+
+def test_0006_downgrade_restores_last_update_and_drops_identity(tmp_path):
+    """head → 0005：last_update 从 last_success_at 恢复、新列与 stable_key/
+    索引/CHECK 消失、节点行保留（已被去重删除的行不可恢复——见说明）"""
+    db_path = _make_0005_database(tmp_path / "down.db")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        _insert_subscription(conn, sub_id=1, interval=3600,
+                             last_update="2026-10-01 12:00:00")
+        _insert_node(conn, node_id=1, sub_id=1,
+                     config="a = trojan, a.example.com, 443, password=x")
+        _insert_node(conn, node_id=2, sub_id=1,
+                     config="b = trojan, b.example.com, 443, password=x")
+    conn.close()
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+    assert sqlite_scalar(db_path, "SELECT COUNT(*) FROM proxy_nodes") == 2
+
+    command.downgrade(database_migration._alembic_config(db_path), "0005_udp_exceptions")
+
+    sub_cols = [row[1] for row in sqlite_rows(db_path, "PRAGMA table_info(subscriptions)")]
+    assert "last_update" in sub_cols
+    for column in ("last_attempt_at", "last_success_at", "next_update_at",
+                   "last_error_code", "last_node_count"):
+        assert column not in sub_cols
+    assert "stable_key" not in _proxy_nodes_columns(db_path)
+    assert sqlite_rows(
+        db_path, "SELECT name FROM sqlite_master WHERE name='uq_proxy_nodes_subscription_stable_key'") == []
+    assert sqlite_rows(
+        db_path, "SELECT last_update FROM subscriptions WHERE id=1") == [("2026-10-01 12:00:00",)]
+    assert sqlite_scalar(db_path, "SELECT COUNT(*) FROM proxy_nodes") == 2
+
+
+def test_unversioned_0006_missing_partial_where_rejected(tmp_path):
+    """列指纹与 0006 一致但唯一索引缺 WHERE（非部分索引）：fail closed 拒绝"""
+    db_path = tmp_path / "nonpartial.db"
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("DROP INDEX uq_proxy_nodes_subscription_stable_key")
+        conn.execute(
+            "CREATE UNIQUE INDEX uq_proxy_nodes_subscription_stable_key "
+            "ON proxy_nodes (subscription_id, stable_key)")
+        conn.execute("DROP TABLE alembic_version")
+        conn.execute("DROP TABLE data_migration_records")
+    conn.close()
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "uq_proxy_nodes_subscription_stable_key" in details
+
+
+def test_proxy_node_identity_structures_match_metadata(tmp_path):
+    """三方强制器：冻结映射、ORM metadata、Alembic head 产物的
+    proxy_nodes CHECK 与部分唯一索引同名同定义（含 WHERE）"""
+    from app.models import ProxyNode
+    from sqlalchemy.schema import CheckConstraint
+
+    head = database_migration._head_revision()
+    frozen_checks = database_migration._accumulated_required_checks(head)["proxy_nodes"]
+    metadata_checks = {
+        c.name: database_migration._normalize_check_expression(c.sqltext.text)
+        for c in ProxyNode.__table__.constraints
+        if isinstance(c, CheckConstraint) and c.name
+    }
+    assert set(frozen_checks) == set(metadata_checks) == \
+        {"ck_proxy_nodes_subscription_stable_key"}
+    assert metadata_checks["ck_proxy_nodes_subscription_stable_key"] == \
+        database_migration._normalize_check_expression(
+            frozen_checks["ck_proxy_nodes_subscription_stable_key"])
+
+    frozen_ixs = database_migration._accumulated_required_indexes(head)["proxy_nodes"]
+    orm_ixs = {ix.name: ix for ix in ProxyNode.__table__.indexes}
+    assert set(orm_ixs) == set(frozen_ixs) == {"uq_proxy_nodes_subscription_stable_key"}
+    ix = orm_ixs["uq_proxy_nodes_subscription_stable_key"]
+    assert ix.unique is True
+    where_clause = (ix.dialect_options["sqlite"]["where"]).text
+    assert database_migration._normalize_check_expression(where_clause) == \
+        database_migration._normalize_check_expression(
+            frozen_ixs["uq_proxy_nodes_subscription_stable_key"]["sqlite_where"])
+
+    path = tmp_path / "head.db"
+    command.upgrade(database_migration._alembic_config(path), "head")
+    engine = sqlalchemy.create_engine(f"sqlite:///{path}")
+    try:
+        inspector = sqlalchemy.inspect(engine)
+        actual_checks = {cc["name"]: cc["sqltext"] for cc in
+                         inspector.get_check_constraints("proxy_nodes")}
+        actual_ix = {i["name"]: i for i in inspector.get_indexes("proxy_nodes")}
+    finally:
+        engine.dispose()
+    assert database_migration._normalize_check_expression(
+        actual_checks["ck_proxy_nodes_subscription_stable_key"]) == \
+        metadata_checks["ck_proxy_nodes_subscription_stable_key"]
+    entry = actual_ix["uq_proxy_nodes_subscription_stable_key"]
+    assert entry["column_names"] == ["subscription_id", "stable_key"]
+    assert bool(entry["unique"]) is True
+    assert database_migration._normalize_check_expression(
+        str(entry["dialect_options"]["sqlite_where"])) == \
+        metadata_checks["ck_proxy_nodes_subscription_stable_key"].replace(
+            "subscription_id IS NULL OR stable_key IS NOT NULL",
+            "stable_key IS NOT NULL")  # WHERE 即索引谓词本身
+
+
+def test_0006_frozen_canonicalizer_matches_runtime(tmp_path):
+    """迁移内嵌 canonicalizer 与运行时 stable_node_key 对 golden vectors 一致
+    （防两份实现漂移；迁移自带漂移自校验，此处交叉验证运行时侧）"""
+    from app.services.node_identity import stable_node_key
+
+    vectors = (
+        ("US A = trojan, edge.example.com, 443, password=synthetic",
+         "US Renamed = TROJAN , EDGE.Example.COM , 0443 , password=synthetic",
+         "905a00f8e51b5ad424b686a4dcfc4b693ff2cfd9ca59b2e9ca6f95cea4e63f13"),
+        ("JP = ss, relay.example.jp, 8388, aes-256-gcm, password=alpha",
+         "JP 2 = ss, relay.example.jp, 8388, password=alpha, aes-256-gcm",
+         "2a9e16a3d2d8cc906cdcb2b92b94beded9a962953e3c773b5ddaeef4b0a1f865"),
+    )
+    for first, second, expected in vectors:
+        assert stable_node_key({"config": first}) == expected
+        assert stable_node_key({"config": second}) == expected
