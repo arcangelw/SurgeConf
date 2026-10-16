@@ -155,11 +155,13 @@ async def _migrate_dangling_rule_source_actions(db) -> int:
     - action 仍是旧值（英国/韩国）——用户改过 action 即视为有意，不动；
     - 用户禁用的规则源不动（enabled=False）；
     - 对应地区组当前确实不会生成（组不存在/被禁用/auto+manual 全关）才修；
-      用户已显式开启英韩组则保留原选择。
+    - 旧 action 可能仍指向有效的同名 enabled 节点（canonical 节点优先）
+      或同名 enabled 服务组时绝不改写——迁移层无完整生成上下文，按
+      保守上界保留用户数据；disabled 同名候选不阻止确定迁移；
     其余任何规则源（有效节点 action、自定义 action 等）一律不改写；
     CustomRule 的坏引用属用户手写内容，由生成时校验显式报错指引修复。
     """
-    from app.models import RegionGroup, ServiceGroup
+    from app.models import ProxyNode, RegionGroup, ServiceGroup
 
     # 历史内置悬空签名：(name, source URL, rule_type, legacy_action, group)
     legacy_stream = (
@@ -175,6 +177,18 @@ async def _migrate_dangling_rule_source_actions(db) -> int:
     # 回退目标优先恒生成的 Global 服务组；用户删光服务组时退到内置 DIRECT
     fallback = "Global" if any(sg.name == "Global" and sg.enabled for sg in services) else "DIRECT"
 
+    # 保守守卫：旧 action 可能仍指向有效的同名节点或服务组（canonical
+    # 解析节点优先；服务组恒生成）时绝不改写。迁移层没有完整生成上下文
+    # （订阅前缀 / 信息关键词过滤均不可知），按保守上界处理：只要存在
+    # enabled 同名节点即视为可能有效、保留用户数据；disabled 候选不会
+    # 进入产物，不阻止迁移。不引入对 generator 的循环依赖。
+    reserved_names = {
+        name for name in (await db.execute(
+            select(ProxyNode.name).where(ProxyNode.enabled == True))).scalars().all()
+        if name
+    }
+    reserved_names.update(sg.name for sg in services if sg.enabled and sg.name)
+
     fixed = 0
     candidates = (await db.execute(
         select(RuleSource).where(RuleSource.name.in_(by_name))
@@ -189,6 +203,8 @@ async def _migrate_dangling_rule_source_actions(db) -> int:
         group_generated = rg is not None and rg.enabled and (rg.auto_enabled or rg.manual_enabled)
         if group_generated:
             continue  # 组会生成：引用有效，保留用户选择
+        if legacy_action in reserved_names:
+            continue  # 同名 enabled 节点/服务组可能使旧引用仍有效：保守保留
         rs.action = fallback
         fixed += 1
     return fixed

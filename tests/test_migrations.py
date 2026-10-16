@@ -306,6 +306,68 @@ async def test_dangling_migration_keeps_explicitly_enabled_groups(db):
     assert action == "英国"
 
 
+
+@pytest.mark.asyncio
+async def test_dangling_migration_blocked_by_same_name_enabled_node(db):
+    """enabled 同名节点（canonical 节点优先，旧引用实际有效）：不改写"""
+    db.add(ProxyNode(name="英国", node_type="trojan", server="203.0.113.2", port=443,
+                     config="英国 = trojan, 203.0.113.2, 443, password=x", enabled=True))
+    db.add(RuleSource(name="Stream EU (non_ip)", url="https://ruleset.skk.moe/List/non_ip/stream_eu.conf",
+                      action="英国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == "Stream EU (non_ip)"))).scalar_one()
+    assert action == "英国"  # 同名 enabled 节点使旧引用可能仍有效：保守保留
+
+
+@pytest.mark.asyncio
+async def test_dangling_migration_blocked_by_same_name_enabled_service_group(db):
+    """enabled 同名服务组（恒生成，旧引用实际有效）：不改写"""
+    from app.models import ServiceGroup
+
+    db.add(ServiceGroup(name="韩国", group_type="select", policies=["自动选择"],
+                        sort_order=90, enabled=True))
+    db.add(RuleSource(name="Stream KR (non_ip)", url="https://ruleset.skk.moe/List/non_ip/stream_kr.conf",
+                      action="韩国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=36, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == "Stream KR (non_ip)"))).scalar_one()
+    assert action == "韩国"
+
+
+@pytest.mark.asyncio
+async def test_dangling_migration_disabled_same_name_candidates_do_not_block(db):
+    """disabled 同名节点/服务组不会进入产物：不阻止确定迁移"""
+    from app.models import ServiceGroup
+
+    db.add(ProxyNode(name="英国", node_type="trojan", server="203.0.113.3", port=443,
+                     config="英国 = trojan, 203.0.113.3, 443, password=x", enabled=False))
+    db.add(ServiceGroup(name="英国", group_type="select", policies=["DIRECT"],
+                        sort_order=91, enabled=False))
+    db.add(RuleSource(name="Stream EU (non_ip)", url="https://ruleset.skk.moe/List/non_ip/stream_eu.conf",
+                      action="英国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))  # 幂等
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == "Stream EU (non_ip)"))).scalar_one()
+    assert action == "Global"
+
+
 @pytest.mark.asyncio
 async def test_dangling_migration_keeps_builtin_and_valid_actions(db):
     """内置动作与有效组引用（服务组/活跃地区组）一律不动"""
