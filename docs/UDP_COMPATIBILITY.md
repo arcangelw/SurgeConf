@@ -10,7 +10,7 @@
 
 | 模式 | 生成产物 | 适用目标 |
 |---|---|---|
-| `strict` | 注入四条受管 STUN 防护：`DOMAIN-KEYWORD,stun,REJECT`、UDP 3478、UDP 19302 与 `PROTOCOL,STUN` 阻断；例外不输出（保留在库中，切回 scoped 后恢复） | 全部目标 |
+| `strict` | 注入四条受管 STUN 防护规则以阻断受管 STUN 流量：`DOMAIN-KEYWORD,stun,REJECT`、UDP 3478、UDP 19302 与 `PROTOCOL,STUN`；例外不输出（保留在库中，切回 scoped 后恢复） | 全部目标 |
 | `scoped` | 先输出已启用例外的放行规则，随后注入**与 strict 完全相同的**四条 STUN 防护（Mac 默认）。无已启用例外时，产物中的 STUN 防护与 strict 完全一致 | 仅 Mac 两目标 |
 | `compatible` | 不注入任何受管 STUN 防护（iOS 默认）；用户自建规则照常保留 | 全部目标 |
 
@@ -43,7 +43,7 @@
 
 ## iOS compatible 的 WebRTC 风险
 
-`ios_mobile` 默认 `compatible`：UDP 兼容性最好（游戏、通话类应用正常），但**浏览器 WebRTC 可能获得直连候选地址**——即对端可见你的真实出口 IP。介意该隐私暴露时，请将档案切换为 `strict`（阻断受管 STUN 防护后，WebRTC 直连候选随之不可用）。
+`ios_mobile` 默认 `compatible`：UDP 兼容性最好（游戏、通话类应用正常），但**浏览器 WebRTC 可能获得直连候选地址**——即对端可见你的真实出口 IP。介意该隐私暴露时，请将档案切换为 `strict`（受管 STUN 流量被阻断后，WebRTC 直连候选随之不可用）。
 
 ## 关于 `udp-policy-not-supported-behaviour = REJECT`
 
