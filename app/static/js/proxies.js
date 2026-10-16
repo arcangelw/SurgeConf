@@ -882,7 +882,7 @@ async function syncOne(id, btn) {
     try {
       showLoading();
       const result = await API.post(`/api/subscriptions/${id}/sync`);
-      toast(I18N["sub.sync_done"].replace("{0}", result.subscription).replace("{1}", result.node_count));
+      toast(I18N["sub.sync_done"].replace("{0}", result.node_count));
       await refreshAll();
     } catch (e) { toast(e.message, "error"); }
     finally { hideLoading(); }
@@ -894,7 +894,9 @@ async function syncAll(btn) {
     try {
       showLoading();
       const result = await API.post("/api/subscriptions/sync-all");
-      toast(I18N["sub.sync_all_done"].replace("{0}", result.results.length));
+      const failed = result.results.filter(r => !r.success);
+      failed.forEach(r => toast(r.public_message, "error"));
+      toast(I18N["sub.sync_all_done"].replace("{0}", result.results.length - failed.length));
       await refreshAll();
     } catch (e) { toast(e.message, "error"); }
     finally { hideLoading(); }

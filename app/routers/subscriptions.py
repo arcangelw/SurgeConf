@@ -1,6 +1,7 @@
 """订阅管理 API"""
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from pydantic import BaseModel
@@ -131,13 +132,19 @@ async def delete_subscription(sub_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/{sub_id}/sync")
 async def sync_one(sub_id: int, db: AsyncSession = Depends(get_db)):
+    """手动同步单项（不受 enabled/auto 限制）：成功 200 安全 DTO；
+    同步失败 502 返回同一安全 DTO（不嵌套 detail、不携带异常原文）；
+    订阅不存在返回静态 404。"""
     result = await sync_subscription(db, sub_id)
-    if "error" in result:
-        raise HTTPException(400, result["error"])
-    return result
+    if result is None:
+        raise HTTPException(404, "订阅不存在")
+    if not result.success:
+        return JSONResponse(status_code=502, content=result.to_dict())
+    return result.to_dict()
 
 
 @router.post("/sync-all")
 async def sync_all(db: AsyncSession = Depends(get_db)):
+    """同步所有启用订阅：逐项安全 DTO，单项失败不中断（各含错误码）"""
     results = await sync_all_subscriptions(db)
-    return {"results": results}
+    return {"results": [r.to_dict() for r in results]}

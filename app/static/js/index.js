@@ -42,7 +42,9 @@ async function syncAll(btn) {
     try {
       toast(I18N["dashboard.syncing"]);
       const result = await API.post("/api/subscriptions/sync-all");
-      toast(I18N["dashboard.sync_done"].replace("{0}", result.results.length));
+      const failed = result.results.filter(r => !r.success);
+      failed.forEach(r => toast(r.public_message, "error"));
+      toast(I18N["dashboard.sync_done"].replace("{0}", result.results.length - failed.length));
       refreshStats();
     } catch (e) {
       toast(e.message, "error");

@@ -77,7 +77,7 @@ TRANSLATIONS = {
         "sub.interval": "更新间隔（秒）",
         "sub.empty": "还没有添加订阅源",
         "sub.not_synced": "未同步",
-        "sub.sync_done": "{0}: {1} 个节点",
+        "sub.sync_done": "已同步 {0} 个节点",
         "sub.sync_all_done": "同步完成: {0} 个订阅",
         "sub.confirm_delete": '确定删除订阅 "{0}"？相关节点也会被删除。',
         # 节点
@@ -489,7 +489,7 @@ TRANSLATIONS = {
         "sub.interval": "Update Interval (sec)",
         "sub.empty": "No subscriptions yet",
         "sub.not_synced": "Not synced",
-        "sub.sync_done": "{0}: {1} nodes",
+        "sub.sync_done": "Synced {0} nodes",
         "sub.sync_all_done": "Sync done: {0} subscriptions",
         "sub.confirm_delete": 'Delete subscription "{0}"? Related nodes will also be deleted.',
         # 节点

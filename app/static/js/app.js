@@ -31,7 +31,7 @@ const API = {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-      throw new Error(err.detail || resp.statusText);
+      throw new Error(err.detail || err.public_message || resp.statusText);
     }
     return resp.json();
   },

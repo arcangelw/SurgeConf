@@ -4,12 +4,13 @@ import re
 import base64
 import logging
 import httpx
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from app.models import Subscription, ProxyNode
-from app.services.node_identity import stable_node_key
+from app.services.node_identity import stable_node_key, NodeIdentityError
 
 logger = logging.getLogger(__name__)
 
@@ -296,77 +297,270 @@ def _validate_url(url: str) -> str:
     return url
 
 
-async def fetch_subscription(sub: Subscription) -> list[dict]:
-    """拉取订阅链接并解析节点"""
-    _validate_url(sub.url)
+async def fetch_subscription(url: str) -> list[dict]:
+    """拉取订阅链接并解析节点（纯网络阶段，不持有任何数据库事务）"""
+    _validate_url(url)
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(sub.url)
+        resp = await client.get(url)
         resp.raise_for_status()
         return parse_subscription_content(resp.text)
 
 
-async def sync_subscription(db: AsyncSession, sub_id: int) -> dict:
-    """同步单个订阅：拉取、解析、存入数据库。
+# ===== 同步结果安全 DTO 与错误分类 =====
 
-    现有破坏式重建路径的过渡实现：插入前按 stable_key 对本次拉取结果
-    确定性去重（相同连接不同显示名只保留首个），并记录成功状态。
-    事务化 upsert 与失败状态保留由后续任务接管。
+class _EmptySubscriptionError(Exception):
+    """拉取成功但解析不出任何节点（fail closed：不写入任何变更）"""
+
+
+_ERROR_PUBLIC_MESSAGES = {
+    "timeout": "订阅拉取超时，已保留上次可用节点",
+    "http_status": "订阅源响应异常，已保留上次可用节点",
+    "invalid_content": "订阅内容无法解析，已保留上次可用节点",
+    "network_error": "订阅源网络错误，已保留上次可用节点",
+    "internal_error": "同步发生内部错误，已保留上次可用节点",
+}
+
+
+def safe_sync_error(exc: BaseException) -> tuple[str, str]:
+    """把同步异常映射为固定错误码与公开消息。
+
+    错误码 allowlist：timeout / http_status / invalid_content /
+    network_error / internal_error。消息为静态文本，绝不拼接异常原文、
+    URL、主机、配置或响应体。分类顺序敏感：Timeout 是 RequestError
+    子类，必须先于 RequestError 判断。
     """
-    result = await db.execute(select(Subscription).where(Subscription.id == sub_id))
-    sub = result.scalar_one_or_none()
-    if not sub:
-        return {"error": "订阅不存在"}
+    if isinstance(exc, httpx.TimeoutException):
+        code = "timeout"
+    elif isinstance(exc, httpx.HTTPStatusError):
+        code = "http_status"
+    elif isinstance(exc, httpx.RequestError):
+        code = "network_error"
+    elif isinstance(exc, (_EmptySubscriptionError, NodeIdentityError, ValueError)):
+        # ValueError 覆盖 URL 校验拒绝、解码与 JSON 解析错误
+        code = "invalid_content"
+    else:
+        code = "internal_error"
+    return code, _ERROR_PUBLIC_MESSAGES[code]
 
+
+@dataclass(frozen=True)
+class SyncResult:
+    """同步结果安全 DTO：对外序列化只有这些字段，无 URL/配置/异常细节。
+
+    计数语义（报告与测试保持一致）：
+    - 成功：node_count 为去重后节点数；inserted = 新 stable_key 建立的
+      节点数；updated = 匹配到既有 stable_key 的处理数（即使字段值未变
+      也计数）；removed = 本次结果中缺失而被删除的旧节点数。
+    - 失败：零节点写入，inserted/updated/removed 全 0；node_count 保持
+      上次成功值 last_node_count（从未成功过则为 None）。
+    """
+
+    subscription_id: int
+    success: bool
+    node_count: int | None
+    inserted: int
+    updated: int
+    removed: int
+    error_code: str | None
+    public_message: str
+
+    def to_dict(self) -> dict:
+        """对外序列化（仅安全字段）"""
+        return {
+            "subscription_id": self.subscription_id,
+            "success": self.success,
+            "node_count": self.node_count,
+            "inserted": self.inserted,
+            "updated": self.updated,
+            "removed": self.removed,
+            "error_code": self.error_code,
+            "public_message": self.public_message,
+        }
+
+
+_SYNC_INTERVAL_MIN = 300
+_SYNC_INTERVAL_MAX = 604800
+_SYNC_INTERVAL_DEFAULT = 86400
+_FAILURE_RETRY_CAP = 900
+
+
+def _normalized_interval(interval: int | None) -> int:
+    """与 0006 迁移同口径：范围外/NULL 归一为默认 86400"""
+    if interval is None or not (_SYNC_INTERVAL_MIN <= interval <= _SYNC_INTERVAL_MAX):
+        return _SYNC_INTERVAL_DEFAULT
+    return interval
+
+
+def _utc_naive(now: datetime | None = None) -> datetime:
+    """统一为 UTC naive（库内时间口径）。
+
+    None → 当前 UTC；aware 只接受零 UTC 偏移（非 UTC 时区属调用方
+    编程错误，直接抛 ValueError，不进入同步流程）；naive 按库内口径
+    视为 UTC。
+    """
+    if now is None:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    offset = now.utcoffset()
+    if offset is not None and offset != timedelta(0):
+        raise ValueError("now 必须为 UTC（aware 零偏移）或 naive UTC")
+    return now.replace(tzinfo=None) if offset is not None else now
+
+
+def _prepare_incoming(nodes: list[dict]) -> list[tuple[str, dict]]:
+    """解析结果 → (stable_key, node_data)；同 key 保留首个（确定性去重）"""
+    prepared: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    for node_data in nodes:
+        key = stable_node_key(node_data)
+        if key in seen:
+            continue
+        seen.add(key)
+        prepared.append((key, node_data))
+    return prepared
+
+
+async def _record_failed_attempt(db: AsyncSession, sub_id: int,
+                                  now: datetime, code: str) -> None:
+    """失败状态短事务：只更新 attempt/error_code/next。
+
+    不触碰 last_success_at/last_node_count 与任何节点；enabled+auto 时
+    next = now + min(interval, 900)，否则 NULL。订阅并发删除时静默跳过；
+    本事务自身失败仅记录错误码。
+    """
     try:
-        nodes = await fetch_subscription(sub)
+        sub = (await db.execute(
+            select(Subscription).where(Subscription.id == sub_id)
+        )).scalar_one_or_none()
+        if sub is None:
+            await db.rollback()
+            return
+        sub.last_attempt_at = now
+        sub.last_error_code = code
+        if sub.enabled and sub.auto_update:
+            delay = min(_normalized_interval(sub.update_interval), _FAILURE_RETRY_CAP)
+            sub.next_update_at = now + timedelta(seconds=delay)
+        else:
+            sub.next_update_at = None
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.error("subscription %s failure state write failed: code=%s", sub_id, code)
 
-        # 删除该订阅的旧节点
-        await db.execute(delete(ProxyNode).where(ProxyNode.subscription_id == sub_id))
 
-        # 插入新节点（同一次拉取内相同连接确定性去重）
-        seen_keys: set[str] = set()
-        inserted = 0
-        for node_data in nodes:
-            key = stable_node_key(node_data)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            node = ProxyNode(
-                name=node_data["name"],
-                subscription_id=sub_id,
-                node_type=node_data["node_type"],
-                server=node_data["server"],
-                port=node_data["port"],
-                config=node_data["config"],
-                stable_key=key,
-                enabled=True,
-            )
-            db.add(node)
-            inserted += 1
+async def sync_subscription(db: AsyncSession, sub_id: int,
+                            now: datetime | None = None) -> SyncResult | None:
+    """同步单个订阅：拉取/解析/去重在事务外，成功后单事务 upsert。
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+    订阅不存在（含同步期间被并发删除）返回 None，由调用方决定 404。
+
+    成功写事务：重查订阅与现有节点，按 stable_key 匹配——匹配项只更新
+    provider 字段（name/node_type/server/port/config/region_auto），保留
+    id、region_manual、enabled、pinned_services、created_at 等人工状态；
+    新节点 enabled=True、人工字段为空；缺失旧节点删除；更新
+    attempt/success/node_count、清空 error_code；一次 commit。
+
+    任何失败（拉取/解析/空结果/写事务异常）：节点零写入，独立短事务只
+    记录 attempt/error_code/next，保留最后可用节点与既有成功状态。
+    """
+    now = _utc_naive(now)
+
+    # 阶段 1：短只读事务取订阅快照（普通值，不携带 ORM 对象跨事务）
+    row = (await db.execute(
+        select(Subscription.url, Subscription.last_node_count)
+        .where(Subscription.id == sub_id)
+    )).first()
+    await db.commit()
+    if row is None:
+        return None
+    url, last_node_count = row
+
+    # 阶段 2：网络拉取、解析、稳定键计算、同批去重（全部在写事务外）
+    try:
+        prepared = _prepare_incoming(await fetch_subscription(url))
+        if not prepared:
+            raise _EmptySubscriptionError()
+    except Exception as exc:
+        code, message = safe_sync_error(exc)
+        logger.error("subscription %s sync failed: code=%s", sub_id, code)
+        await _record_failed_attempt(db, sub_id, now, code)
+        return SyncResult(sub_id, False, last_node_count, 0, 0, 0, code, message)
+
+    # 阶段 3：单一写事务 upsert
+    try:
+        sub = (await db.execute(
+            select(Subscription).where(Subscription.id == sub_id)
+        )).scalar_one_or_none()
+        if sub is None:
+            await db.rollback()
+            return None
+        existing = {
+            node.stable_key: node
+            for node in (await db.execute(
+                select(ProxyNode).where(ProxyNode.subscription_id == sub_id)
+            )).scalars()
+        }
+        incoming_keys = {key for key, _ in prepared}
+        inserted = updated = removed = 0
+        for key, node_data in prepared:
+            node = existing.get(key)
+            if node is not None:
+                # 只覆盖 provider 字段；人工字段原样保留
+                node.name = node_data["name"]
+                node.node_type = node_data["node_type"]
+                node.server = node_data["server"]
+                node.port = node_data["port"]
+                node.config = node_data["config"]
+                node.region_auto = node_data.get("region_auto")
+                updated += 1
+            else:
+                db.add(ProxyNode(
+                    name=node_data["name"],
+                    subscription_id=sub_id,
+                    node_type=node_data["node_type"],
+                    server=node_data["server"],
+                    port=node_data["port"],
+                    config=node_data["config"],
+                    stable_key=key,
+                    region_auto=node_data.get("region_auto"),
+                    enabled=True,
+                ))
+                inserted += 1
+        stale_ids = [node.id for key, node in existing.items()
+                     if key not in incoming_keys]
+        if stale_ids:
+            await db.execute(delete(ProxyNode).where(ProxyNode.id.in_(stale_ids)))
+            removed = len(stale_ids)
         sub.last_attempt_at = now
         sub.last_success_at = now
         sub.last_error_code = None
-        sub.last_node_count = inserted
+        sub.last_node_count = len(prepared)
+        if sub.enabled and sub.auto_update:
+            sub.next_update_at = now + timedelta(
+                seconds=_normalized_interval(sub.update_interval))
+        else:
+            sub.next_update_at = None
         await db.commit()
-
-        return {"subscription": sub.name, "node_count": inserted}
-    except Exception as e:
+        return SyncResult(sub_id, True, len(prepared), inserted, updated,
+                          removed, None, "同步成功")
+    except Exception as exc:
         await db.rollback()
-        return {"error": str(e)}
+        code, message = safe_sync_error(exc)
+        logger.error("subscription %s sync write failed: code=%s", sub_id, code)
+        await _record_failed_attempt(db, sub_id, now, code)
+        return SyncResult(sub_id, False, last_node_count, 0, 0, 0, code, message)
 
 
-async def sync_all_subscriptions(db: AsyncSession) -> list[dict]:
-    """同步所有启用的订阅"""
-    result = await db.execute(
-        select(Subscription).where(Subscription.enabled == True)
-    )
-    subs = result.scalars().all()
+async def sync_all_subscriptions(db: AsyncSession) -> list[SyncResult]:
+    """同步所有启用订阅：逐项安全 DTO，单项失败不中断；并发删除项跳过"""
+    ids = (await db.execute(
+        select(Subscription.id).where(Subscription.enabled == True)  # noqa: E712
+    )).scalars().all()
+    await db.commit()
     results = []
-    for sub in subs:
-        r = await sync_subscription(db, sub.id)
-        results.append(r)
+    for sub_id in ids:
+        result = await sync_subscription(db, sub_id)
+        if result is not None:
+            results.append(result)
     return results
 
 
