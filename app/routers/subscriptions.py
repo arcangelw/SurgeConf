@@ -20,8 +20,9 @@ router = APIRouter(prefix="/api/subscriptions", tags=["订阅管理"])
 
 SUB_COLORS = ["#6c5ce7", "#00b894", "#e17055", "#0984e3", "#fdcb6e", "#e84393", "#00cec9", "#d63031"]
 
-# 规范颜色格式：仅接受 #RRGGBB（序列化时统一收敛为小写）
-SUB_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+# 规范颜色格式：仅接受整串 #RRGGBB（fullmatch 严格整串；Python 的 $ 会
+# 放行尾随换行，故模式不带锚点、匹配一律用 fullmatch）。序列化统一小写。
+SUB_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 
 
 def _palette_color(sub_id: int) -> str:
@@ -30,7 +31,7 @@ def _palette_color(sub_id: int) -> str:
 
 def _safe_color(value: Optional[str], sub_id: int) -> str:
     """存量脏颜色收敛到调色板 fallback，绝不透传进前端样式"""
-    if isinstance(value, str) and SUB_COLOR_RE.match(value):
+    if isinstance(value, str) and SUB_COLOR_RE.fullmatch(value):
         return value.lower()
     return _palette_color(sub_id)
 
@@ -84,7 +85,7 @@ class SubscriptionCreate(BaseModel):
         """null 表示清除（回退调色板）；非空必须是规范 #RRGGBB"""
         if value is None:
             return None
-        if not SUB_COLOR_RE.match(value):
+        if not SUB_COLOR_RE.fullmatch(value):
             raise ValueError("color 必须为 #RRGGBB 格式")
         return value.lower()
 
@@ -113,7 +114,7 @@ class SubscriptionUpdate(BaseModel):
         """null 表示清除（回退调色板）；非空必须是规范 #RRGGBB"""
         if value is None:
             return None
-        if not SUB_COLOR_RE.match(value):
+        if not SUB_COLOR_RE.fullmatch(value):
             raise ValueError("color 必须为 #RRGGBB 格式")
         return value.lower()
 
@@ -146,11 +147,14 @@ async def subscription_status_summary(db: AsyncSession = Depends(get_db)):
             continue
         if auto_update and next_at is not None and next_at <= now:
             summary["due"] += 1
-        if error_code:
+        # 与 DTO/UI 同一口径：先规范化再判定。None 才视为无错误；
+        # 空字符串/未知码收敛 internal_error 并计入 failed。
+        error = _safe_error_code(error_code)
+        if error is not None:
             summary["failed"] += 1
         if success_at is None:
             summary["never_synced"] += 1
-        elif not error_code:
+        elif error is None:
             summary["healthy"] += 1
     return summary
 

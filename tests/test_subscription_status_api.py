@@ -24,6 +24,7 @@ from app.models import Subscription
 from app.routers.subscriptions import (
     SubscriptionCreate,
     SubscriptionUpdate,
+    _palette_color,
     _iso_utc,
     _subscription_summary,
     get_subscription,
@@ -202,6 +203,46 @@ async def test_status_summary_matrix(db):
 
 
 @pytest.mark.asyncio
+async def test_status_summary_error_code_normalization(db):
+    """聚合与 DTO/UI 同口径：先 _safe_error_code 规范化再判定。
+
+    None 才无错误；空字符串/未知码收敛 internal_error 并计 failed
+    （尤其空字符串不得被当作"无错误"计入 healthy）。
+    """
+    from sqlalchemy import select as _select
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    past = now - timedelta(hours=2)
+    cases = [
+        (None, "healthy"),          # 无错误 + 曾成功
+        ("", "failed"),             # 空字符串 → internal_error → failed（非 healthy）
+        ("garbage-code", "failed"), # 未知码 → internal_error → failed
+        ("timeout", "failed"),      # 合法五码原样计 failed
+        ("http_status", "failed"),
+        ("invalid_content", "failed"),
+        ("network_error", "failed"),
+        ("internal_error", "failed"),
+    ]
+    for i, (code, _) in enumerate(cases):
+        db.add(_mk_sub(name=f"ec{i}", enabled=True, auto_update=False,
+                       next_update_at=None, last_success_at=past,
+                       last_error_code=code))
+    await db.commit()
+
+    summary = await subscription_status_summary(db=db)
+    n = len(cases)
+    assert summary == {"due": 0, "healthy": 1, "failed": n - 1,
+                       "never_synced": 0}
+    # 空字符串订阅绝不在 healthy：failed 计数覆盖除 None 外全部
+    assert summary["failed"] == 7 and summary["healthy"] == 1
+
+    # DTO 同口径：空字符串/未知码序列化输出 internal_error
+    subs = {s.name: s for s in (await db.execute(_select(Subscription))).scalars().all()}
+    assert _subscription_summary(subs["ec1"])["last_error_code"] == "internal_error"
+    assert _subscription_summary(subs["ec3"])["last_error_code"] == "timeout"
+
+
+@pytest.mark.asyncio
 async def test_status_summary_exact_keys_and_no_url_leak(db):
     """聚合响应 exact keys；不读/不返回 URL（响应文本无订阅 URL 字样）"""
     import json
@@ -226,6 +267,15 @@ async def test_status_summary_route_order_not_swallowed(client):
     assert resp.status_code == 200
     assert set(resp.json()) == {"due", "healthy", "failed", "never_synced"}
 
+    # 422 不回显输入（颜色非法值绝不出现在响应文本）
+    bad = await client.post("/api/subscriptions", json={
+        "name": "n", "url": "https://example.com/s", "color": "#123456\n"})
+    assert bad.status_code == 422
+    assert "#123456" not in bad.text
+    assert set(bad.json()) == {"detail"}
+    for err in bad.json()["detail"]:
+        assert set(err) == {"loc", "type", "msg"}
+
     # 列表端点同样返回安全 DTO（无 URL 泄漏）
     listing = await client.get("/api/subscriptions")
     assert listing.status_code == 200
@@ -238,7 +288,8 @@ async def test_status_summary_route_order_not_swallowed(client):
 def test_color_rejected_on_create_and_update():
     """API create/update 拒绝非 #RRGGBB；合法值收敛小写"""
     base = dict(name="n", url="https://example.com/s")
-    for bad in ("red", "#fff", "#GGGGGG", "#12345", "javascript:alert(1)", "#1234567"):
+    for bad in ("red", "#fff", "#GGGGGG", "#12345", "javascript:alert(1)", "#1234567",
+                "#123456\n", " #123456", "#123456 ", "#123456\nx", "\n#123456"):
         with pytest.raises(ValidationError):
             SubscriptionCreate(**base, color=bad)
         with pytest.raises(ValidationError):
@@ -251,6 +302,7 @@ def test_color_rejected_on_create_and_update():
 async def test_serializer_color_fallback_for_legacy_rows(db):
     """存量脏颜色（绕过 API 直写）序列化收敛到调色板 fallback"""
     db.add(_mk_sub(name="dirty", color="javascript:alert(1)"))
+    db.add(_mk_sub(name="newline", color="#123456\n"))
     db.add(_mk_sub(name="ok", color="#E17055"))
     db.add(_mk_sub(name="nullcolor", color=None))
     await db.commit()
@@ -260,6 +312,7 @@ async def test_serializer_color_fallback_for_legacy_rows(db):
     assert _subscription_summary(subs["dirty"])["color"].startswith("#")
     assert re.match(r"^#[0-9a-f]{6}$", _subscription_summary(subs["dirty"])["color"])
     assert _subscription_summary(subs["ok"])["color"] == "#e17055"
+    assert _subscription_summary(subs["newline"])["color"] == _palette_color(subs["newline"].id)
     assert re.match(r"^#[0-9a-f]{6}$", _subscription_summary(subs["nullcolor"])["color"])
 
 
@@ -284,6 +337,11 @@ async def client(tmp_path, monkeypatch):
         async with fastapi_app.router.lifespan_context(fastapi_app):
             async with AsyncClient(transport=ASGITransport(app=fastapi_app),
                                    base_url="http://test") as c:
+                import re as _re
+                page = await c.get("/")
+                meta = _re.search(r'name="csrf-token" content="([^"]+)"', page.text)
+                assert meta, "GET / 应签发隐式会话并输出 CSRF meta"
+                c.headers["X-CSRF-Token"] = meta.group(1)
                 yield c
 
     fastapi_app.dependency_overrides.pop(get_db, None)
