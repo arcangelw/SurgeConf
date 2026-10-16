@@ -24,8 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import ConfigProfile, UdpException
 from app.services.profile_resolution import ProfileNotFound, resolve_profile
-from app.udp_policy import (UdpMatchType, _MAC_ADDRESS_PATTERN,
-                            _contains_control_character, normalize_udp_match)
+from app.udp_policy import (UdpMatchType, _contains_control_character,
+                            normalize_udp_match)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,21 @@ _FALLBACK_MASKS = ("***", "[redacted]")
 # MAC 掩码前必须 fullmatch 的规范存储形态：6 组 2 位十六进制、冒号分隔
 #（接受存量小写；掩码输出以 normalize 契约的大写为准）
 _MAC_CANONICAL = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+
+# 仅用于脱敏碰撞比较的 MAC-like 规范器（非领域合法性判定）：
+# 6 组、每组 2 位十六进制或 ``**``、分隔符 ``:``/``-``（允许混合，
+# 保守纳入），统一 uppercase+冒号。掩码形存量（aa:bb:**:**:**:ff 等）
+# 也能得到规范 key；不可规范返回 None。绝不影响 normalize_udp_match
+# 的写入校验（非法值仍不可经 API 写入）。
+_MAC_LIKE_GROUP = r"(?:[0-9A-Fa-f]{2}|\*\*)"
+_MAC_LIKE_PATTERN = re.compile(
+    rf"{_MAC_LIKE_GROUP}(?:[:-]{_MAC_LIKE_GROUP}){{5}}")
+
+
+def _mask_collision_key(value: str) -> str | None:
+    if not _MAC_LIKE_PATTERN.fullmatch(value):
+        return None
+    return value.upper().replace("-", ":")
 
 
 class _DisplayNameChecked(BaseModel):
@@ -122,17 +137,19 @@ def _safe_fallback_mask(forbidden: frozenset[str]) -> str:
 
 
 async def _forbidden_match_values(db: AsyncSession) -> frozenset[str]:
-    """全库 UDP 例外完整匹配值（跨档案）+ MAC 规范等价形式。
+    """全库 UDP 例外完整匹配值（跨档案）+ MAC-like 规范等价形式。
 
     掩码候选不得等于其中任何值（防止一条记录的掩码回显另一条记录的
-    完整敏感值，含大小写/分隔变体的语义等价）。集合本身绝不进入
+    完整敏感值）。规范器接受合法与掩码形 MAC 存量（含大小写、横线、
+    混合分隔变体）；非 MAC 形值只按原文纳入。集合本身绝不进入
     响应或日志。
     """
     result = await db.execute(select(UdpException.match_value))
     values = {row[0] for row in result.all()}
     for value in tuple(values):
-        if _MAC_ADDRESS_PATTERN.fullmatch(value):
-            values.add(value.upper().replace("-", ":"))
+        key = _mask_collision_key(value)
+        if key is not None:
+            values.add(key)
     return frozenset(values)
 
 

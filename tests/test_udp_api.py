@@ -760,3 +760,53 @@ async def test_fallback_placeholder_itself_stored(admin_client, workstation_prof
     for item in listed.json():
         assert item["match_value_masked"] not in ("***", "[redacted]")
         assert item["match_value_masked"] != "ab"
+
+
+# ===== Fix round 3：掩码形 MAC 存量的等价规范（MAC-like 规范器） =====
+
+@pytest.mark.parametrize("stock", [
+    "aa:bb:**:**:**:ff",   # 小写冒号掩码形
+    "AA-BB-**-**-**-FF",   # 大写横线掩码形
+    "aa:bb-**:**-**:ff",   # 混合分隔（保守纳入）
+])
+@pytest.mark.asyncio
+async def test_mask_like_mac_stock_collides_with_candidate(
+        admin_client, gateway_profile, stock):
+    """掩码形 MAC 存量（含分隔/大小写变体）经规范 key 与合法 MAC 候选
+    碰撞：list/create/update 均 fallback，不回显候选与存量原文"""
+    from app.models import UdpException
+
+    async with admin_client._test_factory() as db:
+        db.add(UdpException(profile_id=gateway_profile.id,
+                            match_type="mac_address", match_value=stock))
+        await db.commit()
+    created = await admin_client.post(_base(gateway_profile), json={
+        "match_type": "mac_address", "match_value": "AA:BB:CC" + ":DD:EE:FF"})
+    assert created.status_code == 201
+    assert created.json()["match_value_masked"] == "***"  # key 碰撞 fallback
+    assert "AA:BB:**:**:**:FF" not in created.text
+    listed = await admin_client.get(_base(gateway_profile))
+    assert "AA:BB:**:**:**:FF" not in listed.text
+    assert stock not in listed.text
+    upd = await admin_client.put(
+        f"{_base(gateway_profile)}/{created.json()['id']}",
+        json={"enabled": False})
+    assert upd.status_code == 200
+    assert "AA:BB:**:**:**:FF" not in upd.text
+
+
+@pytest.mark.asyncio
+async def test_non_mac_values_not_over_normalized(admin_client,
+                                                  workstation_profiles):
+    """非 MAC 形值只按原文碰撞：含冒号的 process 值正常掩码，不误
+    fallback；MAC 档案照常输出掩码（互不干扰）"""
+    profile, _ = workstation_profiles
+    resp = await admin_client.post(_base(profile), json={
+        "match_type": "process", "match_value": "not:a:mac:value!"})
+    assert resp.status_code == 201
+    assert resp.json()["match_value_masked"] == "no**e!"
+    gw = await _create_profile(admin_client, "隔离档案", "mac_gateway")
+    mac = await admin_client.post(_base(gw), json={
+        "match_type": "mac_address", "match_value": "02:00:00:00:00:01"})
+    assert mac.status_code == 201
+    assert mac.json()["match_value_masked"] == "02:00:**:**:**:01"
