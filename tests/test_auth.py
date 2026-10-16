@@ -49,9 +49,9 @@ async def client_loopback(auth_app):
 
 @pytest_asyncio.fixture
 async def client_from_lan(auth_app):
-    """对端 192.168.1.50：非回环的局域网客户端"""
-    transport = ASGITransport(app=auth_app, client=("192.168.1.50", 51234))
-    async with AsyncClient(transport=transport, base_url="http://192.168.1.50") as c:
+    """对端 203.0.113.50：非回环的局域网客户端（RFC 5737 文档地址）"""
+    transport = ASGITransport(app=auth_app, client=("203.0.113.50", 51234))
+    async with AsyncClient(transport=transport, base_url="http://203.0.113.50") as c:
         yield c
 
 
@@ -190,7 +190,7 @@ async def test_local_only_rejects_non_loopback_writes(client_from_lan):
 async def test_xff_cannot_spoof_loopback(client_from_lan):
     resp = await client_from_lan.get(
         "/api/configs/profiles",
-        headers={"X-Forwarded-For": "127.0.0.1, 10.0.0.1"})
+        headers={"X-Forwarded-For": "127.0.0.1, 198.51.100.1"})
     assert resp.status_code == 403
 
 
@@ -307,8 +307,8 @@ async def test_implicit_session_unusable_in_lan_mode(client_loopback, client_fro
 async def test_csrf_bound_to_own_session(auth_app, client_from_lan, client_loopback):
     await _enable_lan_mode(client_loopback)
     other = AsyncClient(transport=ASGITransport(app=auth_app,
-                                                client=("192.168.1.51", 51234)),
-                        base_url="http://192.168.1.51")
+                                                client=("203.0.113.51", 51234)),
+                        base_url="http://203.0.113.51")
     login_other = await other.post("/api/auth/login", json={"password": PASSWORD})
     assert login_other.status_code == 200
     stolen_csrf = login_other.json()["csrf_token"]

@@ -6,11 +6,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# shellcheck source=launchd_lib.sh
+source "$SCRIPT_DIR/launchd_lib.sh"
+
 # 收紧新建文件权限：数据库/WAL/会话密钥默认仅属主可读写
 umask 077
 
 # 运行目录（默认 Application Support；SURGECONF_DATA_DIR 可整体重定向）
-DATA_DIR="${SURGECONF_DATA_DIR:-$HOME/Library/Application Support/SurgeConf}"
+DATA_DIR="$(sc_resolve_data_dir)"
 LOG_DIR="$HOME/Library/Logs/SurgeConf"
 mkdir -p "$DATA_DIR" "$LOG_DIR"
 chmod 700 "$DATA_DIR" "$LOG_DIR"
@@ -32,6 +35,8 @@ echo "SurgeConf 启动中..."
 echo "访问地址: http://${HOST}:${PORT}"
 
 if [ "${1:-}" = "--daemon" ]; then
+  # 重定向前安全预建日志（拒绝 symlink，0600）
+  sc_ensure_log_file "$LOG_DIR/surgeconf.log"
   nohup uvicorn app.main:app --host "$HOST" --port "$PORT" --no-access-log \
     >> "$LOG_DIR/surgeconf.log" 2>&1 &
   echo "PID: $!"

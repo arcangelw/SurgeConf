@@ -59,7 +59,7 @@ async def admin_client(secure_app):
 @pytest_asyncio.fixture
 async def anonymous_client(secure_app):
     """非回环匿名对端：无任何会话（local_only 下普通管理路径 403）"""
-    client = await _make_client(secure_app, "192.168.1.50")
+    client = await _make_client(secure_app, "203.0.113.50")
     yield client
     await client.aclose()
 

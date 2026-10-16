@@ -144,6 +144,20 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 
 访问模式切换为 `lan_authenticated` 并设置管理密码后，局域网设备通过 `http://<主机地址>:61830` 登录管理。
 
+### launchd 配置持久化
+
+`enable`/`start`/`restart` 统一走唯一安装流程：卸载已加载任务 → 按当前配置重新生成 plist → 加载并确认成功（任一步失败都会如实报错）。旧 plist 的 `0.0.0.0` 监听、仓库日志路径等遗留字段在每次安装时都会被重写。
+
+安装时各键的更新语义（持久化于 `~/Library/Application Support/SurgeConf/launchd.env`，权限 0600）：
+
+| 调用方式 | 效果 |
+|---|---|
+| `SURGE_HOST=0.0.0.0 ./surgeconf.sh enable` | 写入并持久化，restart 保留 |
+| `./surgeconf.sh restart`（未设置该键） | 保留已持久化的值 |
+| `SURGE_HOST= ./surgeconf.sh enable`（显式空） | 清除该键，回到安全默认 `127.0.0.1` |
+
+`SURGE_HOST`/`SURGE_PORT`/`SURGECONF_DATA_DIR` 会写入 plist 的 `EnvironmentVariables`（用于定位运行目录）；控制器凭据 `SURGE_CONTROLLER_ACCESS`/`SURGE_HTTP_API` 只保存在 0600 的 launchd.env 中，绝不写入 plist。plist 本身权限 0600 并设置 `Umask 63`（即八进制 077），所有路径与值经 XML 转义并拒绝控制字符。
+
 ---
 
 ## 使用场景与自定义规则指南
@@ -171,13 +185,13 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 
 3. **添加企业 Host 映射** — 在配置方案的 Host 映射中添加：
    ```
-   *.internal.company.com → server:10.0.1.100
-   gitlab.corp → server:10.0.2.50
+   *.internal.company.com → server:192.0.2.10
+   gitlab.corp → server:192.0.2.50
    ```
 
 4. **指定内网 DNS** — 某些企业域名只能通过内部 DNS 解析，在 General 中配置：
    ```
-   dns-server = 223.5.5.5, 10.0.1.1, 10.0.1.2
+   dns-server = 223.5.5.5, 192.0.2.53, 198.51.100.53
    ```
    或在 Host 映射中直接指定。
 

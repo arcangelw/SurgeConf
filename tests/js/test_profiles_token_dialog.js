@@ -151,10 +151,10 @@ function createPage(protocol, port) {
   ];
   for (const [protocol, port, suffix] of matrix) {
     const page = createPage(protocol, port);
-    page.reg("ip-select-7", { value: "10.1.2.3" });
+    page.reg("ip-select-7", { value: "198.51.100.7" });
     assert.equal(
       page.sandbox.__hooks.buildSubscribeUrl(7, "tk"),
-      `${protocol}//10.1.2.3${suffix}/api/configs/profiles/7/subscribe?token=tk`,
+      `${protocol}//198.51.100.7${suffix}/api/configs/profiles/7/subscribe?token=tk`,
       `${protocol}//...:${port} 组合端口处理错误`);
     await new Promise((r) => setTimeout(r, 0)); // 排空该 context 的 init 微任务
   }
@@ -164,7 +164,7 @@ function createPage(protocol, port) {
   await new Promise((resolve) => setTimeout(resolve, 20)); // 排空 init()/loadData()
 
   page.reg("profile-list");
-  const ipSelect = page.reg("ip-select-1", { value: "192.168.1.9" });
+  const ipSelect = page.reg("ip-select-1", { value: "203.0.113.9" });
   page.reg("token-status-1");
   const btn = page.reg("token-btn-1");
   const modal = page.reg("token-modal");
@@ -172,17 +172,17 @@ function createPage(protocol, port) {
   const hooks = page.sandbox.__hooks;
 
   const urlOf = (token) =>
-    `http://192.168.1.9:61830/api/configs/profiles/1/subscribe?token=${encodeURIComponent(token)}`;
+    `http://203.0.113.9:61830/api/configs/profiles/1/subscribe?token=${encodeURIComponent(token)}`;
 
   // ---- T1b 纯函数：逐参数安全编码 / 回退地址 / IPv6 / hostname ----
   assert.equal(hooks.buildSubscribeUrl(1, "abc/DEF+x="), urlOf("abc/DEF+x="));
   assert.equal(
     hooks.buildSubscribeUrl(2, "t"),
     "http://127.0.0.1:61830/api/configs/profiles/2/subscribe?token=t");
-  ipSelect.value = "10.0.0.8";
+  ipSelect.value = "198.51.100.8";
   assert.equal(
     hooks.buildSubscribeUrl(1, "t"),
-    "http://10.0.0.8:61830/api/configs/profiles/1/subscribe?token=t");
+    "http://198.51.100.8:61830/api/configs/profiles/1/subscribe?token=t");
   // IPv6 字面量：方括号包裹，冒号不被百分号编码
   ipSelect.value = "fe80::1";
   assert.equal(
@@ -193,7 +193,7 @@ function createPage(protocol, port) {
   assert.equal(
     hooks.buildSubscribeUrl(1, "t"),
     "http://My.Host-Name_1.example:61830/api/configs/profiles/1/subscribe?token=t");
-  ipSelect.value = "192.168.1.9";
+  ipSelect.value = "203.0.113.9";
 
   // ---- T2 首次生成：无确认弹窗，对话框显示完整 URL ----
   hooks.allProfiles = [{ id: 1, name: "默认配置", is_default: true, locale: "zh",

@@ -1,6 +1,9 @@
 """Surge 配置文件生成器 - 支持中英文分组名"""
 
+import ipaddress
 import os
+import re
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -16,6 +19,54 @@ DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐
 
 # IP 类规则集关键词：命中则生成 no-resolve，避免域名连接为匹配 IP 规则触发本地 DNS 解析（DNS 泄漏）
 DEFAULT_NO_RESOLVE_KEYWORDS = "(ip),ASN,/ip/,Lan"
+
+# 控制器凭据 env 值必须匹配的单行 access@host:port 格式（host 支持
+# hostname / IPv4 / 方括号 IPv6）；任何控制字符或格式偏离都让生成失败，
+# 防止 CR/LF 等注入额外键或 section。
+_HOSTNAME_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$")
+_ACCESS_FORBIDDEN = set(" \t\r\n\v\f,=#@")
+
+
+def validated_access_env(name: str) -> str | None:
+    """读取并校验控制器凭据环境变量；未设置/仅空白返回 None。
+
+    合法值：单行 ``access@host:port``，access 不含空白与配置分隔符，
+    host 为 hostname、IPv4 或 ``[IPv6]``，port 为 1..65535。
+    非法值抛 ValueError —— 明确生成失败，绝不带病输出。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(f"{name}: 控制字符不被允许")
+    access, sep, host_port = value.partition("@")
+    if not sep or not access or any(ch in _ACCESS_FORBIDDEN for ch in access):
+        raise ValueError(f"{name}: 需要 access@host:port 格式且 access 不含空白/分隔符")
+    host, port_sep, port = host_port.rpartition(":")
+    if not port_sep or not host:
+        raise ValueError(f"{name}: 缺少 host:port")
+    if host.startswith("[") and host.endswith("]") and host.count("[") == 1:
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError as exc:
+            raise ValueError(f"{name}: 非法 IPv6 字面量") from exc
+    else:
+        if ":" in host:
+            raise ValueError(f"{name}: IPv6 必须使用方括号包裹")
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            # 形似 IPv4（纯数字与点）的 host 不允许回退为 hostname
+            if host.replace(".", "").isdigit() or not _HOSTNAME_RE.match(host):
+                raise ValueError(f"{name}: 非法 host（需 hostname/IPv4/[IPv6]）")
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(f"{name}: 端口需为 1..65535")
+    return value
 
 async def _get_sys_config(db: AsyncSession) -> dict:
     """读取系统级配置"""
@@ -105,12 +156,12 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # General
     general = dict(DEFAULT_GENERAL)
-    # 控制器凭据：无静态默认，仅在对应环境变量非空时注入为默认值
-    # （配置方案 General 表单的显式值仍可覆盖）
-    env_controller = os.environ.get("SURGE_CONTROLLER_ACCESS", "").strip()
+    # 控制器凭据：无静态默认，仅在对应环境变量为合法非空值时注入为默认值
+    # （配置方案 General 表单的显式值仍可覆盖；非法值在此明确失败）
+    env_controller = validated_access_env("SURGE_CONTROLLER_ACCESS")
     if env_controller:
         general["external-controller-access"] = env_controller
-    env_http_api = os.environ.get("SURGE_HTTP_API", "").strip()
+    env_http_api = validated_access_env("SURGE_HTTP_API")
     if env_http_api:
         general["http-api"] = env_http_api
     if profile and profile.general:
