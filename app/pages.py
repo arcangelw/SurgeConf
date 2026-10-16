@@ -83,8 +83,9 @@ async def page_settings(request: Request):
 
 @router.get("/login", response_class=HTMLResponse)
 async def page_login(request: Request):
-    """登录页公开渲染；已持有有效会话时直接回到首页"""
-    from app.security import resolve_session
-    if resolve_session(request) is not None:
+    """登录页公开渲染；已持有当前模式下有效会话时直接回到首页"""
+    from app.security import load_access_settings, resolve_session_for
+    settings = await load_access_settings()
+    if resolve_session_for(request, settings) is not None:
         return RedirectResponse(url="/", status_code=307)
     return _render(request, "login.html")

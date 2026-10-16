@@ -4,6 +4,7 @@
 ``PUT /api/settings/access`` 受访问矩阵与 CSRF 保护（见 ``app.security``）。
 """
 
+import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -15,8 +16,19 @@ from app.database import get_db
 from app.models import SystemConfig
 from app.security import (COOKIE_NAME, SESSION_MAX_AGE,
                           get_session_signer, hash_admin_password,
-                          load_access_settings, require_csrf,
-                          verify_admin_password)
+                          load_access_settings, login_throttle_wait,
+                          record_login_failure, record_login_success,
+                          require_csrf, verify_admin_password)
+
+# 全局 KDF 并发上限：登录 scrypt 校验全部卸载到线程池执行
+_KDF_SEMAPHORE = asyncio.Semaphore(4)
+
+
+async def _verify_password_off_loop(password: str, encoded: str) -> bool:
+    """scrypt 校验限并发并卸载到线程，避免阻塞事件循环"""
+    async with _KDF_SEMAPHORE:
+        return await asyncio.to_thread(verify_admin_password, password, encoded)
+
 
 router = APIRouter(tags=["认证"])
 
@@ -38,12 +50,20 @@ class LoginBody(BaseModel):
 
 @router.post("/api/auth/login")
 async def login(body: LoginBody, request: Request, response: Response):
+    # 限流按直接 TCP 对端计数，不信任任何转发头
+    wait_seconds = login_throttle_wait(request)
+    if wait_seconds is not None:
+        return JSONResponse(status_code=429,
+                            content={"detail": "尝试次数过多，请稍后再试"},
+                            headers={"Retry-After": str(wait_seconds)})
     settings = await load_access_settings()
     if not settings.password_hash:
         return JSONResponse(status_code=403,
                             content={"detail": "未设置管理密码"})
-    if not verify_admin_password(body.password, settings.password_hash):
+    if not await _verify_password_off_loop(body.password, settings.password_hash):
+        record_login_failure(request)
         return JSONResponse(status_code=401, content={"detail": "密码错误"})
+    record_login_success(request)
     token, csrf = get_session_signer().issue(loopback_implicit=False)
     _set_session_cookie(response, token, request)
     return {
@@ -55,18 +75,24 @@ async def login(body: LoginBody, request: Request, response: Response):
 
 
 @router.post("/api/auth/logout")
-async def logout(response: Response):
-    response.delete_cookie(COOKIE_NAME, path="/")
+async def logout(request: Request, response: Response):
+    # 非公开端点：中间件已要求有效会话 + CSRF，此处防御性复查
+    if not require_csrf(request):
+        return JSONResponse(status_code=403,
+                            content={"detail": "CSRF token missing or invalid"})
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True,
+                           samesite="strict",
+                           secure=request.url.scheme == "https")
     return {"authenticated": False}
 
 
 @router.get("/api/auth/session")
 async def session_info(request: Request):
-    from app.security import resolve_session
-    session = resolve_session(request)
+    from app.security import resolve_session_for
+    settings = await load_access_settings()
+    session = resolve_session_for(request, settings)
     if session is None:
         return {"authenticated": False}
-    settings = await load_access_settings()
     return {
         "authenticated": True,
         "csrf_token": session["csrf"],
@@ -84,7 +110,8 @@ class AccessUpdate(BaseModel):
 
 
 @router.put("/api/settings/access")
-async def update_access(body: AccessUpdate, request: Request, db=Depends(get_db)):
+async def update_access(body: AccessUpdate, request: Request, response: Response,
+                        db=Depends(get_db)):
     """访问模式切换与管理密码设置。
 
     首次启用 ``lan_authenticated`` 必须同时设置密码；
@@ -99,7 +126,7 @@ async def update_access(body: AccessUpdate, request: Request, db=Depends(get_db)
     settings = await load_access_settings()
 
     if settings.password_configured:
-        if not body.current_password or not verify_admin_password(
+        if not body.current_password or not await _verify_password_off_loop(
                 body.current_password, settings.password_hash or ""):
             return JSONResponse(status_code=403, content={"detail": "当前密码错误"})
     elif body.current_password:
@@ -132,6 +159,16 @@ async def update_access(body: AccessUpdate, request: Request, db=Depends(get_db)
         else:
             db.add(SystemConfig(key=key, value=value))
     await db.commit()
+    # 切换到 lan_authenticated 时，请求若携带回环隐式会话则一并清除
+    # （隐式会话在新模式下立即失效，浏览器侧也去掉无效 Cookie）
+    if body.admin_access == "lan_authenticated":
+        token = request.cookies.get(COOKIE_NAME)
+        if token:
+            signer = get_session_signer()
+            if signer.parse(token, loopback_implicit=False) is None:
+                response.delete_cookie(COOKIE_NAME, path="/", httponly=True,
+                                       samesite="strict",
+                                       secure=request.url.scheme == "https")
     return {
         "installation_role": body.installation_role,
         "admin_access": body.admin_access,

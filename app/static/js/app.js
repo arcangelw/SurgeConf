@@ -62,9 +62,9 @@ const API = {
   },
 };
 
-/** 退出登录：清除会话后回登录页 */
+/** 退出登录：走统一 API（自动携带 CSRF），清除会话后回登录页 */
 async function logout() {
-  try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) { /* 忽略 */ }
+  try { await API.post("/api/auth/logout"); } catch (e) { /* 失败也继续跳转 */ }
   window.location.href = "/login";
 }
 

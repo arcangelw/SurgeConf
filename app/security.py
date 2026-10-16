@@ -10,6 +10,7 @@
 """
 
 import base64
+from collections import defaultdict, deque
 import hashlib
 import hmac
 import ipaddress
@@ -33,16 +34,22 @@ VALID_ADMIN_ACCESS = {"local_only", "lan_authenticated"}
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
-# 公开路径：静态资源与登录端点；它们不读取任何管理数据
-PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/logout", "/api/auth/session"}
+# 公开路径：静态资源、登录页/登录端点与未认证 session 探测；
+# logout 不公开（需有效会话 + CSRF）。它们不读取任何管理数据。
+PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/session"}
+
+# 登录限流：每直接对端 60 秒窗口内最多 10 次失败，超限阻断 60 秒
+LOGIN_FAILURE_WINDOW = 60.0
+LOGIN_FAILURE_LIMIT = 10
+LOGIN_BLOCK_SECONDS = 60.0
 
 _SCRYPT_N = 2 ** 14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_SALT_BYTES = 16
 _SCRYPT_DKLEN = 32
-# 解码时防止库内被篡改参数造成 DoS
-_SCRYPT_PARAM_LIMITS = (2 ** 20, 64, 32)
+_SECRET_BYTES = 32
+# verify 侧只接受编码规范值（n=16384,r=8,p=1），不接受任何参数偏离
 
 _SIGNER_CACHE: dict[str, "SessionSigner"] = {}
 
@@ -59,19 +66,21 @@ def hash_admin_password(password: str) -> str:
 
 
 def verify_admin_password(password: str, encoded: str) -> bool:
+    """只接受 n=16384,r=8,p=1、16 字节盐、32 字节摘要；一切检查在 KDF 前"""
     try:
-        scheme, n_s, r_s, p_s, salt_b64, digest_b64 = encoded.split("$")
-        n, r, p = int(n_s), int(r_s), int(p_s)
-        if scheme != "scrypt":
+        parts = encoded.split("$")
+        if len(parts) != 6:
             return False
-        if not all(0 < v <= lim for v, lim in zip((n, r, p), _SCRYPT_PARAM_LIMITS)):
+        scheme, n_s, r_s, p_s, salt_b64, digest_b64 = parts
+        if (scheme != "scrypt" or n_s != str(_SCRYPT_N)
+                or r_s != str(_SCRYPT_R) or p_s != str(_SCRYPT_P)):
             return False
         salt = base64.b64decode(salt_b64, validate=True)
         expected = base64.b64decode(digest_b64, validate=True)
-        if not salt or not expected:
+        if len(salt) != _SCRYPT_SALT_BYTES or len(expected) != _SCRYPT_DKLEN:
             return False
-        actual = hashlib.scrypt(password.encode("utf-8"), n=n, r=r, p=p,
-                                salt=salt, dklen=len(expected))
+        actual = hashlib.scrypt(password.encode("utf-8"), n=_SCRYPT_N, r=_SCRYPT_R,
+                                p=_SCRYPT_P, salt=salt, dklen=_SCRYPT_DKLEN)
         return hmac.compare_digest(actual, expected)
     except (ValueError, TypeError):
         return False
@@ -79,20 +88,65 @@ def verify_admin_password(password: str, encoded: str) -> bool:
 
 # ===== 会话签名密钥 =====
 
-def load_or_create_session_secret(path: Path) -> bytes:
-    """加载（或首次生成）32 字节会话签名密钥；密钥文件收敛到 0o600。
+def _read_secret_file(path: Path) -> bytes | None:
+    """O_NOFOLLOW 只读打开并校验为 32 字节普通文件；任何异常视作不可用"""
+    import stat as stat_module
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks = []
+        remaining = _SECRET_BYTES + 1  # 多读 1 字节用于拒绝超长文件
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        return data if len(data) == _SECRET_BYTES else None
+    finally:
+        os.close(fd)
 
-    密钥丢失仅导致既有会话失效，不涉及业务数据，损坏/长度异常时重新生成。
+
+def load_or_create_session_secret(path: Path) -> bytes:
+    """加载（或首次原子创建）32 字节会话签名密钥。
+
+    - 创建用 ``O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`` 一次原子完成（0o600），
+      并发竞争失败方重读最终文件，所有调用方拿到同一密钥；
+    - 已有合法文件（含 0644 等宽松权限）加载时收敛到 0o600；
+    - 符号链接 / 非普通文件 / 长度异常一律拒绝（fail closed），
+      密钥丢失仅导致既有会话失效，不涉及业务数据。
     """
     path = Path(path)
-    if path.exists():
-        data = path.read_bytes()
-        if len(data) == 32:
-            return data
-    secret = secrets.token_bytes(32)
+    data = _read_secret_file(path)
+    if data is not None:
+        os.chmod(path, 0o600)
+        return data
+
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.write_bytes(secret)
-    path.chmod(0o600)
+    secret = secrets.token_bytes(_SECRET_BYTES)
+    try:
+        fd = os.open(path,
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        # 另一个调用方赢了竞态，或路径被符号链接/异常文件占据
+        data = _read_secret_file(path)
+        if data is None:
+            raise
+        os.chmod(path, 0o600)
+        return data
+    except OSError:
+        # 符号链接（ELOOP）等：拒绝在不安全路径上创建
+        raise
+    try:
+        os.write(fd, secret)
+    finally:
+        os.close(fd)
     return secret
 
 
@@ -212,11 +266,12 @@ def request_peer_is_loopback(request: Request) -> bool:
         return False
 
 
-def resolve_session(request: Request) -> dict | None:
+def resolve_session(request: Request, *, allow_implicit: bool = True) -> dict | None:
     """解析请求携带的有效会话。
 
-    显式会话对任意对端有效；隐式（loopback salt）会话仅在回环对端时解析，
-    其余情况一律视作无会话。
+    显式会话对任意对端有效；隐式（loopback salt）会话仅在显式允许
+    （``local_only`` 模式）且对端为回环时才解析——切换到
+    ``lan_authenticated`` 后隐式会话立即失效，LAN 模式只接受显式会话。
     """
     token = request.cookies.get(COOKIE_NAME)
     if not token:
@@ -225,9 +280,15 @@ def resolve_session(request: Request) -> dict | None:
     explicit = signer.parse(token, loopback_implicit=False)
     if explicit is not None:
         return explicit
-    if request_peer_is_loopback(request):
+    if allow_implicit and request_peer_is_loopback(request):
         return signer.parse(token, loopback_implicit=True)
     return None
+
+
+def resolve_session_for(request: Request, settings: AccessSettings) -> dict | None:
+    """按当前访问模式解析会话：仅 local_only 接受回环隐式会话"""
+    return resolve_session(request,
+                           allow_implicit=settings.admin_access == "local_only")
 
 
 def require_csrf(request: Request) -> bool:
@@ -247,11 +308,14 @@ async def require_admin_request(request: Request, settings: AccessSettings) -> s
     ``request.state.session``，需要为回环新签发隐式会话时
     ``request.state.issue_implicit_session`` 为 True（由装配层负责 Set-Cookie）。
     """
+    loopback = request_peer_is_loopback(request)
     if is_public_path(request.url.path):
+        # local_only 下公开路径也仅限本机：非回环连登录页/登录端点都不可见
+        if settings.admin_access == "local_only" and not loopback:
+            return Decision.FORBIDDEN
         return Decision.PUBLIC
 
-    loopback = request_peer_is_loopback(request)
-    session = resolve_session(request)
+    session = resolve_session_for(request, settings)
     needs_csrf = request.method not in SAFE_METHODS
 
     if settings.admin_access == "local_only":
@@ -270,7 +334,7 @@ async def require_admin_request(request: Request, settings: AccessSettings) -> s
             return Decision.CSRF_REJECTED
         return Decision.ALLOW
 
-    # lan_authenticated：隐式会话 salt 不同，天然不通过 resolve_session
+    # lan_authenticated：只接受显式会话（resolve_session_for 已排除隐式）
     if session is None:
         if request.url.path.startswith("/api/"):
             return Decision.UNAUTHORIZED
@@ -285,3 +349,46 @@ def _mark_implicit_issue(request: Request) -> tuple[str, str]:
     token, csrf = get_session_signer().issue(loopback_implicit=True)
     request.state.issue_implicit_session = token
     return token, csrf
+
+
+# ===== 登录限流（按直接 TCP 对端，不信任任何转发头） =====
+
+
+_login_failures: dict[str, deque] = defaultdict(deque)
+_login_blocked_until: dict[str, float] = {}
+
+
+def _peer_key(request: Request) -> str:
+    peer: Address | None = request.client
+    return peer.host if peer and peer.host else "unknown-peer"
+
+
+def login_throttle_wait(request: Request) -> int | None:
+    """登录前检查：被阻断时返回建议等待秒数（>=1），否则 None。"""
+    key = _peer_key(request)
+    now = time.monotonic()
+    until = _login_blocked_until.get(key, 0.0)
+    if now < until:
+        return int(until - now) + 1
+    failures = _login_failures.get(key)
+    if failures is not None:
+        while failures and now - failures[0] >= LOGIN_FAILURE_WINDOW:
+            failures.popleft()
+    return None
+
+
+def record_login_failure(request: Request) -> None:
+    key = _peer_key(request)
+    now = time.monotonic()
+    failures = _login_failures[key]
+    failures.append(now)
+    while failures and now - failures[0] >= LOGIN_FAILURE_WINDOW:
+        failures.popleft()
+    if len(failures) >= LOGIN_FAILURE_LIMIT:
+        _login_blocked_until[key] = now + LOGIN_BLOCK_SECONDS
+        failures.clear()
+
+
+def record_login_success(request: Request) -> None:
+    _login_failures.pop(_peer_key(request), None)
+    _login_blocked_until.pop(_peer_key(request), None)
