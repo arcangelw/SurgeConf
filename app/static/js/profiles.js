@@ -311,7 +311,7 @@ async function renderGeneralTab(profileId) {
   }
   if (generalMetaGen(profileId) !== gen) return;
   renderGeneralForm(profileId, meta);
-  await loadGeneralValues(profileId);
+  await loadGeneralValues(profileId, gen);
 }
 
 function renderGeneralForm(profileId, meta) {
@@ -418,9 +418,16 @@ function toggleGroup(groupId) {
   }
 }
 
-async function loadGeneralValues(profileId) {
+async function loadGeneralValues(profileId, gen) {
   try {
     const data = await API.get(`/api/general/values?profile_id=${encodeURIComponent(profileId)}`);
+    // values 响应必须与 metadata 同一 profile generation 才填充：响应归来时
+    // 档案已更新/删除（generation 推进）或 Tab 已卸载（容器消失）都放弃——
+    // 旧目标（如 iOS）的 values 不得污染此后重新渲染的新（如 Mac）表单
+    if (gen !== undefined) {
+      if (generalMetaGen(profileId) !== gen) return;
+      if (!document.getElementById(`groups-container-${profileId}`)) return;
+    }
     fillGeneralForm(profileId, data.values);
   } catch (e) { toast(e.message, "error"); }
 }

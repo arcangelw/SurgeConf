@@ -618,12 +618,97 @@ async function t7() {
   console.log("T7f MITM 档案 PUT 同样失效 通过");
 }
 
+// ===== T8 General values 乱序：旧 values 晚到不污染新表单 =====
+
+async function t8() {
+  // --- T8a 旧 iOS values 晚于新 Mac 表单：generation 守卫 ---
+  let resolveIosValues;
+  let valuesSeq = 0;
+  const page = createPage({
+    valuesHandler(url) {
+      const m = /profile_id=(\d+)/.exec(url);
+      valuesSeq += 1;
+      if (Number(m[1]) === 1 && valuesSeq === 1) {
+        return new Promise((resolve) => {
+          resolveIosValues = () => resolve({
+            values: { "loglevel": "notify", "auto-suspend": true, "compatibility-mode": 3 },
+          });
+        });
+      }
+      return { values: { "loglevel": "warning" } };
+    },
+  });
+  regGeneralTab(page, 1);
+  const iosRender = page.sandbox.__hooks.renderGeneralTab(1);  // 旧 iOS values pending
+
+  // 档案更新（target iOS → Mac）推进 generation，再完整重渲染新表单
+  await updateProfileViaUI(page, 1);
+  page.targets.set(1, "mac_workstation");
+  await page.sandbox.__hooks.renderGeneralTab(1);
+
+  // 新 Mac 表单控件落位（真实浏览器由 innerHTML 解析；stub 手动注册）
+  page.formControls.length = 0;
+  const loglevel = control(page.formControls, "loglevel", "select", { value: "" });
+  const httpApi = control(page.formControls, "http-api", "text", { value: "" });
+  assert.equal(loglevel.value, "", "前提：新表单初始为空");
+  // 用 Mac values（立即到达）填充新表单：走真实 fillGeneralForm 路径
+  await page.sandbox.__hooks.fillGeneralForm(1, { "loglevel": "warning" });
+  assert.equal(loglevel.value, "warning", "前提：Mac values 已填充新表单");
+
+  resolveIosValues();   // 旧 iOS values 晚到（loglevel=notify + iOS 专属键）
+  await iosRender;
+  assert.equal(loglevel.value, "warning", "旧 iOS values 不得污染新 Mac 表单（loglevel）");
+  assert.equal(httpApi.value, "", "旧 iOS values 不含 Mac-only 键，保持为空");
+  assert.equal(loglevel.value !== "notify", true, "notify 是旧 iOS 值，不得回填");
+  console.log("T8a 旧 iOS values 晚于新 Mac 表单不污染 通过");
+
+  // --- T8b values 挂起期间档案删除：generation 不一致不填充 ---
+  let resolveDeletedValues;
+  const pageB = createPage({
+    valuesHandler() {
+      return new Promise((resolve) => {
+        resolveDeletedValues = () => resolve({ values: { "loglevel": "notify" } });
+      });
+    },
+  });
+  regGeneralTab(pageB, 1);
+  const renderB = pageB.sandbox.__hooks.renderGeneralTab(1);
+  await new Promise((r) => setImmediate(r));   // 等 metadata 阶段走完，values 已挂起
+  const lvlB = control(pageB.formControls, "loglevel", "select", { value: "" });
+  await pageB.sandbox.__hooks.deleteProfile(1, makeElement());   // 删除 → 失效
+  resolveDeletedValues();                                        // 旧 values 晚到
+  await renderB;
+  assert.equal(lvlB.value, "", "档案删除后旧 values 不得填充");
+  console.log("T8b values 挂起期间档案删除不填充 通过");
+
+  // --- T8c values 挂起期间 tab 已卸载（容器消失）不填充 ---
+  let resolveUnmountedValues;
+  const pageC = createPage({
+    valuesHandler() {
+      return new Promise((resolve) => {
+        resolveUnmountedValues = () => resolve({ values: { "loglevel": "notify" } });
+      });
+    },
+  });
+  regGeneralTab(pageC, 1);
+  const renderC = pageC.sandbox.__hooks.renderGeneralTab(1);
+  await new Promise((r) => setImmediate(r));
+  const lvlC = control(pageC.formControls, "loglevel", "select", { value: "" });
+  pageC.sandbox.document.getElementById = () => null;      // 模拟容器已卸载
+  resolveUnmountedValues();
+  await renderC;
+  assert.equal(lvlC.value, "", "tab 已卸载后旧 values 不得填充");
+  console.log("T8c values 挂起期间 tab 卸载不填充 通过");
+}
+
 (async () => {
   await t2();
   await t3();
   await t4();
   await t5();
   await t7();
+  await t8();
   console.log("JS 行为测试：forced 渲染禁用/徽标 + 完整 fixture 元数据 + 无持久缓存"
-    + " + 档案生命周期失效（update/delete/旧响应晚到/save 重拉）+ fail closed 全部通过");
+    + " + 档案生命周期失效（update/delete/旧响应晚到/save 重拉）+ values 乱序守卫"
+    + " + fail closed 全部通过");
 })().catch((e) => { console.error(e); process.exit(1); });

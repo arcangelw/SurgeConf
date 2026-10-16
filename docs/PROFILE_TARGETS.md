@@ -53,17 +53,19 @@ General 字段能力由唯一能力矩阵（`app/profile_targets.py`）派生，
 
 目标切换后，General Tab 按当前档案重新拉取 `/api/general/fields?profile_id=<id>`，字段集合与 forced 徽标随目标即时变化；保存前会再次拉取，防止用旧目标的 forced 集合提交（fail closed）。
 
+规则能力同样按目标过滤：`ios_mobile` 产物不输出任何 Mac 进程规则（`PROCESS-*` 前缀族）与 `MAC-ADDRESS` 规则——检测为结构化括号感知（覆盖 `AND`/`OR`/`NOT` 嵌套，payload 子串如域名不受影响），全局与档案作用域同口径；Mac 两目标不受影响。`FINAL` 为生成器专属终结规则：最终 `[Rule]` 恰一条 FINAL，策略只来自档案的兜底策略（`final_action`），pre/general 自定义规则保存与生成两端均拒绝 FINAL。
+
 ## UDP 安全模式与阶段边界
 
 | 模式 | 语义 | 允许的目标 |
 |---|---|---|
-| `strict` | 全局拒绝 UDP 转发 | 全部 |
+| `strict` | 严格模式：阶段 C 将在生成产物中阻断 STUN 域名、UDP 3478/19302 端口与 `PROTOCOL,STUN` 规则 | 全部 |
 | `scoped` | 按策略作用域放行 UDP（Mac 目标默认） | 仅 Mac 两目标 |
 | `compatible` | 兼容模式（iOS 默认） | 全部 |
 
 - 唯一被拒绝的组合是 `ios_mobile + scoped`：创建与更新都在事务提交前校验，失败 422 且不落库。
 - 只切换目标不提供模式时，模式重置为新目标默认（iOS → `compatible`，Mac → `scoped`）。
-- **阶段边界**：当前 `udp_security_mode` 作为档案属性保存并参与组合校验；生成产物中的 UDP 安全底线由全目标强制值兜底（`block-quic = per-policy`、`udp-policy-not-supported-behaviour = REJECT`，保存 API 拒绝危险覆盖）。strict/scoped/compatible 的逐策略差异化生成行为属于后续 UDP 阶段，本阶段不改变产物语义。
+- **阶段边界**：阶段 B 仅存储并校验 `udp_security_mode` 枚举与目标组合（`ios_mobile + scoped` 拒绝），**不依据该模式改变生成产物**；strict 的 STUN 域名 / UDP 3478/19302 / `PROTOCOL,STUN` 阻断与 scoped/compatible 的逐策略差异化生成属于阶段 C。当前产物的 UDP 安全底线由全目标强制值兜底（`block-quic = per-policy`、`udp-policy-not-supported-behaviour = REJECT`，保存 API 拒绝危险覆盖）。
 
 ## Profile 不能开启 Gateway VM
 

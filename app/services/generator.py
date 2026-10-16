@@ -17,9 +17,12 @@ from app.profile_targets import ProfileTarget, filter_general_for_target
 from app.services.config_validation import (
     GenerationContext,
     GroupMemberRef,
+    InvalidConfiguration,
     RuleActionRef,
     extract_rule_action,
+    is_final_rule,
     resolve_policy_reference,
+    rule_excluded_for_target,
     translate_policy_name,
     translate_rule_action,
     validate_generated_references,
@@ -276,6 +279,25 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
         .order_by(CustomRule.sort_order)
     )
     general_rules = general_rules_result.scalars().all()
+
+    # 目标能力过滤（iOS）：Mac 进程规则（PROCESS-*）与 MAC-ADDRESS 不进入
+    # iOS 产物——结构化/括号感知检测，覆盖顶层与 AND/OR/NOT 嵌套，全局与
+    # 当前档案作用域同口径；被过滤的规则不进入 rule_actions（不参与引用校验）
+    if profile_target is ProfileTarget.IOS_MOBILE:
+        pre_rules = [r for r in pre_rules
+                     if not rule_excluded_for_target(r.rule_text, profile.target)]
+        general_rules = [r for r in general_rules
+                         if not rule_excluded_for_target(r.rule_text, profile.target)]
+
+    # FINAL 为生成器专属：任何 pre/general 自定义 FINAL（含绕过保存端直接
+    # 写库的存量）fail closed——最终 [Rule] 的 FINAL 恰一条，且只来自
+    # ConfigProfile.final_action，不允许自定义规则借道覆盖
+    final_custom_errors = [
+        f"{'前置' if r.position == 'pre' else '通用'}自定义规则「{r.rule_text}」: "
+        f"FINAL 是生成器专属终结规则，不允许保存或生成；兜底策略请在档案设置中修改 final_action"
+        for r in (*pre_rules, *general_rules) if is_final_rule(r.rule_text)]
+    if final_custom_errors:
+        raise InvalidConfiguration(final_custom_errors)
 
     # 先构建 + 记录结构化引用，再统一校验：任何无效引用聚合抛出，
     # 绝不把部分 [Rule] 段拼进产物（sections 只在校验通过后扩展）

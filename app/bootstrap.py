@@ -23,6 +23,8 @@ from app.default_config import (
     DEFAULT_MITM, DEFAULT_PRE_RULES, DEFAULT_GENERAL_RULES,
     DEFAULT_HOST_MAPPINGS,
 )
+from app.profile_targets import default_target_for_role, default_udp_mode
+from app.security import DEFAULT_INSTALLATION_ROLE
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,12 +48,18 @@ async def seed_defaults(session_factory) -> None:
             for rs in DEFAULT_RULE_SOURCES:
                 db.add(RuleSource(**rs))
 
+            # 新建默认档案按 DEFAULT_INSTALLATION_ROLE + 中央 role→target 映射
+            # 显式写 target/mode（默认 home_gateway → mac_gateway/scoped），与
+            # 0003 迁移的旧档 server_default（mac_workstation/scoped）路径分离
+            seed_target = default_target_for_role(DEFAULT_INSTALLATION_ROLE)
             db.add(ConfigProfile(
                 name="默认配置",
                 description="基于原始 Surge.conf 的默认配置",
                 is_default=True,
                 locale="zh",
                 final_action="兜底",
+                target=seed_target.value,
+                udp_security_mode=default_udp_mode(seed_target).value,
                 general=dict(DEFAULT_GENERAL),
                 url_rewrites=list(DEFAULT_URL_REWRITES),
                 header_rewrites=list(DEFAULT_HEADER_REWRITES),

@@ -27,7 +27,8 @@ from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
 from app.security import (issue_profile_token, resolve_installation_role,
                           verify_profile_token)
 from app.services.backups import unique_path
-from app.services.config_validation import InvalidConfiguration, validate_rule_order
+from app.services.config_validation import (InvalidConfiguration, is_final_rule,
+                                            validate_rule_order)
 from app.services.generator import generate_surge_config
 from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
 
@@ -168,6 +169,10 @@ async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(g
     # 显式 null 不等于省略：区分「未提供」（用目标默认模式）与「显式非法值」
     if data.udp_security_mode is None and "udp_security_mode" in data.model_fields_set:
         raise HTTPException(422, "udp_security_mode 不允许显式 null：省略该字段以使用目标默认模式")
+    # final_action 显式 null 不等于省略：未提供用模型默认（手动选择）
+    if data.final_action is None and "final_action" in data.model_fields_set:
+        raise HTTPException(422, "final_action 不允许显式 null：省略该字段以使用默认兜底策略")
+    final_action = data.final_action or "手动选择"
     mode = data.udp_security_mode or default_udp_mode(data.target)
     try:
         validate_target_mode(data.target, mode)
@@ -180,6 +185,7 @@ async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(g
         target=data.target.value,
         udp_security_mode=mode.value,
         locale=data.locale or "zh",
+        final_action=final_action,
         general=data.general or {},
         dns=data.dns or {},
         url_rewrites=data.url_rewrites or [],
@@ -320,6 +326,15 @@ async def create_rule(data: RuleSourceCreate, db: AsyncSession = Depends(get_db)
         enabled=data.enabled,
     )
     db.add(rule)
+    # 新增后 flush（新行进入本事务可见集），在 commit 前构造完整 enabled
+    # 候选并校验顺序不变量；失败 rollback（数据库不变）并返回与
+    # reorder/update 端点同一 422 结构
+    try:
+        await db.flush()
+        await _validate_rule_order_or_422(db)
+    except HTTPException:
+        await db.rollback()
+        raise
     await db.commit()
     await db.refresh(rule)
     return {"id": rule.id, "name": rule.name}
@@ -606,6 +621,12 @@ async def list_custom_rules(
 
 @router.post("/custom-rules")
 async def create_custom_rule(data: CustomRuleCreate, db: AsyncSession = Depends(get_db)):
+    # FINAL 为生成器专属终结规则（按档案 final_action 追加且恰一条），
+    # pre/general 任何自定义 FINAL（内置 action 与 policy action 均同）
+    # 在保存端拒绝；生成校验端对绕过写入的存量同样 fail closed
+    if is_final_rule(data.rule_text):
+        raise HTTPException(
+            422, "FINAL 是生成器专属终结规则，不允许保存为自定义规则；兜底策略请在档案设置中修改 final_action")
     rule = CustomRule(**data.model_dump())
     db.add(rule)
     await db.commit()
@@ -631,6 +652,11 @@ async def update_custom_rule(rule_id: int, data: CustomRuleUpdate, db: AsyncSess
     if not rule:
         raise HTTPException(404, "规则不存在")
     update_data = data.model_dump(exclude_unset=True)
+    # 更新端同口径拦截：把 rule_text 改成 FINAL 拒绝（不改 rule_text 的
+    # 更新如排序/启停不受影响）
+    if update_data.get("rule_text") is not None and is_final_rule(update_data["rule_text"]):
+        raise HTTPException(
+            422, "FINAL 是生成器专属终结规则，不允许保存为自定义规则；兜底策略请在档案设置中修改 final_action")
     for key, value in update_data.items():
         setattr(rule, key, value)
     await db.commit()

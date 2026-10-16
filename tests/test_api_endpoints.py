@@ -634,3 +634,105 @@ async def test_guide_route_admin_boundary(client):
     assert login.status_code == 200
     assert (await client.get("/guide/profile-targets")).status_code == 200
     assert (await client.get("/guide/not-exist")).status_code == 404
+
+# ===== 修复3：自定义规则 FINAL 为生成器专属（保存端 fail closed） =====
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_text", ["FINAL,DIRECT", "FINAL,手动选择"])
+async def test_create_custom_rule_final_rejected(client, final_text):
+    """pre/general 保存端拒绝任何自定义 FINAL（内置 action 与 policy action），
+    数据库不落新行"""
+    before = await client.get("/api/configs/custom-rules")
+    n_before = len(before.json())
+    for position in ("pre", "general"):
+        resp = await client.post("/api/configs/custom-rules", json={
+            "rule_text": final_text, "position": position})
+        assert resp.status_code == 422, resp.text
+        assert "FINAL" in resp.json()["detail"]
+    after = await client.get("/api/configs/custom-rules")
+    assert len(after.json()) == n_before, "被拒绝的 FINAL 规则不得落库"
+
+
+@pytest.mark.asyncio
+async def test_update_custom_rule_to_final_rejected(client):
+    """更新端把 rule_text 改成 FINAL：422 且原文本保持不变；不改 rule_text 的
+    更新（如排序/启停）不受影响"""
+    created = await client.post("/api/configs/custom-rules", json={
+        "rule_text": "DOMAIN-SUFFIX,normal.example,DIRECT"})
+    rid = created.json()["id"]
+
+    bad = await client.put(f"/api/configs/custom-rules/{rid}",
+                           json={"rule_text": "FINAL,自动选择"})
+    assert bad.status_code == 422
+    assert "FINAL" in bad.json()["detail"]
+
+    row = [r for r in (await client.get("/api/configs/custom-rules")).json()
+           if r["id"] == rid][0]
+    assert row["rule_text"] == "DOMAIN-SUFFIX,normal.example,DIRECT"
+
+    ok = await client.put(f"/api/configs/custom-rules/{rid}",
+                          json={"sort_order": 5, "enabled": False})
+    assert ok.status_code == 200
+
+
+# ===== 修复4：POST /profiles 持久化请求 final_action =====
+
+@pytest.mark.asyncio
+async def test_create_profile_persists_requested_final_action(client):
+    """请求 final_action 必须落库并直通生成 FINAL；省略用模型默认"""
+    pid = await _create(client, "自定义兜底档", final_action="自动选择")
+    assert (await _detail(client, pid))["final_action"] == "自动选择"
+    content = (await client.get(f"/api/configs/generate?profile_id={pid}")).text
+    assert "FINAL,自动选择,dns-failed" in content
+
+    pid2 = await _create(client, "默认兜底档")
+    assert (await _detail(client, pid2))["final_action"] == "手动选择"
+    content2 = (await client.get(f"/api/configs/generate?profile_id={pid2}")).text
+    assert "FINAL,手动选择,dns-failed" in content2
+
+
+@pytest.mark.asyncio
+async def test_create_profile_explicit_null_final_action_rejected(client):
+    """final_action 显式 null：422（省略才使用模型默认）"""
+    resp = await client.post("/api/configs/profiles",
+                             json={"name": "空兜底", "final_action": None})
+    assert resp.status_code == 422
+
+
+# ===== 修复6：POST /rules 创建后提交前校验顺序不变量 =====
+
+@pytest.mark.asyncio
+async def test_create_rule_breaking_order_rolls_back(client):
+    """创建内置稳定身份副本（同 name/url/rule_type）且排在 Apple 之后：
+    422 + 数据库行数不变（flush 后 rollback）"""
+    from sqlalchemy import select as sa_select
+    from app.models import RuleSource as RuleSourceModel
+    builtin_ai = next(rs for rs in DEFAULT_RULE_SOURCES if rs["category"] == "ai")
+    before = len((await client.get("/api/configs/rules")).json())
+
+    resp = await client.post("/api/configs/rules", json={
+        "name": builtin_ai["name"], "url": builtin_ai["url"],
+        "action": "DIRECT", "rule_type": builtin_ai["rule_type"],
+        "category": builtin_ai["category"], "sort_order": 9999, "enabled": True})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["code"] == "invalid_configuration"
+
+    after = len((await client.get("/api/configs/rules")).json())
+    assert after == before, "顺序违例的创建不得提交（数据库不变）"
+
+    async with client._test_factory() as db:
+        copies = (await db.execute(
+            sa_select(RuleSourceModel).where(
+                RuleSourceModel.sort_order == 9999))).scalars().all()
+        assert copies == []
+
+
+@pytest.mark.asyncio
+async def test_create_rule_custom_source_still_works(client):
+    """合法自定义规则源（非内置身份）创建照常成功"""
+    before = len((await client.get("/api/configs/rules")).json())
+    resp = await client.post("/api/configs/rules", json={
+        "name": "我的私有规则", "url": "https://example.com/my.list",
+        "action": "DIRECT", "rule_type": "RULE-SET", "sort_order": 200})
+    assert resp.status_code == 200, resp.text
+    assert len((await client.get("/api/configs/rules")).json()) == before + 1

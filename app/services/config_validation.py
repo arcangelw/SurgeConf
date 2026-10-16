@@ -330,3 +330,81 @@ def validate_rule_order(ordered) -> None:
     errors = rule_order_violations(ordered)
     if errors:
         raise InvalidConfiguration(errors)
+
+
+# ===== 规则目标能力（结构化/括号感知检测） =====
+
+# Mac 专属规则类型：PROCESS-* 前缀族（进程名/路径等）与 MAC-ADDRESS。
+# iOS Surge 不支持按 Mac 进程或网卡地址匹配；检测只看类型段，
+# payload 子串（如域名 process-name.example.com）不受影响。
+MAC_ONLY_RULE_TYPE_PREFIXES = ("PROCESS-",)
+MAC_ONLY_RULE_TYPES = frozenset({"MAC-ADDRESS"})
+LOGICAL_RULE_TYPES = frozenset({"AND", "OR", "NOT"})
+
+
+def _is_mac_only_rule_type(rule_type: str) -> bool:
+    return (rule_type in MAC_ONLY_RULE_TYPES
+            or any(rule_type.startswith(p) for p in MAC_ONLY_RULE_TYPE_PREFIXES))
+
+
+def _is_wrapped(text: str) -> bool:
+    """首尾括号是否配对在同一层（包裹整段），避免误剥 ``(a),(b)`` 形态"""
+    if not (text.startswith("(") and text.endswith(")")):
+        return False
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and i != len(text) - 1:
+                return False
+    return depth == 0
+
+
+def _contains_mac_only_rule(fragment: str) -> bool:
+    """在规则片段（顶层规则或逻辑 payload）中递归检测 Mac 专属构造。
+
+    结构化解析：剥掉包裹整段的平衡括号后按深度 0 逗号切分，检查类型段；
+    逻辑规则（AND/OR/NOT）的 payload 段继续递归（支持多层嵌套）。
+    """
+    text = fragment.strip()
+    if not text:
+        return False
+    if _is_wrapped(text):
+        inner = text[1:-1].strip()
+        # 剥层后是多段（逻辑 payload 的子规则列表）：每段递归
+        return any(_contains_mac_only_rule(s) for s in _split_top_level(inner) if s.strip())
+    segments = [s.strip() for s in _split_top_level(text)]
+    if not segments:
+        return False
+    head = segments[0]
+    if _is_mac_only_rule_type(head):
+        return True
+    if head in LOGICAL_RULE_TYPES and len(segments) >= 2:
+        return _contains_mac_only_rule(segments[1])
+    return False
+
+
+def rule_uses_mac_only_constructs(rule_text: str) -> bool:
+    """规则是否使用 Mac 专属构造（PROCESS-* / MAC-ADDRESS，含逻辑嵌套）"""
+    return _contains_mac_only_rule(rule_text)
+
+
+def rule_excluded_for_target(rule_text: str, target: str) -> bool:
+    """规则是否因目标能力被排除出产物（当前仅 ios_mobile 排除 Mac 专属构造）"""
+    if target == "ios_mobile":
+        return rule_uses_mac_only_constructs(rule_text)
+    return False
+
+
+# ===== FINAL 生成器专属判定 =====
+
+def is_final_rule(rule_text: str) -> bool:
+    """规则文本是否为 FINAL 规则（顶层类型段恰为 FINAL，结构化判定）。
+
+    FINAL 是生成器按 ConfigProfile.final_action 追加的终结规则，任何
+    pre/general 自定义 FINAL 都在保存端与生成校验端被拒绝。
+    """
+    segments = [s.strip() for s in _split_top_level(rule_text.strip())]
+    return bool(segments) and segments[0] == "FINAL"

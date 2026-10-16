@@ -49,6 +49,40 @@ def test_default_udp_mode_by_target():
     assert default_udp_mode(ProfileTarget.IOS_MOBILE) is UdpSecurityMode.COMPATIBLE
 
 
+# ===== fresh seed：新建默认档案显式写 target/mode（与旧档迁移分离） =====
+
+@pytest.mark.asyncio
+async def test_fresh_seed_default_profile_carries_role_target():
+    """全新空库 seed_defaults：默认档案按 DEFAULT_INSTALLATION_ROLE + 中央映射
+    显式写 target/mode（home_gateway → mac_gateway/scoped），与列默认无关"""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from app.bootstrap import seed_defaults
+    from app.security import DEFAULT_INSTALLATION_ROLE
+    from app.profile_targets import default_target_for_role
+    from app.database import Base
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession,
+                                             expire_on_commit=False)
+        await seed_defaults(session_factory)
+        async with session_factory() as db:
+            rows = (await db.execute(
+                select(ConfigProfile.target, ConfigProfile.udp_security_mode)
+            )).fetchall()
+    finally:
+        await engine.dispose()
+
+    expected_target = default_target_for_role(DEFAULT_INSTALLATION_ROLE)
+    assert rows == [(expected_target.value, default_udp_mode(expected_target).value)]
+    # 防漂移锁：默认角色 home_gateway → mac_gateway/scoped（0003 旧档迁移
+    # 仍为 mac_workstation/scoped，两者路径分离，见上方迁移用例）
+    assert (DEFAULT_INSTALLATION_ROLE, rows[0]) == ("home_gateway", ("mac_gateway", "scoped"))
+
+
 # ===== 迁移：合成旧 schema 副本 =====
 
 def sqlite_rows(path: Path, sql: str):
