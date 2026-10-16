@@ -55,6 +55,13 @@ def other_payload(name="Other"):
             "port": 443, "config": config}
 
 
+def fresh_payload(name="Fresh"):
+    """第三个全新连接身份（既不匹配 Keep 也不匹配 Drop，触发 INSERT）"""
+    config = f"{name} = trojan, 8.8.8.8, 443, password=z"
+    return {"name": name, "node_type": "trojan", "server": "8.8.8.8",
+            "port": 443, "config": config}
+
+
 def timeout_exc(message=f"synthetic timeout {URL}"):
     return httpx.TimeoutException(message)
 
@@ -337,9 +344,10 @@ async def make_subscription(session, **kw):
 
 @pytest.mark.asyncio
 async def test_sync_write_failure_rolls_back_atomically(file_db, monkeypatch):
-    """写事务 DML（matched 更新 + insert + stale 删除）真实 flush 后 commit
-    故障：rollback 原子撤销；全新会话验证节点/人工字段/成功状态原样；
-    失败状态由独立短事务提交；同会话可继续下一次同步。"""
+    """写事务 DML 三类齐备（matched 更新 + INSERT + DELETE）真实 flush 后
+    commit 故障：rollback 原子撤销；全新会话验证 Fresh 不存在、Drop 仍
+    存在且原字段、Keep provider/人工状态回滚；失败状态由独立短事务提交；
+    同会话可继续下一次同步。"""
     from unittest.mock import AsyncMock
     s1, factory = file_db
     sub = await make_subscription(s1)
@@ -351,19 +359,38 @@ async def test_sync_write_failure_rolls_back_atomically(file_db, monkeypatch):
                                 config="Drop = trojan, 9.9.9.9, 443, password=y")
     async with factory() as s2:
         before_nodes = await node_snapshot(s2, sub_id)
+    assert [n[1] for n in before_nodes] == ["Keep", "Drop"]
+
+    # 守卫（防测试退化）：incoming 恰好构成 matched 更新（Renamed ≡ Keep）
+    # + 全新 INSERT（Fresh，不匹配任何既有 key）；既有 Drop 不在 incoming
+    # （触发 DELETE）；三个连接身份两两不同。
+    keep_payload = node_payload("Renamed")
+    fresh = fresh_payload("Fresh")
+    drop_like = {"name": "Drop", "config": "Drop = trojan, 9.9.9.9, 443, password=y"}
+    keep_key, fresh_key, drop_key = (stable_node_key(p)
+                                     for p in (keep_payload, fresh, drop_like))
+    assert len({keep_key, fresh_key, drop_key}) == 3
+    assert keep_key == before_nodes[0][10]  # Renamed 与既有 Keep 同身份
+    assert drop_key == before_nodes[1][10]   # Drop 与既有 Drop 同身份
+    assert fresh_key not in {before_nodes[0][10], before_nodes[1][10]}
 
     monkeypatch.setattr(subscription_service, "fetch_subscription",
-                        AsyncMock(return_value=[node_payload("Renamed"),
-                                                other_payload("Fresh")]))
+                        AsyncMock(return_value=[keep_payload, fresh]))
 
     calls = {"n": 0}
+    flushed = {}
     real_commit = s1.commit
 
     async def flaky_commit():
         calls["n"] += 1
         if calls["n"] == 2:
-            # 写事务 commit：先把全部 DML 真实送入事务再故障（非 mock echo）
+            # 写事务 commit：先把三类 DML 真实送入事务再故障（非 mock echo）；
+            # 同事务内查询确认 UPDATE/INSERT/DELETE 均已生效（防退化守卫）
             await s1.flush()
+            rows = (await s1.execute(
+                select(ProxyNode).where(ProxyNode.subscription_id == sub_id)
+                .order_by(ProxyNode.id))).scalars().all()
+            flushed["names"] = [n.name for n in rows]
             raise RuntimeError("disk i/o boom")
         await real_commit()
 
@@ -373,7 +400,10 @@ async def test_sync_write_failure_rolls_back_atomically(file_db, monkeypatch):
     assert result.error_code == "internal_error"
     assert "boom" not in result.public_message
     assert calls["n"] >= 3  # 失败状态短事务已真实提交
-    # 全新会话验证：事务内 DML 全部回滚，人工字段/成功状态原样
+    # 守卫：flush 时事务内已见三种 DML（Keep→Renamed 更新、Fresh 插入、Drop 删除）
+    assert flushed["names"] == ["Renamed", "Fresh"]
+    # 全新会话验证：事务内 DML 全部回滚——Fresh 不存在、Drop 仍存在且
+    # 原字段、Keep provider/人工状态原样
     async with factory() as s2:
         assert await node_snapshot(s2, sub_id) == before_nodes
         attempt, success, nxt, err, count = await sub_state(s2, sub_id)
@@ -382,9 +412,11 @@ async def test_sync_write_failure_rolls_back_atomically(file_db, monkeypatch):
         assert count is None
         assert err == "internal_error"
         assert nxt == UTC_NOW_NAIVE + timedelta(seconds=900)
-    # 同会话可继续：下一次同步成功（commit 替身已恢复正常）
+    # 同会话可继续：下一次同步成功（commit 替身已恢复正常），
+    # 且三类 DML 真实落库：1 更新 + 1 插入 + 1 删除
     ok = await sync_subscription(s1, sub_id, now=UTC_NOW + timedelta(hours=1))
     assert ok.success is True
+    assert (ok.inserted, ok.updated, ok.removed) == (1, 1, 1)
     async with factory() as s2:
         after = await node_snapshot(s2, sub_id)
     assert [n[1] for n in after] == ["Renamed", "Fresh"]
