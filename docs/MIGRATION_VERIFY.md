@@ -115,7 +115,7 @@ RULE-SET,<URL 含 /ip/ 的规则集>,<任意策略>,no-resolve  ← 至少一行
 | `scoped` | 例外 DIRECT 行在前（示例：`AND,((MAC-ADDRESS,02:00:00:00:00:01),(PROTOCOL,UDP)),DIRECT`，规范占位值），四条 REJECT 按上表顺序殿后；无启用例外时与 strict 相同 |
 | `compatible` | 无 `# >> 托管 UDP 安全规则` 段、无任何托管 STUN 行；`ios_mobile` 产物恒无 `PROCESS-*` / `MAC-ADDRESS` 规则 |
 
-产物断言口径：**项目托管的全局 `UDP/443 → REJECT` 不再生成**；若产物中仍出现该行，只可能是升级后你（重新）自建的——属正常、不算迁移失败，如不需要可在管理界面删除。升级前与托管行**逐字相同**的全局自建规则已被 `remove_global_quic_v1` 一次性删除（边界见迁移内容第 7 条），文本变体不受影响。说明：RULE-SET 行的策略随设备配置而异，判定依据是「URL 含 /ip/ 且以 ,no-resolve 结尾」而非具体策略名。
+产物断言口径：**项目不再动态注入全局 `UDP/443 → REJECT`**；若产物中仍出现该行，可能来自迁移范围外保留的已有用户规则（如全局 general 位置、档案级 pre/general 规则），也可能是迁移记账后新增/重建的用户规则——出现本身**不能**判迁移失败，如不需要可在管理界面删除（`remove_global_quic_v1` 的删除边界见迁移内容第 7 条）。说明：RULE-SET 行的策略随设备配置而异，判定依据是「URL 含 /ip/ 且以 ,no-resolve 结尾」而非具体策略名。
 
 ### 6. 运行时实测（Surge 已重载新配置后）
 
@@ -183,7 +183,7 @@ echo "日志 $L_BEFORE -> $L_AFTER；记录 $R_BEFORE -> $R_AFTER"
    '/Applications/Surge.app/Contents/Applications/surge-cli' --raw dump rule
    ```
 
-   预期：例外进程 DIRECT 规则位于四条 STUN REJECT 之前；无项目托管的全局 UDP/443 拒绝行（若仍见该行为你升级后自建——不需要可自行删除；升级前与托管行逐字相同的自建全局规则已被迁移一次性删除，属预期）。
+   预期：例外进程 DIRECT 规则位于四条 STUN REJECT 之前；无项目托管的全局 UDP/443 拒绝行（若仍见该行，可能来自迁移范围外保留的已有用户规则，或迁移记账后新增/重建的用户规则——不能据出现判迁移失败；不需要可自行删除）。
 3. 启动配置为例外的实时视频/通话应用，确认画面与声音正常（UDP 放行生效）。
 4. 浏览器 WebRTC 检测页：不出现公开直连 STUN 候选（例外进程之外的防护仍生效）。
 
