@@ -17,8 +17,10 @@ from secrets import token_hex
 
 from app.runtime_paths import (RuntimePaths, assert_regular_file,
                                assert_sqlite_database_safe,
+                               harden_private_file,
                                refresh_runtime_permissions, reserve_private_file,
-                               resolve_runtime_paths)
+                               resolve_runtime_paths,
+                               validate_reserved_empty_file)
 
 # 自动/手动备份统一保留最近 10 份（迁移前备份同样纳入该策略，消除无限累积）
 BACKUP_KEEP = 10
@@ -51,13 +53,21 @@ class BackupInfo:
 # ===== 备份原语（database_migration 复用） =====
 
 
-def sqlite_backup(source: Path, target: Path) -> None:
+def sqlite_backup(source: Path, target: Path, *, reserved: bool = False) -> None:
     """SQLite Backup API 复制（源以只读 URI 打开，正确处理 WAL 页级一致性）。
 
-    打开源之前先做全链校验（普通文件 + 父链 + sidecar）：fail closed。
+    源在打开前做全链校验（普通文件 + 父链 + sidecar）fail closed；目标
+    两种交付形态：
+    - ``reserved=False``（默认）：``O_CREAT|O_EXCL|O_NOFOLLOW`` 严格
+      预占新文件（已存在即失败）；
+    - ``reserved=True``：目标为调用方本次预占的 0 字节 0600 普通文件，
+      经 ``validate_reserved_empty_file`` 复核后才交给 SQLite。
     """
     assert_sqlite_database_safe(source)
-    reserve_private_file(target)   # O_CREAT|O_EXCL|O_NOFOLLOW 0600 预占位
+    if reserved:
+        validate_reserved_empty_file(target)
+    else:
+        reserve_private_file(target)   # O_CREAT|O_EXCL|O_NOFOLLOW 0600 预占位
     source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     target_conn = sqlite3.connect(target)
     try:
@@ -122,7 +132,7 @@ def backup_database(source: Path, paths: RuntimePaths, schema_tag: str,
     try:
         sqlite_backup(source, tmp)
         _finalize_backup_file(tmp)
-        os.chmod(tmp, 0o600)
+        harden_private_file(tmp)
         os.replace(tmp, target)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -205,7 +215,7 @@ def _rebind_and_restore_live(paths: RuntimePaths, safety: Path | None) -> None:
 
     if not paths.database.exists() and safety is not None and safety.exists():
         sqlite_backup(safety, paths.database)
-        os.chmod(paths.database, 0o600)
+        harden_private_file(paths.database)
     if paths.database.exists():
         database.bind(paths.database)
 

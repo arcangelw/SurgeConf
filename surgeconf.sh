@@ -38,11 +38,12 @@ case "${1:-help}" in
       echo "控制文件校验失败，拒绝启动" >&2
       exit 1
     }
-    HOST="$(sc_env_value SURGE_HOST)"
-    PORT="$(sc_env_value SURGE_PORT)"
+    HOST="${SURGE_HOST-}"
+    PORT="${SURGE_PORT-}"
     : "${HOST:=127.0.0.1}"
     : "${PORT:=61830}"
-    DATA_DIR="$(sc_env_value SURGECONF_DATA_DIR)"
+    # 空值（含显式空）已由 sc_resolve_runtime_config unset，回默认控制目录
+    DATA_DIR="${SURGECONF_DATA_DIR-}"
     : "${DATA_DIR:=$(sc_control_dir)}"
     echo "SurgeConf 独立启动中 (前台模式)..."
     echo "访问地址: http://${HOST}:${PORT}/"
@@ -67,9 +68,15 @@ case "${1:-help}" in
     echo "SurgeConf 已取消开机自启"
     ;;
   status)
-    # 精确 label 判定（exit status），不解析 PID、不做子串 grep
-    if launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1; then
-      echo "SurgeConf 运行中"
+    # 精确 label 查询（exit status + PID 列）：不解析 label、不做子串 grep。
+    # launchctl list <label> 成功仅表示已加载；第一列数字 PID 才是运行中，
+    # "-"/空 表示已加载但当前无进程（崩溃/退避状态）。
+    if listing="$(launchctl list "$SC_LAUNCHD_LABEL" 2>/dev/null)"; then
+      pid="${listing%%$'\t'*}"
+      case "$pid" in
+        ''|*[!0-9]*) echo "SurgeConf 已加载但未运行" ;;
+        *) echo "SurgeConf 运行中" ;;
+      esac
     elif [ -f "$PLIST" ]; then
       echo "SurgeConf 已注册但未运行"
     else

@@ -227,6 +227,53 @@ async def test_reset_failure_restores_previous_live_database(runtime_db, runtime
 # ===== 管理端点：confirm 门禁、白名单下载、响应不含绝对路径 =====
 
 
+# ===== Round 4：严格 EXCL 预占、reserved 交付复核、fd 流式下载 =====
+
+
+def _minimal_source(tmp_path):
+    src = tmp_path / "src.db"
+    conn = sqlite3.connect(src)
+    conn.execute("CREATE TABLE t(x)")
+    conn.commit()
+    conn.close()
+    return src
+
+
+def test_sqlite_backup_reserved_requires_precreated_empty_target(tmp_path):
+    """reserved=True：目标必须是本次预占的 0 字节 0600 文件；未预占即拒绝"""
+    from app.runtime_paths import reserve_private_file
+    src = _minimal_source(tmp_path)
+    staged = tmp_path / "staging.db"
+    with pytest.raises(RuntimeError):
+        backups.sqlite_backup(src, staged, reserved=True)   # 未预占 → 拒绝
+    reserve_private_file(staged)
+    backups.sqlite_backup(src, staged, reserved=True)
+    assert sqlite_scalar(staged, "PRAGMA integrity_check") == "ok"
+
+
+def test_sqlite_backup_create_mode_rejects_existing_target(tmp_path):
+    """默认 create 模式：目标已存在（任意形态）即拒绝（严格 EXCL）"""
+    src = _minimal_source(tmp_path)
+    occupied = tmp_path / "occupied.db"
+    occupied.write_bytes(b"x")
+    with pytest.raises(RuntimeError):
+        backups.sqlite_backup(src, occupied)
+
+
+@pytest.mark.asyncio
+async def test_backup_download_streams_from_verified_fd(client, runtime_paths):
+    """下载经白名单 + O_NOFOLLOW fd 流式交付：Content-Length 来自 fstat、
+    文件名来自白名单名，响应字节与磁盘一致（无 FileResponse 路径重开）"""
+    info = await backups.create_backup("manual")
+    resp = await client.get(f"/api/settings/backups/{info.name}")
+    assert resp.status_code == 200
+    assert resp.headers["content-length"] == str(info.size)
+    assert f'filename="{info.name}"' in resp.headers["content-disposition"]
+    on_disk = (runtime_paths.backups / info.name).read_bytes()
+    assert resp.content == on_disk
+    assert resp.content.startswith(b"SQLite format 3")
+
+
 @pytest.mark.asyncio
 async def test_backup_endpoints_lifecycle(client, runtime_paths):
     resp = await client.post("/api/settings/backups")

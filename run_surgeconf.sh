@@ -21,9 +21,14 @@ umask 077
 # 重复/未知/控制字符拒绝）。
 sc_read_launchd_env "$(sc_control_env_path)"
 
-# 运行目录：控制文件持久化值或默认
-DATA_DIR="$(sc_env_value SURGECONF_DATA_DIR)"
-: "${DATA_DIR:=$(sc_control_dir)}"
+# 运行目录：控制文件持久化值或默认；空值视为 unset——绝不把空
+# SURGECONF_DATA_DIR 传给子进程（Python 端 Path("") 会解析为当前目录）
+if [ -z "${SURGECONF_DATA_DIR-}" ]; then
+  unset SURGECONF_DATA_DIR || true
+  DATA_DIR="$(sc_control_dir)"
+else
+  DATA_DIR="$SURGECONF_DATA_DIR"
+fi
 LOG_DIR="$HOME/Library/Logs/SurgeConf"
 sc_ensure_directory "$DATA_DIR"
 sc_ensure_directory "$LOG_DIR"

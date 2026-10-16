@@ -39,6 +39,13 @@ sc_control_env_path() {
 sc_ensure_directory() {
   local d="$1"
   local anchor="${2:-$HOME}"
+  # 词法拒绝 .. 组件：含 .. 的路径可在词法上匹配锚点前缀、解析后逃逸
+  case "/$d/" in
+    *"/../"*)
+      echo "拒绝包含 .. 的路径: $d" >&2
+      return 1
+      ;;
+  esac
   case "$d" in
     "$anchor"|"$anchor"/*) ;;
     *) anchor="/" ;;
@@ -145,9 +152,17 @@ sc_write_launchd_env() {
   local key val
   for key in SURGE_HOST SURGE_PORT SURGECONF_DATA_DIR \
              SURGE_CONTROLLER_ACCESS SURGE_HTTP_API; do
-    val="$(sc_env_value "$key")" || return $?
+    # 显式 case 直接取全局变量：不经命令替换（命令替换吞尾随换行，
+    # 尾随 LF 会在校验前被静默规范化而漏过拒绝）
+    case "$key" in
+      SURGE_HOST)              val="${SURGE_HOST-}" ;;
+      SURGE_PORT)              val="${SURGE_PORT-}" ;;
+      SURGECONF_DATA_DIR)      val="${SURGECONF_DATA_DIR-}" ;;
+      SURGE_CONTROLLER_ACCESS) val="${SURGE_CONTROLLER_ACCESS-}" ;;
+      SURGE_HTTP_API)          val="${SURGE_HTTP_API-}" ;;
+    esac
     if [ -n "$val" ]; then
-      sc_assert_no_control "$val" || return $?   # 写入前拒绝 LF/CR/全部控制字符
+      sc_assert_no_control "$val" || return $?   # 原始值（含尾随 LF）在校验中失败
       out="${out}${key}=${val}"$'\n'
     fi
   done
@@ -167,21 +182,37 @@ sc_write_launchd_env() {
 # 单行 KEY=value 格式 + 按键唯一性检查杜绝多行伪造。读前收敛 0600。
 sc_read_launchd_env() {
   local file="$1"
-  [ -e "$file" ] || return 0
+  # symlink 检查先于存在性：dangling symlink 不得被当作"文件不存在"
   if [ -L "$file" ]; then
     echo "拒绝 symlink 的控制文件: $file" >&2
     return 1
   fi
+  [ -e "$file" ] || return 0
   if [ ! -f "$file" ]; then
     echo "控制文件不是普通文件: $file" >&2
     return 1
   fi
-  chmod 600 "$file"
+  # 收敛 0600 前后比对 device/inode：chmod 作用对象在窗口内被替换则 fail closed
+  local identity_before identity_after
+  identity_before="$(stat -f '%d %i' "$file")" || return $?
+  chmod 600 "$file" || return $?
+  identity_after="$(stat -f '%d %i' "$file")" || return $?
+  if [ "$identity_before" != "$identity_after" ]; then
+    echo "控制文件在权限收敛期间被替换: $file" >&2
+    return 1
+  fi
 
   local line key val
   local seen_host=0 seen_port=0 seen_data=0 seen_ctrl=0 seen_api=0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      *=*) ;;
+      *)
+        echo "控制文件行缺少 = 分隔: ${line%%$'\t'*}" >&2
+        return 1
+        ;;
+    esac
     key="${line%%=*}"
     val="${line#*=}"
     case "$key" in
@@ -222,6 +253,23 @@ sc_resolve_runtime_config() {
   if [ "${SURGE_CONTROLLER_ACCESS+x}" = x ]; then set_ctrl=1; in_ctrl="${SURGE_CONTROLLER_ACCESS-}"; fi
   if [ "${SURGE_HTTP_API+x}" = x ]; then set_api=1; in_api="${SURGE_HTTP_API-}"; fi
 
+  # 显式非空值在写/导出前拒绝控制字符：原始值直传校验，不经命令替换
+  if [ "$set_host" = 1 ] && [ -n "$in_host" ]; then
+    sc_assert_no_control "$in_host" || return $?
+  fi
+  if [ "$set_port" = 1 ] && [ -n "$in_port" ]; then
+    sc_assert_no_control "$in_port" || return $?
+  fi
+  if [ "$set_data" = 1 ] && [ -n "$in_data" ]; then
+    sc_assert_no_control "$in_data" || return $?
+  fi
+  if [ "$set_ctrl" = 1 ] && [ -n "$in_ctrl" ]; then
+    sc_assert_no_control "$in_ctrl" || return $?
+  fi
+  if [ "$set_api" = 1 ] && [ -n "$in_api" ]; then
+    sc_assert_no_control "$in_api" || return $?
+  fi
+
   sc_read_launchd_env "$(sc_control_env_path)" || return $?
 
   if [ "$set_host" = 1 ]; then sc_set_env SURGE_HOST "$in_host"; fi
@@ -229,6 +277,12 @@ sc_resolve_runtime_config() {
   if [ "$set_data" = 1 ]; then sc_set_env SURGECONF_DATA_DIR "$in_data"; fi
   if [ "$set_ctrl" = 1 ]; then sc_set_env SURGE_CONTROLLER_ACCESS "$in_ctrl"; fi
   if [ "$set_api" = 1 ]; then sc_set_env SURGE_HTTP_API "$in_api"; fi
+
+  # 显式空 SURGECONF_DATA_DIR 视为 unset：回默认目录且绝不把空值传给
+  # 子进程（Python 端 Path("") 会解析为当前目录，运行数据落回源码树）
+  if [ "${SURGECONF_DATA_DIR+x}" = x ] && [ -z "${SURGECONF_DATA_DIR-}" ]; then
+    unset SURGECONF_DATA_DIR || true
+  fi
 }
 
 # 旧架构迁移：固定控制文件缺失时，从现有 plist 安全解析
@@ -239,6 +293,11 @@ sc_migrate_legacy_control() {
   local plist="$1"
   local control_env
   control_env="$(sc_control_env_path)"
+  # symlink 先于存在性：dangling symlink 不得被当作"控制文件缺失"而触发迁移覆盖
+  if [ -L "$control_env" ]; then
+    echo "拒绝 symlink 的控制文件: $control_env" >&2
+    return 1
+  fi
   [ -e "$control_env" ] && return 0
   [ -f "$plist" ] || return 0
   if [ -L "$plist" ]; then

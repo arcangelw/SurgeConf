@@ -6,7 +6,7 @@ from sqlalchemy import text
 from app.runtime_paths import (resolve_runtime_paths, ensure_runtime_directories,
                                assert_regular_file, assert_sqlite_database_safe,
                                harden_runtime_permissions, refresh_runtime_permissions,
-                               reserve_private_file)
+                               reserve_private_file, validate_reserved_empty_file)
 from app.database import DatabaseRuntime
 
 
@@ -137,20 +137,92 @@ def test_assert_regular_file_semantics(tmp_path):
 # ===== Round 3：no-follow 收口 =====
 
 
-def test_reserve_private_file_semantics(tmp_path):
-    """O_CREAT|O_EXCL|O_NOFOLLOW：新建 0600 普通文件、幂等复用、symlink 拒绝"""
+def test_reserve_private_file_is_strictly_exclusive(tmp_path):
+    """O_CREAT|O_EXCL|O_NOFOLLOW：新建 0600 普通文件；已存在（任意形态）一律拒绝"""
     import os
     target = tmp_path / "staging.db"
     reserve_private_file(target)
     assert target.is_file()
     assert target.stat().st_mode & 0o777 == 0o600
-    reserve_private_file(target)          # 已存在普通文件 → 幂等复用
-    assert target.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(RuntimeError, match="already exists"):
+        reserve_private_file(target)      # 已存在普通文件 → 拒绝（绝不复用）
 
     os.remove(target)
     os.symlink(tmp_path / "elsewhere", target)
     with pytest.raises(RuntimeError):
         reserve_private_file(target)
+
+
+def test_validate_reserved_empty_file_semantics(tmp_path):
+    """预占交付复核：0 字节 0600 普通文件通过；非空/0644/symlink/FIFO/缺失拒绝"""
+    import os
+    ok = tmp_path / "reserved.db"
+    fd = os.open(ok, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+    validate_reserved_empty_file(ok)
+
+    os.chmod(ok, 0o644)
+    with pytest.raises(RuntimeError, match="0600"):
+        validate_reserved_empty_file(ok)
+    os.chmod(ok, 0o600)
+    ok.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="not empty"):
+        validate_reserved_empty_file(ok)
+
+    link = tmp_path / "link.db"
+    os.symlink(ok, link)
+    with pytest.raises(RuntimeError):
+        validate_reserved_empty_file(link)
+
+    fifo = tmp_path / "fifo.db"
+    os.mkfifo(fifo)
+    with pytest.raises(RuntimeError):
+        validate_reserved_empty_file(fifo)
+
+    with pytest.raises(RuntimeError):
+        validate_reserved_empty_file(tmp_path / "missing.db")
+
+
+def test_ensure_nested_dirs_preserve_shared_ancestor_mode(tmp_path, monkeypatch):
+    """嵌套新 data dir：已存在的共享祖先权限不变；新建中间层 0700；
+    最终 managed root 收敛 0700"""
+    import os
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    os.chmod(shared, 0o755)
+    nested = shared / "deep" / "surgeconf"
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(nested))
+    paths = resolve_runtime_paths(home=tmp_path / "home")
+    ensure_runtime_directories(paths)
+    assert shared.stat().st_mode & 0o777 == 0o755            # 共享祖先不被 chmod
+    assert (shared / "deep").stat().st_mode & 0o777 == 0o700  # 新建中间层 0700
+    assert nested.stat().st_mode & 0o777 == 0o700             # managed root 收敛
+    assert (nested / "backups").is_dir()
+    assert (nested / "exports").is_dir()
+
+
+def test_ensure_nested_dirs_reject_symlink_component(tmp_path, monkeypatch):
+    """嵌套路径中间组件为 symlink：dirfd walk 拒绝（不 follow）"""
+    import os
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    os.symlink(real, link)
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(link / "surgeconf"))
+    paths = resolve_runtime_paths(home=tmp_path / "home")
+    with pytest.raises(RuntimeError):
+        ensure_runtime_directories(paths)
+
+
+def test_resolve_empty_data_dir_falls_back_to_default(tmp_path, monkeypatch):
+    """空 SURGECONF_DATA_DIR（set 但空串）与 unset 同语义：回默认目录，
+    绝不让 Path("") 把运行数据解析到当前目录/源码树"""
+    home = tmp_path / "home"
+    monkeypatch.setenv("SURGECONF_DATA_DIR", "")
+    paths = resolve_runtime_paths(home=home)
+    assert paths.root == home / "Library" / "Application Support" / "SurgeConf"
+    monkeypatch.delenv("SURGECONF_DATA_DIR")
+    assert resolve_runtime_paths(home=home).root == paths.root
 
 
 def test_assert_sqlite_database_safe_sidecars_and_parent(tmp_path):

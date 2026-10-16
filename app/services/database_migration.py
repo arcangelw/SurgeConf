@@ -11,7 +11,8 @@ from alembic.script import ScriptDirectory
 from app.bootstrap import seed_defaults
 from app.database import Base, DatabaseRuntime
 from app.runtime_paths import (RuntimePaths, assert_regular_file, assert_sqlite_database_safe,
-                               ensure_runtime_directories, reserve_private_file)
+                               ensure_runtime_directories, harden_private_file,
+                               reserve_private_file)
 from app.services.backups import backup_database, sqlite_backup
 from app.services.data_migrations import DATA_MIGRATIONS, apply_data_migrations
 
@@ -243,7 +244,7 @@ def verify_and_publish(staging: Path, target: Path) -> None:
         sidecar = staging.with_name(staging.name + suffix)
         if sidecar.exists():
             sidecar.unlink()
-    os.chmod(staging, 0o600)
+    harden_private_file(staging)
     os.replace(staging, target)
 
 
@@ -305,7 +306,7 @@ async def rebuild_from_source(source: Path | None, paths: RuntimePaths) -> tuple
         # SQLite 随后打开的是我们已验证的文件；全新路径同样先占位
         reserve_private_file(staging)
         if source is not None:
-            sqlite_backup(source, staging)
+            sqlite_backup(source, staging, reserved=True)
         applied = await upgrade_staging(staging)
         _remove_live_sidecars(live)
         verify_and_publish(staging, live)

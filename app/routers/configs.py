@@ -17,7 +17,8 @@ from typing import Optional
 
 from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
-from app.runtime_paths import refresh_runtime_permissions, resolve_runtime_paths
+from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
+                               resolve_runtime_paths)
 from app.security import issue_profile_token, verify_profile_token
 from app.services.backups import unique_path
 from app.services.generator import generate_surge_config
@@ -370,7 +371,7 @@ async def export_config(profile_id: int, data: ExportRequest,
     tmp = paths.exports / f".{target.name}.tmp-{os.getpid()}-{token_hex(4)}"
     try:
         tmp.write_bytes(content.encode("utf-8"))
-        os.chmod(tmp, 0o600)
+        harden_private_file(tmp)
         os.replace(tmp, target)
     except BaseException:
         tmp.unlink(missing_ok=True)

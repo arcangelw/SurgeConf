@@ -1,9 +1,13 @@
 """系统设置端点：语言切换、备份生命周期、数据重置、系统级配置。"""
 
+import os
+import stat as stat_mod
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from starlette.background import BackgroundTask
 
 from app.database import get_db
 from app.i18n import DEFAULT_LOCALE
@@ -66,14 +70,51 @@ async def get_backups():
 
 @router.get("/backups/{name}")
 async def download_backup(name: str):
-    """下载备份：name 必须命中现有备份白名单，且最终路径为已验证的
-    非 symlink 普通文件（list_backups 已收敛目录权限并逐项 lstat）"""
-    from app.runtime_paths import assert_regular_file
+    """下载备份：name 必须命中现有备份白名单（list_backups 已 refresh
+    并逐项 lstat），命中后以 ``O_NOFOLLOW`` 打开同一 fd 交付——
+    ``fstat`` 验证普通文件后由该 fd 流式读出，响应头（长度/文件名）
+    全部来自 fstat 与白名单名，绝不按路径二次打开（无 FileResponse
+    TOCTOU 窗口）。fd 在流结束与后台任务双路径幂等关闭。
+    """
     for item in list_backups():
-        if item.name == name:
-            assert_regular_file(item.path)   # 双重确认（白名单 + 类型）
-            return FileResponse(item.path, media_type="application/octet-stream",
-                                filename=item.name)
+        if item.name != name:
+            continue
+        try:
+            fd = os.open(item.path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="备份不存在") from exc
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise HTTPException(status_code=404, detail="备份不存在")
+
+        closed = False
+
+        def _close_fd() -> None:
+            nonlocal closed
+            if not closed:
+                closed = True
+                os.close(fd)
+
+        def _stream():
+            try:
+                while True:
+                    chunk = os.read(fd, 256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                _close_fd()
+
+        return StreamingResponse(
+            _stream(),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Length": str(st.st_size),
+                "Content-Disposition": f'attachment; filename="{item.name}"',
+            },
+            background=BackgroundTask(_close_fd),
+        )
     raise HTTPException(status_code=404, detail="备份不存在")
 
 

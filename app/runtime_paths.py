@@ -27,10 +27,11 @@ class RuntimePaths:
 
 def resolve_runtime_paths(home: Path | None = None) -> RuntimePaths:
     home = home or Path.home()
-    root = Path(os.environ.get(
-        "SURGECONF_DATA_DIR",
-        home / "Library" / "Application Support" / "SurgeConf",
-    )).expanduser()
+    # 防御性：空 SURGECONF_DATA_DIR（set 但为空串）与 unset 同样回默认，
+    # 避免 Path("") 解析为当前目录、把运行数据落进源码树
+    env_dir = os.environ.get("SURGECONF_DATA_DIR", "")
+    root = Path(env_dir if env_dir
+                else home / "Library" / "Application Support" / "SurgeConf").expanduser()
     log_dir = home / "Library" / "Logs" / "SurgeConf"
     return RuntimePaths(root, root / "surge_conf.db", root / "backups",
                         root / "exports", root / "session.key",
@@ -54,44 +55,67 @@ def _open_directory_nofollow(path: Path) -> int:
 
 
 def _ensure_directory_safe(path: Path) -> None:
-    """安全创建目录（含缺失父层的逐层递归）。
+    """逐组件 dirfd walk 安全创建目录（支持多层缺失的嵌套路径）。
 
-    已存在的每一层先经 ``O_DIRECTORY|O_NOFOLLOW`` 打开验证并 fchmod 0700；
-    缺失的层逐段 mkdir 后立即以同样方式打开验证 —— 全程不 follow symlink。
+    从根目录开始以 ``O_DIRECTORY|O_NOFOLLOW`` 逐组件打开：已存在组件
+    只做验证（绝不 chmod 属于他人的共享祖先）；缺失组件以
+    ``mkdir(0o700, dir_fd=...)`` 创建后立即打开验证并 ``fchmod 0700``。
+    全程不按完整路径打开，任何组件为 symlink/非目录时 fail closed。
     """
     path = Path(path)
-    missing: list[Path] = []
-    current = path
-    # 从最深层向上找已存在的祖先，途中任何 symlink/非目录直接 fail closed
-    while not os.path.lexists(current):
-        missing.append(current)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    # 校验最深已存在祖先
-    if os.path.lexists(current):
-        fd = _open_directory_nofollow(current)
-        os.fchmod(fd, 0o700)
+    if not path.is_absolute():
+        raise RuntimeError(f"runtime directory must be absolute: {path}")
+    fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for comp in path.parts[1:]:
+            if comp == os.curdir:
+                continue
+            try:
+                child = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(comp, 0o700, dir_fd=fd)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"cannot create runtime directory component {comp!r} "
+                        f"of {path}: {exc}") from exc
+                child = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+                os.fchmod(child, 0o700)
+            except NotADirectoryError as exc:
+                raise RuntimeError(
+                    f"runtime path component is not a directory: {path}") from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot safely open runtime directory {path}: {exc}") from exc
+            os.close(fd)
+            fd = child
+    finally:
         os.close(fd)
-    # 自上而下逐层创建并即时验证
-    for target in reversed(missing):
-        target.mkdir(mode=0o700)
-        fd = _open_directory_nofollow(target)
+
+
+def _converge_managed_directory(path: Path) -> None:
+    """SurgeConf 管理目录收敛 0700：fd 打开（no-follow）验证后 fchmod。"""
+    fd = _open_directory_nofollow(path)
+    try:
         os.fchmod(fd, 0o700)
+    finally:
         os.close(fd)
 
 
 def ensure_runtime_directories(paths: RuntimePaths) -> None:
-    """创建数据目录（root/backups/exports），逐层 no-follow 安全收敛 0o700。
+    """创建数据目录（root/backups/exports），逐组件 dirfd walk。
 
-    支持嵌套的新 ``SURGECONF_DATA_DIR``；已存在目录被 symlink 替换时
-    fail closed，绝不先 follow 再收敛。日志目录 ``log_dir`` 由实际启用
-    文件日志的任务负责创建。
+    中间祖先（不属于 SurgeConf 的共享目录，如 ``~/Library`` 或自定义
+    data dir 的上层）只验证、绝不修改权限；本次新建的中间组件以 0700
+    创建；最终 managed root/backups/exports 收敛 0700（它们是 SurgeConf
+    管理目录）。嵌套的新 ``SURGECONF_DATA_DIR`` 全程不 follow symlink。
+    日志目录 ``log_dir`` 由实际启用文件日志的任务负责创建。
     """
-    _ensure_directory_safe(paths.root)
-    _ensure_directory_safe(paths.backups)
-    _ensure_directory_safe(paths.exports)
+    for directory in (paths.root, paths.backups, paths.exports):
+        _ensure_directory_safe(directory)
+        _converge_managed_directory(directory)
 
 
 def assert_regular_file(path: Path) -> None:
@@ -141,27 +165,48 @@ def assert_sqlite_database_safe(path: Path) -> None:
 def reserve_private_file(path: Path) -> None:
     """为 SQLite 新目标原子保留普通文件：O_CREAT|O_EXCL|O_NOFOLLOW 0600。
 
-    已存在时校验其为非 symlink 普通文件（幂等复用）；创建成功即以
-    fchmod 固定 0600。随后 SQLite 打开的是我们已验证的普通文件。
+    严格独占创建：目标已存在（无论何种类型/内容）即失败，绝不复用
+    既有文件。已预占目标交给 SQLite 前的复核由
+    ``validate_reserved_empty_file`` 负责。
     """
     path = Path(path)
     assert_parent_chain(path)
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except FileExistsError:
-        assert_regular_file(path)
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
-        st = os.fstat(fd)
-        if not stat_mod.S_ISREG(st.st_mode):
-            os.close(fd)
-            raise RuntimeError(f"runtime path is not a regular file: {path}")
-        os.fchmod(fd, 0o600)
-        os.close(fd)
-        return
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"cannot reserve private file, target already exists: {path}") from exc
     except OSError as exc:
         raise RuntimeError(f"cannot reserve private file {path}: {exc}") from exc
-    os.fchmod(fd, 0o600)
-    os.close(fd)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
+def validate_reserved_empty_file(path: Path) -> None:
+    """复核目标为本次流程预占的 0 字节 0600 普通文件后交付 SQLite。
+
+    fd 打开（``O_NOFOLLOW|O_NONBLOCK``，后者防止 FIFO 阻塞打开）+
+    ``fstat``：非 symlink、普通文件、权限 0600、size == 0；任一不
+    满足即 fail closed（预占后目标被替换或篡改）。
+    """
+    path = Path(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise RuntimeError(
+            f"reserved file is missing or unsafe: {path} ({exc})") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise RuntimeError(f"reserved file is not a regular file: {path}")
+        if stat_mod.S_IMODE(st.st_mode) & 0o777 != 0o600:
+            raise RuntimeError(f"reserved file is not mode 0600: {path}")
+        if st.st_size != 0:
+            raise RuntimeError(f"reserved file is not empty: {path}")
+    finally:
+        os.close(fd)
 
 
 def refresh_runtime_permissions(paths: RuntimePaths) -> None:
@@ -193,7 +238,7 @@ def _harden_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _harden_file(path: Path) -> None:
+def harden_private_file(path: Path) -> None:
     """文件收敛：fd 打开（no-follow）+ fstat 验证普通文件后 fchmod 0600。"""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -223,7 +268,7 @@ def harden_runtime_permissions(paths: RuntimePaths) -> None:
     for file in (paths.database,
                  Path(f"{paths.database}-wal"), Path(f"{paths.database}-shm"),
                  paths.session_secret, paths.log_file):
-        _harden_file(file)
+        harden_private_file(file)
     for directory in (paths.backups, paths.exports):
         if not os.path.lexists(directory):
             continue
@@ -232,6 +277,6 @@ def harden_runtime_permissions(paths: RuntimePaths) -> None:
             if stat_mod.S_ISDIR(st.st_mode):
                 _harden_directory(child)
             elif stat_mod.S_ISREG(st.st_mode):
-                _harden_file(child)
+                harden_private_file(child)
             else:
                 raise RuntimeError(f"unexpected entry type in runtime directory: {child}")

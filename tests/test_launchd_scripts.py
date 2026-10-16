@@ -21,8 +21,16 @@ echo "$@" >> "${FAKE_LAUNCHCTL_LOG:-/dev/null}"
 case "$1" in
   list)
     if [ -n "$2" ]; then
-      # 精确 label 查询：以 exit status 表达加载状态
-      [ -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}" ] && exit 0
+      # 精确 label 查询：输出 PID\tStatus\tLabel，exit status 表达加载状态；
+      # state 文件内容为 "running" 时第一列为数字 PID，其余（含空）为 "-"
+      if [ -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}" ]; then
+        if [ "$(cat "${FAKE_LAUNCHCTL_STATE}")" = "running" ]; then
+          printf -- '12345\t0\t%s\n' "$2"
+        else
+          printf -- '-\t0\t%s\n' "$2"
+        fi
+        exit 0
+      fi
       exit 1
     fi
     if [ -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}" ]; then
@@ -614,9 +622,14 @@ def test_status_uses_exact_label_query(tmp_path, fake_launchctl):
     assert "list com.surgeconf" in calls                  # 精确 label 查询
     assert not any("|" in c or "grep" in c for c in calls)  # 无子串 grep 管道
 
-    state.write_text("loaded")
+    state.write_text("loaded")                            # 已加载但无 PID
     r2 = run_script(["status"], tmp_path, extra_env=env)
-    assert "运行中" in r2.stdout
+    assert "已加载但未运行" in r2.stdout
+    assert "运行中" not in r2.stdout                       # 不得误报运行中
+
+    state.write_text("running")                            # 数字 PID
+    r3 = run_script(["status"], tmp_path, extra_env=env)
+    assert "运行中" in r3.stdout
 
 
 def test_run_branch_refuses_corrupt_control_file(tmp_path, fake_launchctl):
@@ -629,3 +642,106 @@ def test_run_branch_refuses_corrupt_control_file(tmp_path, fake_launchctl):
     r = run_script(["run"], tmp_path, extra_env=env)
     assert r.returncode != 0
     assert "未知键" in r.stderr or "未知键" in r.stdout
+
+
+
+# ===== Round 4：reader 完整性、显式值校验、空 data dir、.. 拒绝 =====
+
+
+def test_reader_rejects_line_without_equals(tmp_path):
+    """每行必须含 =：单独键名行拒绝，不被解释成键值"""
+    r = run_bash(r"""
+        source "$LIB"
+        printf '%s\n' 'SURGE_HOST' > "$HOME/env"
+        if sc_read_launchd_env "$HOME/env" 2>"$HOME/err"; then
+          echo ACCEPTED
+        else
+          echo REJECTED
+        fi
+        cat "$HOME/err"
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "REJECTED" in r.stdout
+    assert "缺少 = 分隔" in r.stdout
+
+
+def test_reader_rejects_dangling_symlink_control_file(tmp_path):
+    """dangling symlink 控制文件：symlink 检查先于存在性，不当作缺失"""
+    r = run_bash(r"""
+        source "$LIB"
+        ln -s "$HOME/no-such-target" "$HOME/env"
+        if sc_read_launchd_env "$HOME/env" 2>"$HOME/err"; then
+          echo ACCEPTED
+        else
+          echo REJECTED
+        fi
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "REJECTED" in r.stdout
+    assert "symlink" in (tmp_path / "home" / "err").read_text()
+
+
+def test_env_write_rejects_trailing_newline_value(tmp_path):
+    """显式凭据含尾随 LF：不经命令替换吞掉，写盘前必须失败且不生成文件"""
+    r = run_bash(r"""
+        source "$LIB"
+        printf -v val 'example-access-key@127.0.0.1:6160\n'
+        export SURGE_CONTROLLER_ACCESS="$val"
+        if sc_write_launchd_env "$HOME/env" 2>/dev/null; then
+          echo WROTE
+        else
+          echo REJECTED
+        fi
+        [ -e "$HOME/env" ] && echo FILE_EXISTS || echo NO_FILE
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "REJECTED" in r.stdout
+    assert "NO_FILE" in r.stdout
+
+
+def test_resolve_unsets_empty_data_dir(tmp_path):
+    """显式空 SURGECONF_DATA_DIR：resolve 后按 unset 处理（不传空值给 Python）"""
+    r = run_bash(r"""
+        source "$LIB"
+        export SURGECONF_DATA_DIR=""
+        sc_resolve_runtime_config
+        if [ "${SURGECONF_DATA_DIR+x}" = x ]; then
+          echo STILL_SET
+        else
+          echo UNSET
+        fi
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "UNSET" in r.stdout
+    assert "STILL_SET" not in r.stdout
+
+
+def test_resolve_rejects_control_char_in_explicit_data_dir(tmp_path):
+    """显式 data dir 含控制字符：resolve 阶段（写/导出前）失败"""
+    r = run_bash(r"""
+        source "$LIB"
+        printf -v bad '%s\n/data' "$HOME"
+        export SURGECONF_DATA_DIR="$bad"
+        if sc_resolve_runtime_config 2>/dev/null; then
+          echo ACCEPTED
+        else
+          echo REJECTED
+        fi
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "REJECTED" in r.stdout
+
+
+def test_ensure_directory_rejects_dotdot_escape(tmp_path):
+    """含 .. 的路径词法拒绝：即使词法上位于锚点内也不创建"""
+    r = run_bash(r"""
+        source "$LIB"
+        if sc_ensure_directory "$HOME/../escape" 2>/dev/null; then
+          echo ACCEPTED
+        else
+          echo REJECTED
+        fi
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "REJECTED" in r.stdout
+    assert not (tmp_path / "escape").exists()
