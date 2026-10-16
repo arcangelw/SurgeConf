@@ -208,30 +208,111 @@ async def test_prepared_head_rejects_invalid_target_and_mode_rows(tmp_path):
 
 
 def test_alembic_head_check_constraints_match_metadata(tmp_path):
-    """强制器：迁移产物、ORM metadata、SCHEMA_REVISION_CHECKS 三处约束名一致"""
+    """强制器：ORM metadata、SCHEMA_REVISION_CHECKS、Alembic 产物三处的
+    约束名与规范化表达式完全一致"""
     from sqlalchemy.schema import CheckConstraint
 
     from app.models import ConfigProfile
 
-    expected = {c.name for c in ConfigProfile.__table__.constraints
-                if isinstance(c, CheckConstraint)}
-    registered = set(database_migration.SCHEMA_REVISION_CHECKS[
-        database_migration._head_revision()]["config_profiles"])
-    assert expected == registered == {
+    head = database_migration._head_revision()
+    registered = database_migration.SCHEMA_REVISION_CHECKS[head]["config_profiles"]
+    metadata_checks = {
+        c.name: database_migration._normalize_check_expression(c.sqltext.text)
+        for c in ConfigProfile.__table__.constraints
+        if isinstance(c, CheckConstraint)
+    }
+    assert set(metadata_checks) == set(registered) == {
         "ck_config_profiles_target",
         "ck_config_profiles_udp_security_mode",
         "ck_config_profiles_target_udp_mode",
+    }
+    assert metadata_checks == {
+        name: database_migration._normalize_check_expression(expr)
+        for name, expr in registered.items()
     }
 
     path = tmp_path / "head.db"
     command.upgrade(database_migration._alembic_config(path), "head")
     engine = sqlalchemy.create_engine(f"sqlite:///{path}")
     try:
-        actual = {cc["name"] for cc in
-                  sqlalchemy.inspect(engine).get_check_constraints("config_profiles")}
+        alembic_checks = {
+            cc["name"]: database_migration._normalize_check_expression(cc["sqltext"])
+            for cc in sqlalchemy.inspect(engine).get_check_constraints("config_profiles")
+        }
     finally:
         engine.dispose()
-    assert actual == expected
+    assert alembic_checks == metadata_checks
+
+
+@pytest.mark.asyncio
+async def test_unversioned_alembic_head_identified(tmp_path):
+    """Alembic 产物的无版本副本（仅剔除簿记表）仍精确识别为 head"""
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    command.upgrade(database_migration._alembic_config(legacy), "head")
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("DROP TABLE alembic_version")
+        conn.execute("DROP TABLE data_migration_records")
+    conn.close()
+    assert database_migration.identify_unversioned_schema(legacy) == \
+        database_migration._head_revision()
+
+
+@pytest.mark.parametrize("tampered", [
+    # 任一表达式恒真（CHECK(1)）：名对语义错
+    {"ck_config_profiles_target": "1",
+     "ck_config_profiles_udp_security_mode": "1",
+     "ck_config_profiles_target_udp_mode": "1"},
+    # 组合约束被改成错误语义（禁止 mac_workstation+scoped，放行 iOS+scoped）
+    {"ck_config_profiles_target": "target IN ('mac_workstation', 'mac_gateway', 'ios_mobile')",
+     "ck_config_profiles_udp_security_mode": "udp_security_mode IN ('strict', 'scoped', 'compatible')",
+     "ck_config_profiles_target_udp_mode":
+         "NOT (target = 'mac_workstation' AND udp_security_mode = 'scoped')"},
+])
+def test_unversioned_head_tampered_check_expression_rejected(tmp_path, tampered):
+    """列与三个约束名都正确、但任一表达式为恒真/错误组合：fail closed，
+    绝不识别（更不 stamp）为 0003"""
+    path = tmp_path / "tampered.db"
+    engine = sqlalchemy.create_engine(f"sqlite:///{path}")
+    tables = [t for t in Base.metadata.sorted_tables
+              if t.name not in ("data_migration_records", "config_profiles")]
+    Base.metadata.create_all(engine, tables=tables)
+    engine.dispose()
+
+    ddl = """
+    CREATE TABLE config_profiles (
+        id INTEGER NOT NULL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        is_default BOOLEAN,
+        target VARCHAR(20) NOT NULL DEFAULT 'mac_workstation',
+        udp_security_mode VARCHAR(20) NOT NULL DEFAULT 'scoped',
+        locale VARCHAR(10),
+        final_action VARCHAR(100),
+        general JSON,
+        dns JSON,
+        url_rewrites JSON,
+        header_rewrites JSON,
+        mitm JSON,
+        subscription_token_hash VARCHAR(64),
+        created_at DATETIME,
+        updated_at DATETIME,
+        CONSTRAINT ck_config_profiles_target CHECK (%s),
+        CONSTRAINT ck_config_profiles_udp_security_mode CHECK (%s),
+        CONSTRAINT ck_config_profiles_target_udp_mode CHECK (%s)
+    )""" % (tampered["ck_config_profiles_target"],
+            tampered["ck_config_profiles_udp_security_mode"],
+            tampered["ck_config_profiles_target_udp_mode"])
+    conn = sqlite3.connect(path)
+    with conn:
+        conn.execute(ddl)
+    conn.close()
+
+    assert database_migration.identify_unversioned_schema(path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(path))
+    assert "CHECK 约束表达式不一致" in details
+    assert "ck_config_profiles" in details
 
 
 @pytest.mark.asyncio

@@ -119,17 +119,22 @@ SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
                              ("config_profiles", "udp_security_mode")},
 }
 
-# 各 revision 必需的命名 CHECK 约束（表 → 约束名集合）。
-# **新增带约束的 revision 时在此登记**；无版本库识别缺任一必需约束即 fail-closed
-#（列指纹一致也不 stamp）。约束名同时由 ORM metadata（models.py __table_args__）
-# 与对应迁移声明，三处必须同名。
-SCHEMA_REVISION_CHECKS: dict[str, dict[str, frozenset[str]]] = {
+# 各 revision 必需的命名 CHECK 约束（表 → 约束名 → 冻结的规范化表达式）。
+# **新增带约束的 revision 时在此登记**；无版本库识别缺任一必需约束、或
+# 同名约束的实际表达式与冻结语义文本不一致（如被篡改为恒真）都 fail-closed
+#（列指纹一致也不 stamp）。约束名与表达式由 ORM metadata（models.py
+# __table_args__）与对应迁移声明，三处必须同名同表达式；测试强制
+# Alembic 产物的 inspector sqltext 规范化后与冻结值一致。
+SCHEMA_REVISION_CHECKS: dict[str, dict[str, dict[str, str]]] = {
     "0003_profile_targets": {
-        "config_profiles": frozenset({
-            "ck_config_profiles_target",
-            "ck_config_profiles_udp_security_mode",
-            "ck_config_profiles_target_udp_mode",
-        }),
+        "config_profiles": {
+            "ck_config_profiles_target":
+                "target IN ('mac_workstation', 'mac_gateway', 'ios_mobile')",
+            "ck_config_profiles_udp_security_mode":
+                "udp_security_mode IN ('strict', 'scoped', 'compatible')",
+            "ck_config_profiles_target_udp_mode":
+                "NOT (target = 'ios_mobile' AND udp_security_mode = 'scoped')",
+        },
     },
 }
 
@@ -162,19 +167,67 @@ def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]], 
         tables = {t for t in inspector.get_table_names()
                   if t not in _IDENTIFY_IGNORED_TABLES}
         columns = {t: {c["name"] for c in inspector.get_columns(t)} for t in tables}
-        checks = {t: {cc["name"] for cc in inspector.get_check_constraints(t)}
+        checks = {t: {cc["name"]: cc["sqltext"] for cc in
+                      inspector.get_check_constraints(t)}
                   for t in tables}
     finally:
         engine.dispose()
     return tables, columns, checks
 
 
-def _missing_required_checks(revision: str, actual_checks: dict[str, set[str]]) -> set[str]:
-    """revision 必需但库中缺失的 CHECK 约束名（跨表打平）"""
+def _normalize_check_expression(sqltext: str) -> str:
+    """仅消除确定性的表示差异，绝不改变布尔语义。
+
+    处理三类：SQLite/Alembic/inspector 之间的空白差异（含换行折叠）、
+    包裹整个表达式的外层成对括号（字符串字面量感知，含 '' 转义）、
+    标识符引用符统一（`x`/[x] → "x"；单引号字符串字面量原样保留）。
+    不做 token 排序、大小写折叠或删引号——那些可能把不同布尔表达式判同。
+    """
+    text = sqltext.strip().replace("`", '"').replace("[", '"').replace("]", '"')
+    while len(text) >= 2 and text[0] == "(" and text[-1] == ")":
+        depth = 0
+        in_string = False
+        wrapped = True
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if in_string:
+                if char == "'":
+                    if index + 1 < len(text) and text[index + 1] == "'":
+                        index += 2  # '' 转义的单引号
+                        continue
+                    in_string = False
+            elif char == "'":
+                in_string = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(text) - 1:
+                    wrapped = False  # 外层括号在末尾之前已闭合 → 非整体包裹
+                    break
+            index += 1
+        if not wrapped or in_string or depth != 0:
+            break
+        text = text[1:-1].strip()
+    return " ".join(text.split())
+
+
+def _required_check_problems(revision: str,
+                             actual_checks: dict[str, dict[str, str]]
+                             ) -> tuple[set[str], set[str]]:
+    """相对 revision 必需约束返回（缺失的约束名, 表达式不一致的约束名）"""
     missing: set[str] = set()
+    mismatched: set[str] = set()
     for table, required in SCHEMA_REVISION_CHECKS.get(revision, {}).items():
-        missing |= required - actual_checks.get(table, set())
-    return missing
+        actual = actual_checks.get(table, {})
+        for name, expected in required.items():
+            if name not in actual:
+                missing.add(name)
+            elif _normalize_check_expression(actual[name]) != \
+                    _normalize_check_expression(expected):
+                mismatched.add(name)
+    return missing, mismatched
 
 
 def identify_unversioned_schema(database_path: Path) -> str | None:
@@ -191,7 +244,8 @@ def identify_unversioned_schema(database_path: Path) -> str | None:
         if not all(actual_columns[table] == set(columns)
                    for table, columns in fingerprint.items()):
             continue
-        if _missing_required_checks(revision, actual_checks):
+        missing, mismatched = _required_check_problems(revision, actual_checks)
+        if missing or mismatched:
             continue
         return revision
     return None
@@ -217,9 +271,12 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
         if extra:
             problems.append(f"{table} 额外列: {', '.join(sorted(extra))}")
     for table, required in SCHEMA_REVISION_CHECKS.get(head, {}).items():
-        missing = required - actual_checks.get(table, set())
+        missing, mismatched = _required_check_problems(head, actual_checks)
         if missing:
             problems.append(f"{table} 缺 CHECK 约束: {', '.join(sorted(missing))}")
+        if mismatched:
+            problems.append(
+                f"{table} CHECK 约束表达式不一致: {', '.join(sorted(mismatched))}")
     if not problems:
         problems.append("schema 与已知 revision 指纹均不一致（混合列）")
     return problems
