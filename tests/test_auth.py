@@ -504,3 +504,148 @@ async def test_base_page_structure(client_loopback):
     assert '<link rel="stylesheet" href="/static/css/style.css' in html
     assert "</nav>" in html
     assert 'name="csrf-token" content="' in html
+
+
+# ===== Fix round 2：session.key 原子发布 / 限流有界 / static 公开 =====
+
+def test_session_secret_publish_is_atomic_no_partial_target(tmp_path, monkeypatch):
+    """并发调用方暂停在 publish 前读不到半成品 target，最终结果一致"""
+    from app import security
+
+    secret_path = tmp_path / "session.key"
+    gate = threading.Event()
+    real_link = os.link
+    state = {"paused_once": False}
+
+    def paused_link(src, dst, *args, **kwargs):
+        if not state["paused_once"]:
+            state["paused_once"] = True
+            assert gate.wait(timeout=5), "creator 应卡在 publish 前"
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(security.os, "link", paused_link)
+    results = {}
+
+    def creator():
+        results["creator"] = security.load_or_create_session_secret(secret_path)
+
+    thread = threading.Thread(target=creator)
+    thread.start()
+    # 等 creator 的 temp 文件出现（已写完但尚未 link）
+    import time as time_module
+    deadline = time_module.monotonic() + 5
+    while time_module.monotonic() < deadline:
+        temps = list(tmp_path.glob(f".{secret_path.name}.tmp-*"))
+        if temps:
+            break
+        time_module.sleep(0.01)
+    assert temps, "creator 应先创建临时文件"
+    # publish 前：target 不存在，读取者拿不到半成品
+    assert not secret_path.exists()
+    assert security._read_secret_file(secret_path) is None
+
+    # 第二个调用方在 publish 前并发创建：自己的 temp → link 不再暂停 → 抢先发布
+    results["second"] = security.load_or_create_session_secret(secret_path)
+    gate.set()  # 放行 creator 的 link：应 EEXIST 后重读已发布文件
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert results["creator"] == results["second"]
+    assert len(results["second"]) == 32
+    # 无残留 temp
+    assert list(tmp_path.glob(f".{secret_path.name}.tmp-*")) == []
+
+
+def test_session_secret_permissions_via_fd_only(tmp_path, monkeypatch):
+    """权限收敛只允许 fchmod（持 fd），禁止路径 chmod TOCTOU"""
+    secret_path = tmp_path / "session.key"
+    secret_path.write_bytes(os.urandom(32))
+    os.chmod(secret_path, 0o644)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("不得使用路径 chmod")
+
+    monkeypatch.setattr(os, "chmod", forbidden)
+    secret = load_or_create_session_secret(secret_path)
+    assert len(secret) == 32
+    assert (secret_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_session_secret_rejects_fifo_without_blocking(tmp_path):
+    """FIFO 目标路径必须快速 fail closed，不得阻塞调用线程"""
+    secret_path = tmp_path / "session.key"
+    os.mkfifo(secret_path)
+    outcome = []
+
+    def call():
+        try:
+            outcome.append(load_or_create_session_secret(secret_path))
+        except OSError as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "FIFO 不得导致阻塞"
+    assert isinstance(outcome[0], OSError)
+    # FIFO 未被破坏、未被替换为普通文件
+    import stat as stat_module
+    assert stat_module.S_ISFIFO(secret_path.stat().st_mode)
+
+
+def _synthetic_peer(index: int) -> str:
+    """RFC 5737 与 2001:db8::/32 文档地址合成对端"""
+    if index < 768:
+        octets = ["192.0.2", "198.51.100", "203.0.113"]
+        return f"{octets[index // 256]}.{index % 256}"
+    return f"2001:db8:{index:x}::1"
+
+
+def _peer_request(host: str):
+    from starlette.requests import Request as StarletteRequest
+    return StarletteRequest({"type": "http", "method": "GET", "path": "/",
+                             "headers": [], "query_string": b"",
+                             "client": (host, 54321), "server": ("test", 80)})
+
+
+def test_login_throttle_state_bounded_and_pruned(monkeypatch):
+    from app import security
+
+    security._login_failures.clear()
+    security._login_blocked_until.clear()
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(security.time, "monotonic", lambda: clock["now"])
+
+    # 灌入超过硬容量的合成 peer：容器不得超过上限
+    for i in range(security.MAX_LOGIN_PEERS + 200):
+        security.record_login_failure(_peer_request(_synthetic_peer(i)))
+    peers = set(security._login_failures) | set(security._login_blocked_until)
+    assert len(peers) == security.MAX_LOGIN_PEERS
+
+    # 容量满时未知 peer fail closed 返回限流，且不插入新条目
+    unknown = _synthetic_peer(security.MAX_LOGIN_PEERS + 500)
+    assert security.login_throttle_wait(_peer_request(unknown)) is not None
+    assert unknown not in security._login_failures
+
+    # 已知 peer（未达阻断阈值）正常放行
+    known = _synthetic_peer(0)
+    assert security.login_throttle_wait(_peer_request(known)) is None
+
+    # 过期 blocked 项与时钟推进后清理
+    security._login_blocked_until[_synthetic_peer(1)] = clock["now"] + 30
+    clock["now"] += 61
+    assert security.login_throttle_wait(_peer_request(known)) is None  # 触发 prune
+    assert _synthetic_peer(1) not in security._login_blocked_until
+    assert not security._login_failures
+    assert not security._login_blocked_until
+    # 清理后未知 peer 恢复放行
+    assert security.login_throttle_wait(_peer_request(unknown)) is None
+
+
+@pytest.mark.asyncio
+async def test_local_only_static_public_but_auth_hidden(client_from_lan):
+    """local_only 非回环：静态资源保持公开，登录端点隐藏"""
+    assert (await client_from_lan.get("/static/js/app.js")).status_code == 200
+    assert (await client_from_lan.get("/static/css/style.css")).status_code == 200
+    assert (await client_from_lan.get("/login")).status_code == 403
+    assert (await client_from_lan.get("/api/auth/session")).status_code == 403
+    assert (await client_from_lan.get("/api/auth/login")).status_code == 403

@@ -89,15 +89,21 @@ def verify_admin_password(password: str, encoded: str) -> bool:
 # ===== 会话签名密钥 =====
 
 def _read_secret_file(path: Path) -> bytes | None:
-    """O_NOFOLLOW 只读打开并校验为 32 字节普通文件；任何异常视作不可用"""
+    """O_RDONLY|O_NOFOLLOW|O_NONBLOCK 打开，fstat 校验普通文件后在持有
+    fd 期间 fchmod 收敛权限（杜绝路径 chmod TOCTOU），再读取恰 32 字节。
+
+    任何异常（符号链接、FIFO、权限、长度不符）都视作不可用，绝不阻塞。
+    """
     import stat as stat_module
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         return None
     try:
         if not stat_module.S_ISREG(os.fstat(fd).st_mode):
             return None
+        os.fchmod(fd, 0o600)
         chunks = []
         remaining = _SECRET_BYTES + 1  # 多读 1 字节用于拒绝超长文件
         while remaining > 0:
@@ -113,41 +119,49 @@ def _read_secret_file(path: Path) -> bytes | None:
 
 
 def load_or_create_session_secret(path: Path) -> bytes:
-    """加载（或首次原子创建）32 字节会话签名密钥。
+    """加载（或首次原子发布）32 字节会话签名密钥。
 
-    - 创建用 ``O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`` 一次原子完成（0o600），
-      并发竞争失败方重读最终文件，所有调用方拿到同一密钥；
-    - 已有合法文件（含 0644 等宽松权限）加载时收敛到 0o600；
-    - 符号链接 / 非普通文件 / 长度异常一律拒绝（fail closed），
+    - 读取路径见 :func:`_read_secret_file`（fd 级 fchmod）；
+    - 创建路径：同目录随机临时名 ``O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`` 0600，
+      完整 write 循环 + fchmod + fsync + close 后用 ``os.link`` 原子发布
+      （hard-link 不覆盖已存在的 target，观察者只会看到完整文件）；
+      竞争 loser 重新安全读取已发布文件；finally 删除自己的临时文件；
+    - 符号链接 / FIFO / 非普通文件 / 长度异常一律 fail closed 抛 OSError，
       密钥丢失仅导致既有会话失效，不涉及业务数据。
     """
     path = Path(path)
     data = _read_secret_file(path)
     if data is not None:
-        os.chmod(path, 0o600)
         return data
 
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     secret = secrets.token_bytes(_SECRET_BYTES)
+    tmp_path = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}")
     try:
-        fd = os.open(path,
-                     os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
                      | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    except FileExistsError:
-        # 另一个调用方赢了竞态，或路径被符号链接/异常文件占据
+        try:
+            view = memoryview(secret)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp_path, path)  # 原子发布：不覆盖既有 target
+        except FileExistsError:
+            pass  # 竞争 loser：target 已被他人完整发布
         data = _read_secret_file(path)
         if data is None:
-            raise
-        os.chmod(path, 0o600)
+            raise OSError(f"session key path unusable: {path}")
         return data
-    except OSError:
-        # 符号链接（ELOOP）等：拒绝在不安全路径上创建
-        raise
-    try:
-        os.write(fd, secret)
     finally:
-        os.close(fd)
-    return secret
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 class SessionSigner:
@@ -251,8 +265,13 @@ class Decision:
     CSRF_REJECTED = "csrf_rejected"
 
 
+def is_static_path(path: str) -> bool:
+    """静态资源在任何访问模式下公开（不含业务数据）"""
+    return path.startswith("/static/")
+
+
 def is_public_path(path: str) -> bool:
-    return path.startswith("/static/") or path in PUBLIC_PATHS
+    return is_static_path(path) or path in PUBLIC_PATHS
 
 
 def request_peer_is_loopback(request: Request) -> bool:
@@ -308,9 +327,13 @@ async def require_admin_request(request: Request, settings: AccessSettings) -> s
     ``request.state.session``，需要为回环新签发隐式会话时
     ``request.state.issue_implicit_session`` 为 True（由装配层负责 Set-Cookie）。
     """
+    path = request.url.path
+    if is_static_path(path):
+        # 静态资源在任何模式下公开（不含业务数据）
+        return Decision.PUBLIC
     loopback = request_peer_is_loopback(request)
-    if is_public_path(request.url.path):
-        # local_only 下公开路径也仅限本机：非回环连登录页/登录端点都不可见
+    if path in PUBLIC_PATHS:
+        # local_only 下登录页/登录端点仅限本机：非回环不可见
         if settings.admin_access == "local_only" and not loopback:
             return Decision.FORBIDDEN
         return Decision.PUBLIC
@@ -353,6 +376,8 @@ def _mark_implicit_issue(request: Request) -> tuple[str, str]:
 
 # ===== 登录限流（按直接 TCP 对端，不信任任何转发头） =====
 
+# 状态硬容量：防对端伪造洪泛撑爆内存；满时未知对端 fail closed
+MAX_LOGIN_PEERS = 1024
 
 _login_failures: dict[str, deque] = defaultdict(deque)
 _login_blocked_until: dict[str, float] = {}
@@ -363,30 +388,52 @@ def _peer_key(request: Request) -> str:
     return peer.host if peer and peer.host else "unknown-peer"
 
 
+def _prune_login_state(now: float) -> None:
+    """清除过期失败窗口、过期阻断与关联空项，保证状态有界"""
+    for key in list(_login_failures.keys()):
+        failures = _login_failures[key]
+        while failures and now - failures[0] >= LOGIN_FAILURE_WINDOW:
+            failures.popleft()
+        if not failures:
+            del _login_failures[key]
+    for key in list(_login_blocked_until.keys()):
+        if now >= _login_blocked_until[key]:
+            del _login_blocked_until[key]
+
+
+def _known_peer(key: str) -> bool:
+    return key in _login_failures or key in _login_blocked_until
+
+
 def login_throttle_wait(request: Request) -> int | None:
-    """登录前检查：被阻断时返回建议等待秒数（>=1），否则 None。"""
+    """登录前检查：被阻断（或状态容量已满的未知对端）返回等待秒数，否则 None。"""
     key = _peer_key(request)
     now = time.monotonic()
+    _prune_login_state(now)
     until = _login_blocked_until.get(key, 0.0)
     if now < until:
         return int(until - now) + 1
-    failures = _login_failures.get(key)
-    if failures is not None:
-        while failures and now - failures[0] >= LOGIN_FAILURE_WINDOW:
-            failures.popleft()
+    if not _known_peer(key):
+        peers = len(set(_login_failures) | set(_login_blocked_until))
+        if peers >= MAX_LOGIN_PEERS:
+            # 容量满：未知对端 fail closed，不插入新条目
+            return int(LOGIN_BLOCK_SECONDS)
     return None
 
 
 def record_login_failure(request: Request) -> None:
     key = _peer_key(request)
     now = time.monotonic()
+    _prune_login_state(now)
+    if not _known_peer(key):
+        peers = len(set(_login_failures) | set(_login_blocked_until))
+        if peers >= MAX_LOGIN_PEERS:
+            return  # 容量满：不记录未知对端
     failures = _login_failures[key]
     failures.append(now)
-    while failures and now - failures[0] >= LOGIN_FAILURE_WINDOW:
-        failures.popleft()
     if len(failures) >= LOGIN_FAILURE_LIMIT:
         _login_blocked_until[key] = now + LOGIN_BLOCK_SECONDS
-        failures.clear()
+        del _login_failures[key]
 
 
 def record_login_success(request: Request) -> None:
