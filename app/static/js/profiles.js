@@ -500,11 +500,21 @@ function renderGenerateTab(profileId) {
 
 // ===== 订阅 Token：明文仅存在于一次性对话框，关闭即清空 =====
 
+function formatSubscribeHost(ip) {
+  // IPv6 字面量须以方括号包裹（host 位置冒号不允许百分号编码）；
+  // 普通 hostname/IP 走 encodeURIComponent（字母数字.-_ 不变，其余安全编码）
+  const raw = String(ip);
+  return raw.includes(":") && !raw.startsWith("[") ? `[${raw}]` : encodeURIComponent(raw);
+}
+
 function buildSubscribeUrl(profileId, token) {
   // 纯函数：协议/端口来自当前页面，地址取当前下拉选择；token 逐参数安全编码
   const ip = document.getElementById(`ip-select-${profileId}`)?.value || "127.0.0.1";
-  const port = SERVER_PORT === "80" || SERVER_PORT === "443" ? "" : `:${SERVER_PORT}`;
-  return `${location.protocol}//${encodeURIComponent(ip)}${port}`
+  // 端口省略必须结合协议：仅协议默认端口可省；交叉组合（http:443 / https:80）必须保留
+  const isDefaultPort = (location.protocol === "http:" && SERVER_PORT === "80")
+    || (location.protocol === "https:" && SERVER_PORT === "443");
+  const port = isDefaultPort ? "" : `:${SERVER_PORT}`;
+  return `${location.protocol}//${formatSubscribeHost(ip)}${port}`
     + `/api/configs/profiles/${Number(profileId)}/subscribe?token=${encodeURIComponent(token)}`;
 }
 
