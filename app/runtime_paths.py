@@ -265,19 +265,20 @@ def harden_runtime_permissions(paths: RuntimePaths) -> None:
     """运行产物权限统一收敛（幂等，bind/连接前调用）。
 
     - root/backups/exports/log_dir：fd no-follow 验证后 fchmod 0700；
-    - live DB 及 -wal/-shm、会话密钥、事件日志与 console 回退日志：
+    - live DB 及 -wal/-shm、会话密钥、事件日志及其跨进程轮转 lock：
       fd + fstat 验证后 fchmod 0600；
-    - backups/exports 下的普通文件 fchmod 0600，子目录按目录规则收敛，
-      其余类型（socket/fifo/设备/symlink）一律拒绝 —— fail closed。
+    - backups/exports/log_dir 下的普通文件（含 console 回退日志与
+      轮转备份）fchmod 0600，子目录按目录规则收敛，其余类型
+      （socket/fifo/设备/symlink）一律拒绝 —— fail closed。
     """
     for directory in (paths.root, paths.backups, paths.exports, paths.log_dir):
         _harden_directory(directory)
     for file in (paths.database,
                  Path(f"{paths.database}-wal"), Path(f"{paths.database}-shm"),
                  paths.session_secret, paths.log_file,
-                 paths.log_dir / CONSOLE_LOG_FILENAME):
+                 Path(f"{paths.log_file}.lock")):
         harden_private_file(file)
-    for directory in (paths.backups, paths.exports):
+    for directory in (paths.backups, paths.exports, paths.log_dir):
         if not os.path.lexists(directory):
             continue
         for child in sorted(directory.iterdir()):

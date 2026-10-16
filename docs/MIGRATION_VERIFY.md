@@ -209,14 +209,25 @@ echo "日志 $L_BEFORE -> $L_AFTER；记录 $R_BEFORE -> $R_AFTER"
 
 ## 运行时可观察性最终清单（本任务新增）
 
-升级到含结构化事件日志的版本后，逐项确认（全程不外发日志原文）：
+升级到含结构化事件日志的版本后，逐项确认（全程不外发日志原文）。先固定两个路径变量：
 
-1. **双日志就位**：`~/Library/Logs/SurgeConf/surgeconf.log`（结构化事件，0600，目录 0700）与 `surgeconf-console.log`（launchd/nohup 的 stdout/stderr）同时存在且内容不同；`surgeconf.log` 只有 `ts=… event=… schema_version=1` 形式的单行记录。
-2. **启动事件序列**：重启服务后事件日志出现 `database_ready` → `orphan_cleanup` → `scheduler_active`（或 `scheduler_standby`，多实例同数据目录时）。
-3. **同步事件**：手动或自动同步一次后出现 `subscription_sync`；失败场景 `success=false error_code=<五码之一>`，且日志中**检索不到**任何 URL、节点行、password/token 字样。
-4. **无秘密回归**：`grep -E "://|password|token" ~/Library/Logs/SurgeConf/surgeconf.log` 无输出（事件字段 allowlist 从入口拒绝）。
-5. **plist 指向**：`plutil -p ~/Library/LaunchAgents/com.surgeconf.plist | grep -i standard` 两个路径均以 `surgeconf-console.log` 结尾（绝不指向 `surgeconf.log`）。
-6. **人工验收**：按 `docs/RUNTIME_OPERATIONS.md` 第 8 节在真实设备执行（两 Mac `surge-cli --check`、iOS 静态检查后导入、实时视频、AI 命中）——本文不宣称物理验收通过。
+```bash
+EVENT_LOG="$HOME/Library/Logs/SurgeConf/surgeconf.log"
+CONSOLE_LOG="$HOME/Library/Logs/SurgeConf/surgeconf-console.log"
+```
+
+1. **双日志就位**：`"$EVENT_LOG"`（结构化事件，0600，目录 0700）与 `"$CONSOLE_LOG"`（launchd/nohup 的 stdout/stderr）同时存在且内容不同；`"$EVENT_LOG"` 只有 `ts=… event=… schema_version=1` 形式的单行记录。
+2. **启动事件序列**（查 `"$EVENT_LOG"`）：重启服务后出现 `database_ready` → `orphan_cleanup` → `scheduler_active`（或 `scheduler_standby`，意外双进程时）。
+3. **同步事件**（查 `"$EVENT_LOG"`）：手动或自动同步一次后出现 `subscription_sync`；失败场景 `success=false error_code=<五码之一>`。
+4. **console 侧启动输出**（查 `"$CONSOLE_LOG"`）：能看到 `[启动] 数据库就绪`；再次重启（幂等）时 `[数据迁移]` 各行计数为 0 或不再出现新变更项。
+5. **无秘密回归**（只输出 PASS/FAIL 与计数，绝不打印匹配行）：
+   ```bash
+   COUNT=$(grep -Ec '://|password|token' "$EVENT_LOG" || true)
+   if [ "$COUNT" = "0" ]; then echo "PASS: 事件日志无秘密模式命中";    else echo "FAIL: 事件日志命中 $COUNT 行（请勿粘贴内容，按第 7 节纪律采集 event/error_code）"; fi
+   ```
+   （`grep -c` 零匹配退出码为 1，`|| true` 保证脚本继续。）
+6. **plist 指向**：`plutil -p ~/Library/LaunchAgents/com.surgeconf.plist | grep -i standard` 两个路径均以 `surgeconf-console.log` 结尾（绝不指向 `surgeconf.log`）。
+7. **人工验收**：按 `docs/RUNTIME_OPERATIONS.md` 第 8 节在真实设备执行（两 Mac `surge-cli --check`、iOS 静态检查后导入、实时视频、AI 命中）——本文不宣称物理验收通过。
 
 ## 静默升级操作（其他设备）
 

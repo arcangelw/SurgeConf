@@ -124,18 +124,21 @@ async def lifespan(app: FastAPI):
     from app.logging_config import (configure_event_logging, log_event,
                                     shutdown_event_logging)
     configure_event_logging(paths.log_file)
-    # 顺序：safe ensure → 配置事件日志 → harden(既有产物) → 迁移 →
-    # harden(新产物) → bind
-    from app.runtime_paths import harden_runtime_permissions
-    harden_runtime_permissions(paths)
 
-    # bind 成功后的一切（维护、调度器、服务、关闭日志）都在同一清理
-    # 边界内：迁移/绑定/维护/启动任一步骤失败或取消，以及 yield 返回，
-    # 都先停调度器（如有实例）再无条件释放数据库连接、最后关闭事件
-    # 日志 handler（FD），不留锁、不留循环任务、不留打开的日志文件
+    # configure 成功后的一切（首次 harden、迁移、绑定、维护、调度器、
+    # yield、清理）都在同一外层异常/清理边界内。清理顺序固定：
+    # scheduler stop → database dispose → logging shutdown，每步独立
+    # try——前一步抛错也继续执行后续步骤；清理异常绝不遮蔽正在传播
+    # 的原始启动/请求异常（只打到 stderr），无原始异常时传播首个
+    # 清理异常。
+    from app.runtime_paths import harden_runtime_permissions
     scheduler = None
+    cleanup_errors: list[BaseException] = []
     try:
         try:
+            # 首次 harden（既有产物收敛）也在边界内：失败同样走
+            # startup_failed + 完整清理
+            harden_runtime_permissions(paths)
             # 延迟导入：database_migration 顶层依赖本模块的 seed_defaults
             from app.services.database_migration import prepare_database
             result = await prepare_database(
@@ -170,18 +173,36 @@ async def lifespan(app: FastAPI):
                 log_event("scheduler_standby")
                 print("[启动] 检测到另一实例正在运行，本实例调度器进入 standby", file=sys.stderr)
         except BaseException:
-            # 启动阶段（迁移/绑定/维护/调度器）失败：只记固定错误码，
-            # 绝不携带异常消息/类型名，随后交由 finally 收敛
+            # 启动阶段（harden/迁移/绑定/维护/调度器）失败：只记固定
+            # 错误码，绝不携带异常消息/类型名，随后交由清理边界收敛
             log_event("startup_failed", error_code="internal_error")
             raise
         yield
         log_event("service_shutdown")
+    except BaseException:
+        # 原始启动/请求期异常正在传播：清理步骤的异常（若有，稍后由
+        # finally 收集）不遮蔽它
+        raise
     finally:
-        # 收敛顺序固定：先停调度器（等待在途同步轮次退出并释放锁；
-        # start 中途失败时 fd 已被其内部清理，stop 幂等），再释放
-        # 数据库连接，最后关闭事件日志 handler（FD；幂等，启动失败
-        # 路径同样到达这里）
-        if scheduler is not None:
-            await scheduler.stop()
-        await database.dispose()
-        shutdown_event_logging()
+        # 嵌套清理：stop 抛错也继续 dispose，dispose 抛错也继续
+        # logging shutdown（handler/FD 最终必然关闭）
+        try:
+            if scheduler is not None:
+                await scheduler.stop()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            await database.dispose()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            shutdown_event_logging()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors and sys.exc_info()[0] is not None:
+            # 原始异常正在传播：清理异常只提示，绝不遮蔽
+            print(f"[关闭] {len(cleanup_errors)} 个清理步骤异常（已忽略，"
+                  f"不遮蔽原始错误）", file=sys.stderr)
+    if cleanup_errors:
+        # 无原始异常（正常 yield 返回）：传播首个清理异常
+        raise cleanup_errors[0]

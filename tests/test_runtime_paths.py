@@ -267,3 +267,30 @@ def test_refresh_fails_closed_after_directory_replacement(tmp_path, monkeypatch)
     paths2 = resolve_runtime_paths(home=tmp_path / "home")
     with pytest.raises(RuntimeError):
         refresh_runtime_permissions(paths2)
+
+
+def test_harden_converges_log_artifacts_incl_lock_and_backups(tmp_path, monkeypatch):
+    """log_dir 下的事件日志、轮转 lock、console 回退与轮转备份统一 0600。"""
+    import os
+    paths = _make_paths(tmp_path, monkeypatch)
+    paths.log_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("surgeconf.log", "surgeconf.log.lock",
+                 "surgeconf-console.log", "surgeconf.log.1", "surgeconf.log.2"):
+        (paths.log_dir / name).write_bytes(b"log")
+        os.chmod(paths.log_dir / name, 0o644)
+    os.chmod(paths.log_dir, 0o755)
+
+    harden_runtime_permissions(paths)
+
+    assert paths.log_dir.stat().st_mode & 0o777 == 0o700
+    for name in ("surgeconf.log", "surgeconf.log.lock",
+                 "surgeconf-console.log", "surgeconf.log.1", "surgeconf.log.2"):
+        assert (paths.log_dir / name).stat().st_mode & 0o777 == 0o600
+
+
+def test_harden_rejects_unexpected_entry_in_log_dir(tmp_path, monkeypatch):
+    paths = _make_paths(tmp_path, monkeypatch)
+    paths.log_dir.mkdir(parents=True, exist_ok=True)
+    (paths.log_dir / "weird").symlink_to(paths.root / "surge_conf.db")
+    with pytest.raises(RuntimeError, match="unexpected entry type"):
+        harden_runtime_permissions(paths)

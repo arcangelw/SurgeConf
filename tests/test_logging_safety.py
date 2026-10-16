@@ -224,9 +224,13 @@ class TestConfigureAndRotation:
         assert len(logger.handlers) == 1
 
     def test_directory_0700_and_file_0600(self, event_log):
+        log_event("database_ready", counts={"applied_migrations": 0})
         assert stat_mod.S_IMODE(
             os.stat(event_log.parent).st_mode) == 0o700
         assert stat_mod.S_IMODE(os.stat(event_log).st_mode) == 0o600
+        # 跨进程轮转锁文件同样 0600 普通文件
+        lock = event_log.parent / "surgeconf.log.lock"
+        assert stat_mod.S_IMODE(os.stat(lock).st_mode) == 0o600
 
     def test_symlink_log_file_rejected(self, tmp_path):
         root = tmp_path.resolve()
@@ -261,7 +265,9 @@ class TestConfigureAndRotation:
                 log_event("subscription_sync", subscription_id=i + 1,
                           success=True,
                           counts={"node_count": 5, "inserted": 1})
-            backups = sorted(path.parent.glob("surgeconf.log.*"))
+            backups = sorted(
+                p for p in path.parent.glob("surgeconf.log.*")
+                if p.name.rsplit(".", 1)[-1].isdigit())
             assert [b.name for b in backups] == [
                 "surgeconf.log.1", "surgeconf.log.2", "surgeconf.log.3"]
             for f in [path, *backups]:
@@ -272,16 +278,42 @@ class TestConfigureAndRotation:
         finally:
             shutdown_event_logging()
 
-    def test_shutdown_closes_file_descriptors(self, event_log):
+    def test_shutdown_and_fd_hygiene(self, event_log):
+        """新模型无跨 emit 常驻 stream：每次写入的 fd 即开即关，
+        shutdown/close 后不再写。用 /dev/fd 计数证明无 FD 泄漏。"""
         logger = logging.getLogger(EVENT_LOGGER_NAME)
         handler = logger.handlers[0]
-        fd = handler.stream.fileno()
-        os.fstat(fd)  # 关闭前有效
+        log_event("database_ready", counts={"applied_migrations": 0})
+
+        def _fd_count() -> int:
+            return len(os.listdir("/dev/fd"))
+
+        before = _fd_count()
+        for i in range(5):
+            log_event("subscription_sync", subscription_id=i + 1,
+                      success=True, counts={"inserted": 1})
+        assert _fd_count() == before  # 无 FD 泄漏（每轮 lock/base fd 已关）
+
         shutdown_event_logging()
-        with pytest.raises(OSError):
-            os.fstat(fd)
         assert logger.handlers == []
+        assert handler._closed is True
+        size = event_log.stat().st_size
+        log_event("scheduler_active")  # handler 已摘除，不落盘
+        assert event_log.stat().st_size == size
         shutdown_event_logging()  # 幂等
+
+    def test_base_replaced_by_symlink_between_emits_fails_closed(
+            self, event_log, capsys):
+        """emit 之间 base 被替换为 symlink：后续写入 fail closed，
+        绝不跟随 symlink 写入目标文件。"""
+        log_event("database_ready", counts={"applied_migrations": 0})
+        event_log.unlink()
+        decoy = event_log.parent / "decoy.log"
+        decoy.write_text("sentinel")
+        event_log.symlink_to(decoy)
+        log_event("scheduler_active")  # O_NOFOLLOW 拒绝 → 吞进 handleError
+        assert decoy.read_text() == "sentinel"  # 未写入 symlink 目标
+        assert not event_log.exists() or event_log.is_symlink()
 
 
 # ===== lifespan 收敛 =====
@@ -314,3 +346,173 @@ async def test_lifespan_startup_failure_shuts_down_logging(
     assert "event=startup_failed" in content
     assert "error_code=internal_error" in content
     assert "迁移失败" not in content
+
+
+# ===== 双进程真实轮转竞争（Fix Round 1）=====
+
+_WRITER_SOURCE = '''
+import sys
+sys.path.insert(0, {repo!r})
+from app.logging_config import configure_event_logging, log_event
+log_file, max_bytes, count, base_id = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
+configure_event_logging(log_file, max_bytes=max_bytes, backup_count=3)
+for i in range(count):
+    log_event("subscription_sync", subscription_id=base_id + i,
+              success=True, counts={{"node_count": 5}})
+'''
+
+
+def test_multiprocess_rotation_no_loss_no_duplication(tmp_path):
+    """两个真实进程并发写同一事件日志并跨阈值多轮轮转。
+
+    总数据量 ≤ base + 3 备份容量：全部唯一事件应恰出现一次，
+    无丢失/重复/半行；备份 ≤ 3；全部文件 0600。"""
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+    repo = str(_Path(__file__).resolve().parent.parent)
+    root = tmp_path.resolve()
+    path = root / "logs" / "surgeconf.log"
+    # 预建日志目录（消除两子进程并发首建目录的竞争；轮转竞争仍真实）
+    configure_event_logging(path, max_bytes=2500, backup_count=3)
+    shutdown_event_logging()
+    writer = root / "writer.py"
+    writer.write_text(_WRITER_SOURCE.format(repo=repo))
+    py = str(_Path(repo) / "venv/bin/python")
+    max_bytes, count = 2500, 40  # 80 行 ≈ 8.6KB ≤ 4×2500 容量
+    procs = [
+        subprocess.Popen([py, str(writer), str(path),
+                          str(max_bytes), str(count), "1"]),
+        subprocess.Popen([py, str(writer), str(path),
+                          str(max_bytes), str(count), "1001"]),
+    ]
+    for proc in procs:
+        assert proc.wait(timeout=90) == 0
+    backups = sorted(p for p in path.parent.glob("surgeconf.log.*")
+                     if p.name.rsplit(".", 1)[-1].isdigit())
+    assert 1 <= len(backups) <= 3
+    files = [path, *backups]
+    lines = []
+    for f in files:
+        content = f.read_text()
+        assert content.endswith("\n")  # 无截断半行
+        lines.extend(ln for ln in content.splitlines() if ln.strip())
+    ids = sorted(int(ln.split("subscription_id=", 1)[1].split(" ", 1)[0])
+                 for ln in lines if "subscription_id=" in ln)
+    assert ids == list(range(1, 41)) + list(range(1001, 1041))  # 恰一次
+    assert all(ln.startswith("ts=") and ln.endswith("schema_version=1")
+               for ln in lines)
+    for f in files + [path.parent / "surgeconf.log.lock"]:
+        assert stat_mod.S_IMODE(os.stat(f).st_mode) == 0o600
+
+
+def _lifespan_env(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(root / "data"))
+    monkeypatch.setenv("HOME", str(root / "home"))
+    return root / "home" / "Library" / "Logs" / "SurgeConf" / "surgeconf.log"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_harden_failure_full_cleanup(tmp_path, monkeypatch):
+    """首次 harden 在边界内失败：startup_failed 落盘、原始异常传播、
+    dispose 与 logging shutdown 仍执行（handler 无残留）。"""
+    log_path = _lifespan_env(tmp_path, monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("harden 失败（静态测试文本）")
+
+    monkeypatch.setattr("app.runtime_paths.harden_runtime_permissions", _boom)
+    from app import main as main_module
+    with pytest.raises(RuntimeError):
+        async with main_module.app.router.lifespan_context(main_module.app):
+            pass
+    assert logging.getLogger(EVENT_LOGGER_NAME).handlers == []
+    content = log_path.read_text()
+    assert "event=startup_failed" in content
+    assert "harden 失败" not in content
+
+
+@pytest.mark.asyncio
+async def test_lifespan_stop_failure_propagates_first_and_shutdown_runs(
+        tmp_path, monkeypatch):
+    """正常服务后 stop 抛错：无原始异常时传播首个清理异常，
+    logging shutdown 仍执行。"""
+    log_path = _lifespan_env(tmp_path, monkeypatch)
+
+    async def _boom_stop(self):
+        raise RuntimeError("stop 失败（静态测试文本）")
+
+    monkeypatch.setattr(
+        "app.services.subscription_scheduler.SubscriptionScheduler.stop",
+        _boom_stop)
+    from app import main as main_module
+    with pytest.raises(RuntimeError, match="stop 失败"):
+        async with main_module.app.router.lifespan_context(main_module.app):
+            pass
+    assert logging.getLogger(EVENT_LOGGER_NAME).handlers == []
+    assert "event=service_shutdown" in log_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_dispose_failure_still_shuts_down_logging(
+        tmp_path, monkeypatch):
+    log_path = _lifespan_env(tmp_path, monkeypatch)
+
+    async def _boom_dispose():
+        raise RuntimeError("dispose 失败（静态测试文本）")
+
+    from app.database import database as database_singleton
+    monkeypatch.setattr(database_singleton, "dispose", _boom_dispose)
+    from app import main as main_module
+    with pytest.raises(RuntimeError, match="dispose 失败"):
+        async with main_module.app.router.lifespan_context(main_module.app):
+            pass
+    assert logging.getLogger(EVENT_LOGGER_NAME).handlers == []
+    assert "event=service_shutdown" in log_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_combined_cleanup_failures_first_wins(
+        tmp_path, monkeypatch):
+    """stop 与 dispose 双失败：无原始异常时传播首个（stop），
+    logging shutdown 仍执行。"""
+    log_path = _lifespan_env(tmp_path, monkeypatch)
+
+    async def _boom_stop(self):
+        raise RuntimeError("stop 失败（静态测试文本）")
+
+    async def _boom_dispose():
+        raise RuntimeError("dispose 失败（静态测试文本）")
+
+    monkeypatch.setattr(
+        "app.services.subscription_scheduler.SubscriptionScheduler.stop",
+        _boom_stop)
+    from app.database import database as database_singleton
+    monkeypatch.setattr(database_singleton, "dispose", _boom_dispose)
+    from app import main as main_module
+    with pytest.raises(RuntimeError, match="stop 失败"):
+        async with main_module.app.router.lifespan_context(main_module.app):
+            pass
+    assert logging.getLogger(EVENT_LOGGER_NAME).handlers == []
+    assert "event=service_shutdown" in log_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_request_error_not_masked_by_cleanup_failure(
+        tmp_path, monkeypatch):
+    """yield 期原始异常 + stop 失败：传播的是原始请求异常（不遮蔽）。"""
+    _lifespan_env(tmp_path, monkeypatch)
+
+    async def _boom_stop(self):
+        raise RuntimeError("stop 失败（静态测试文本）")
+
+    monkeypatch.setattr(
+        "app.services.subscription_scheduler.SubscriptionScheduler.stop",
+        _boom_stop)
+    from app import main as main_module
+    with pytest.raises(ValueError, match="请求期错误"):
+        async with main_module.app.router.lifespan_context(main_module.app):
+            raise ValueError("请求期错误（静态测试文本）")
+    assert logging.getLogger(EVENT_LOGGER_NAME).handlers == []

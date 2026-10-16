@@ -6,28 +6,35 @@
 
 ## 1. 实例启动与停止
 
-### 工作实例（本机）
+### 工作电脑 / 家庭网关（分别在各自物理 Mac 执行）
+
+标准脚本在每台 Mac 上只管理**一个**固定 launchd 实例（默认数据目录
+与端口）。工作电脑与家庭网关是两台不同的物理 Mac，各自克隆仓库并
+执行同样的安装命令：
 
 ```bash
-cd /path/to/SurgeConf
-./start.sh              # 前台（开发模式，stdout 直接进终端）
+cd /path/to/SurgeConf          # 每台 Mac 各自的仓库副本
+./surgeconf.sh start           # launchd 守护（首次安装并启动）
+./surgeconf.sh stop            # 停止（unload launchd）
+./surgeconf.sh restart         # 重新生成 plist 并重启
+./surgeconf.sh status          # 精确 label 查询运行状态
+```
+
+**同一台 Mac 上同时安装两个 launchd 实例不受支持**（标准脚本固定
+Label/数据目录/端口，第二个 `enable` 会覆盖第一个的 plist）。
+
+调度器为进程级互斥（`scheduler.lock` flock）：这是对意外双进程的
+保护——同一数据目录上第二个进程进入 standby 只服务不循环，绝不
+产生两条自动更新循环。
+
+开发调试可临时前台/守护运行（不注册 launchd，与 launchd 实例互斥于
+调度锁）：
+
+```bash
+./start.sh              # 前台（stdout 直接进终端）
 ./start.sh --daemon     # nohup 守护：stdout/stderr 写 console 回退日志
-./surgeconf.sh start    # launchd 守护（推荐）
-./surgeconf.sh stop     # 停止（unload launchd）
-./surgeconf.sh restart  # 重新生成 plist 并重启
-./surgeconf.sh status   # 精确 label 查询运行状态
+./surgeconf.sh run      # 前台运行（读取控制文件配置）
 ```
-
-### 网关实例（独立数据目录/端口）
-
-每个实例使用独立的数据目录与端口，互不共享数据库与调度锁：
-
-```bash
-SURGECONF_DATA_DIR="$HOME/Library/Application Support/SurgeConf-Gateway" \
-SURGE_PORT=61831 ./surgeconf.sh enable
-```
-
-调度器为进程级互斥（`scheduler.lock` flock）：同一数据目录只会有一个实例运行自动更新循环，第二个实例进入 standby 只服务不循环；**不同**数据目录的两个实例各自持锁、各自调度。
 
 ## 2. 数据、备份、导出与日志
 
@@ -74,9 +81,19 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
   ```bash
   /Applications/Surge.app/Contents/Applications/surge-cli reload
   ```
-- **远程/自动化**：HTTP API `POST /v1/profiles/reload`（需在目标实例配置 `external-controller-access`，占位形如 `example-password@127.0.0.1:9090`）。
+- **远程/自动化**：HTTP API `POST /v1/profiles/reload`。该端点由
+  `[General]` 的 `http-api` 启用（占位形如 `http-api = <key>@127.0.0.1:6171`），
+  请求带 `X-Key: <key>` 头认证。注意 `external-controller-access` **不会**
+  启用 HTTP API 端点（两者是独立配置）：
+  ```bash
+  read -sr SURGE_HTTP_KEY          # 手动输入 key（不回显、不进 shell 历史）
+  curl -sS -X POST -H "X-Key: $SURGE_HTTP_KEY" \
+    http://127.0.0.1:6171/v1/profiles/reload
+  unset SURGE_HTTP_KEY             # 用完即清
+  ```
+  禁止把真实 key 写进命令行参数、URL query、脚本或粘贴到任何工单。
 
-官方文档：[HTTP API](https://manual.nssurge.com/others/http-api.html)、[Surge CLI](https://manual.nssurge.com/tools/cli.html)。
+官方文档：[HTTP API](https://manual.nssurge.com/tools/http-api.html)、[Surge CLI](https://manual.nssurge.com/tools/cli.html)。
 
 ## 4. Logbook 查看 reload / DHCP / 网络事件
 

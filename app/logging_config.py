@@ -16,10 +16,11 @@
   无多行值、无异常消息或类型名。
 """
 
+import fcntl
 import logging
 import os
+import stat as stat_mod
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from app.profile_targets import ProfileTarget
@@ -171,31 +172,107 @@ def log_event(event: str, **fields) -> None:
     logger.info(_render_line(event, fields))
 
 
-class PrivateRotatingFileHandler(RotatingFileHandler):
-    """0600 私有轮转文件 handler。
+class PrivateRotatingFileHandler(logging.Handler):
+    """多进程安全的 0600 私有轮转事件日志 handler。
 
-    打开前对已存在目标 ``lstat`` 校验（symlink/FIFO/socket/目录一律
-    fail closed）；每次 ``_open``（含 rollover 后重开主文件）对真实
-    fd ``fchmod 0600``。轮转通过 rename 保备份文件的原 inode 权限，
-    备份文件因此维持首次创建时的 0600。
+    每次写入的完整临界区由日志旁的专用 lock 文件 ``flock`` 保护：
+    ``检查/轮转/打开/写入/flush`` 全部在锁内完成——任何时刻写入的
+    fd 都是对 base 路径的**新鲜**安全打开（``O_NOFOLLOW|O_APPEND|
+    O_CREAT|O_CLOEXEC`` + ``fstat`` 普通文件校验 + ``fchmod 0600``，
+    ``O_NONBLOCK`` 防 FIFO 阻塞），不存在跨 emit 的陈旧 stream，
+    彻底消除旧 inode 写入（轮转 rename 后旧 fd 继续写的问题）。
+
+    轮转链（备份 ``backupCount`` 个，rename 保留 inode 权限）与
+    重开同样在锁内。lock 文件本身 0600，由 ``harden_runtime_
+    permissions`` 一并收敛。跨进程行原子性：``O_APPEND`` 单次
+    ``write`` 原子定位，行级不交叉。
     """
 
     def __init__(self, filename, *, maxBytes: int = DEFAULT_MAX_BYTES,
                  backupCount: int = DEFAULT_BACKUP_COUNT):
-        path = Path(filename)
-        assert_regular_file(path)  # 存在时：非 symlink 的普通文件
-        super().__init__(path, mode="a", maxBytes=maxBytes,
-                         backupCount=backupCount, encoding="utf-8",
-                         delay=False)
+        super().__init__()
+        self.baseFilename = os.path.abspath(filename)
+        self._base = Path(filename)
+        self._lock_path = Path(f"{filename}.lock")
+        self._max_bytes = maxBytes
+        self._backup_count = backupCount
+        self._closed = False
 
-    def _open(self):
-        stream = super()._open()
+    # ---- 安全原语 ----
+
+    @staticmethod
+    def _safe_open_append(path: Path) -> int:
+        """原子 no-follow 追加打开：symlink/FIFO/非普通文件 fail closed。"""
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC
+                 | os.O_NONBLOCK)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
         try:
-            os.fchmod(stream.fileno(), 0o600)
+            st = os.fstat(fd)
+            if not stat_mod.S_ISREG(st.st_mode):
+                raise RuntimeError(
+                    f"event log path is not a regular file: {path}")
+            os.fchmod(fd, 0o600)
         except BaseException:
-            stream.close()
+            os.close(fd)
             raise
-        return stream
+        return fd
+
+    # ---- 轮转（flock 临界区内调用）----
+
+    def _should_rollover(self, incoming: int) -> bool:
+        if self._max_bytes <= 0:
+            return False
+        try:
+            st = os.lstat(self._base)
+        except FileNotFoundError:
+            return False
+        return (stat_mod.S_ISREG(st.st_mode)
+                and st.st_size + incoming >= self._max_bytes)
+
+    def _do_rollover(self) -> None:
+        if self._backup_count > 0:
+            for index in range(self._backup_count - 1, 0, -1):
+                source = Path(f"{self._base}.{index}")
+                target = Path(f"{self._base}.{index + 1}")
+                if os.path.lexists(source):
+                    os.replace(source, target)
+            os.replace(self._base, Path(f"{self._base}.1"))
+        elif os.path.lexists(self._base):
+            os.remove(self._base)
+
+    # ---- 写入 ----
+
+    def append(self, line: str) -> None:
+        """锁内完成 检查→轮转→安全打开→写入→flush（进程间安全）。"""
+        data = (line + "\n").encode("utf-8")
+        lock_fd = self._safe_open_append(self._lock_path)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                if self._should_rollover(len(data)):
+                    self._do_rollover()
+                fd = self._safe_open_append(self._base)
+                with os.fdopen(fd, "ab") as stream:
+                    stream.write(data)
+                    stream.flush()
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._closed:
+            return
+        try:
+            self.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        self._closed = True
+        super().close()
 
 
 def configure_event_logging(log_file, *,
@@ -219,6 +296,9 @@ def configure_event_logging(log_file, *,
                 "event logging already configured for a different file")
     _ensure_directory_safe(log_file.parent)
     _converge_managed_directory(log_file.parent)
+    # 预校验（存在时）：base/lock 为非 symlink 的普通文件才允许配置
+    assert_regular_file(log_file)
+    assert_regular_file(Path(f"{log_file}.lock"))
     handler = PrivateRotatingFileHandler(log_file, maxBytes=max_bytes,
                                          backupCount=backup_count)
     handler.setFormatter(logging.Formatter("%(message)s"))
