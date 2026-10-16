@@ -495,12 +495,36 @@ async def test_new_profile_defaults_follow_instance_role(client):
 
 @pytest.mark.asyncio
 async def test_new_profile_omitted_target_uses_default_role(client):
-    """角色从未设置（缺 SystemConfig 行）时收敛到默认角色 home_gateway → mac_gateway"""
+    """角色从未设置（缺 SystemConfig 行）时收敛到默认角色 work_computer → mac_workstation"""
     created = await client.post("/api/configs/profiles", json={"name": "未设置角色"})
     assert created.status_code == 200, created.text
     profile = await _detail(client, created.json()["id"])
-    assert profile["target"] == "mac_gateway"
+    assert profile["target"] == "mac_workstation"
     assert profile["udp_security_mode"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_session_reports_default_role_when_missing(client):
+    """设置读取路径（load_access_settings）缺失 installation_role 行：
+    /api/auth/session 回显收敛后的默认角色 work_computer（README 默认工作电脑）"""
+    resp = await client.get("/api/auth/session")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["installation_role"] == "work_computer"
+
+
+@pytest.mark.asyncio
+async def test_session_reports_default_role_when_db_value_invalid(client):
+    """设置读取路径（load_access_settings）库内非法角色行（绕过 API 写入）：
+    /api/auth/session 回显回落默认角色 work_computer，绝不透传非法值"""
+    from app.models import SystemConfig
+
+    async with client._test_factory() as db:
+        db.add(SystemConfig(key="installation_role", value="linux_toaster"))
+        await db.commit()
+
+    resp = await client.get("/api/auth/session")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["installation_role"] == "work_computer"
 
 
 @pytest.mark.asyncio
@@ -601,7 +625,7 @@ async def test_create_role_resolution_reuses_request_session(client, monkeypatch
 @pytest.mark.asyncio
 async def test_create_role_falls_back_when_db_value_invalid(client):
     """库内非法角色行（绕过 API 写入）按 DEFAULT_INSTALLATION_ROLE 回落：
-    linux_toaster → home_gateway → mac_gateway"""
+    linux_toaster → work_computer → mac_workstation"""
     from app.models import SystemConfig
 
     async with client._test_factory() as db:
@@ -611,7 +635,7 @@ async def test_create_role_falls_back_when_db_value_invalid(client):
     created = await client.post("/api/configs/profiles", json={"name": "非法角色档"})
     assert created.status_code == 200, created.text
     profile = await _detail(client, created.json()["id"])
-    assert profile["target"] == "mac_gateway"
+    assert profile["target"] == "mac_workstation"
 
 
 @pytest.mark.asyncio

@@ -39,7 +39,7 @@ def default_target_for_role(role: str) -> ProfileTarget:
     上游 load_access_settings 已把库中非法角色收敛为默认角色，此处的
     回落仅作防御（不该被触达）。
     """
-    return DEFAULT_TARGET_BY_ROLE.get(role, ProfileTarget.MAC_GATEWAY)
+    return DEFAULT_TARGET_BY_ROLE.get(role, ProfileTarget.MAC_WORKSTATION)
 
 
 def validate_target_mode(target: ProfileTarget, mode: UdpSecurityMode) -> None:

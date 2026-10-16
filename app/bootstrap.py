@@ -49,8 +49,8 @@ async def seed_defaults(session_factory) -> None:
                 db.add(RuleSource(**rs))
 
             # 新建默认档案按 DEFAULT_INSTALLATION_ROLE + 中央 role→target 映射
-            # 显式写 target/mode（默认 home_gateway → mac_gateway/scoped），与
-            # 0003 迁移的旧档 server_default（mac_workstation/scoped）路径分离
+            # 显式写 target/mode（默认 work_computer → mac_workstation/scoped，
+            # 与 0003 迁移旧档 server_default 同值但代码路径独立）
             seed_target = default_target_for_role(DEFAULT_INSTALLATION_ROLE)
             db.add(ConfigProfile(
                 name="默认配置",

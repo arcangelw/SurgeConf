@@ -54,7 +54,7 @@ def test_default_udp_mode_by_target():
 @pytest.mark.asyncio
 async def test_fresh_seed_default_profile_carries_role_target():
     """全新空库 seed_defaults：默认档案按 DEFAULT_INSTALLATION_ROLE + 中央映射
-    显式写 target/mode（home_gateway → mac_gateway/scoped），与列默认无关"""
+    显式写 target/mode（work_computer → mac_workstation/scoped），与列默认无关"""
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from app.bootstrap import seed_defaults
@@ -78,9 +78,9 @@ async def test_fresh_seed_default_profile_carries_role_target():
 
     expected_target = default_target_for_role(DEFAULT_INSTALLATION_ROLE)
     assert rows == [(expected_target.value, default_udp_mode(expected_target).value)]
-    # 防漂移锁：默认角色 home_gateway → mac_gateway/scoped（0003 旧档迁移
-    # 仍为 mac_workstation/scoped，两者路径分离，见上方迁移用例）
-    assert (DEFAULT_INSTALLATION_ROLE, rows[0]) == ("home_gateway", ("mac_gateway", "scoped"))
+    # 防漂移锁：默认角色 work_computer → mac_workstation/scoped（设计/README
+    # 默认工作电脑；0003 旧档迁移 server_default 同值但路径独立，见上方迁移用例）
+    assert (DEFAULT_INSTALLATION_ROLE, rows[0]) == ("work_computer", ("mac_workstation", "scoped"))
 
 
 # ===== 迁移：合成旧 schema 副本 =====
