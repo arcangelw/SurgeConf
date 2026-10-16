@@ -239,6 +239,17 @@ function renderGeneralForm(profileId) {
   }).join("");
 }
 
+/** 强制安全字段（服务端 metadata forced === true）：控件禁用 + 锁定徽标 */
+function forcedAttrs(f) {
+  return f.forced === true ? ' disabled data-forced="1"' : "";
+}
+
+function forcedBadge(f) {
+  return f.forced === true
+    ? ` <span class="badge badge-warning">${I18N["general.forced_badge"]}</span>`
+    : "";
+}
+
 function renderField(f, profileId) {
   const id = `field-${profileId}-${f.key}`;
   const hintText = hint(f) ? `<p class="gen-hint">${hint(f)}</p>` : "";
@@ -247,9 +258,9 @@ function renderField(f, profileId) {
     const inlineHint = hint(f) ? ` <span class="gen-label-hint">${hint(f)}</span>` : "";
     return `
     <div class="gen-field gen-field-bool">
-      <label class="gen-label" for="${id}">${label(f)}${inlineHint}</label>
+      <label class="gen-label" for="${id}">${label(f)}${inlineHint}${forcedBadge(f)}</label>
       <label class="toggle-wrap" title="${hint(f) || ""}">
-        <input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool">
+        <input type="checkbox" id="${id}" data-key="${f.key}" data-type="bool"${forcedAttrs(f)}>
         <span class="toggle-slider"></span>
       </label>
     </div>`;
@@ -261,8 +272,8 @@ function renderField(f, profileId) {
     ).join("");
     return `
     <div class="gen-field">
-      <label class="gen-label" for="${id}">${label(f)}</label>
-      <select id="${id}" data-key="${f.key}" data-type="select">${opts}</select>
+      <label class="gen-label" for="${id}">${label(f)}${forcedBadge(f)}</label>
+      <select id="${id}" data-key="${f.key}" data-type="select"${forcedAttrs(f)}>${opts}</select>
       ${hintText}
     </div>`;
   }
@@ -270,9 +281,9 @@ function renderField(f, profileId) {
   if (f.type === "tags") {
     return `
     <div class="gen-field gen-field-wide">
-      <label class="gen-label" for="${id}">${label(f)}</label>
+      <label class="gen-label" for="${id}">${label(f)}${forcedBadge(f)}</label>
       <div class="tags-input-wrap">
-        <textarea id="${id}" data-key="${f.key}" data-type="tags" rows="2"
+        <textarea id="${id}" data-key="${f.key}" data-type="tags" rows="2"${forcedAttrs(f)}
           placeholder="${hint(f) || I18N["general.tags_placeholder"]}"></textarea>
       </div>
       ${hintText}
@@ -282,8 +293,8 @@ function renderField(f, profileId) {
   if (f.type === "int") {
     return `
     <div class="gen-field">
-      <label class="gen-label" for="${id}">${label(f)}</label>
-      <input type="number" id="${id}" data-key="${f.key}" data-type="int">
+      <label class="gen-label" for="${id}">${label(f)}${forcedBadge(f)}</label>
+      <input type="number" id="${id}" data-key="${f.key}" data-type="int"${forcedAttrs(f)}>
       ${hintText}
     </div>`;
   }
@@ -291,8 +302,8 @@ function renderField(f, profileId) {
   // text
   return `
   <div class="gen-field${f.key.includes("url") || f.key.includes("skip") ? " gen-field-wide" : ""}">
-    <label class="gen-label" for="${id}">${label(f)}</label>
-    <input type="text" id="${id}" data-key="${f.key}" data-type="text">
+    <label class="gen-label" for="${id}">${label(f)}${forcedBadge(f)}</label>
+    <input type="text" id="${id}" data-key="${f.key}" data-type="text"${forcedAttrs(f)}>
     ${hintText}
   </div>`;
 }
@@ -349,8 +360,13 @@ function bool(v) {
 
 function collectGeneralValues(profileId) {
   const values = {};
+  // 服务端强制安全字段不收集：后端保存时无条件写入强制值；
+  // 依据 fieldMeta（服务端元数据）而非 DOM 属性判定，DOM 篡改也不会提交
+  const forcedKeys = new Set((fieldMeta || []).flatMap(g =>
+    g.fields.filter(f => f.forced === true).map(f => f.key)));
   document.querySelectorAll(`#tab-content-${profileId} [data-key]`).forEach(el => {
     const key = el.dataset.key;
+    if (forcedKeys.has(key)) return;
     const type = el.dataset.type;
 
     if (type === "bool") {
