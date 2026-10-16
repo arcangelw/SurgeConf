@@ -122,6 +122,31 @@ async def test_restore_replaces_live_and_rebinds_runtime(runtime_db, runtime_pat
 
 
 @pytest.mark.asyncio
+async def test_restore_oldest_backup_survives_pre_restore_prune(runtime_db):
+    """满额（10 份）时恢复最旧备份：pre_restore 发布触发 prune 不得删除
+    点名备份；恢复成功、目标数据生效，最终总数仍 <= 10。"""
+    oldest = await backups.create_backup("manual")
+    for _ in range(9):
+        await backups.create_backup("manual")
+    assert len(backups.list_backups()) == 10
+
+    async with runtime_db.session_factory() as db:
+        await db.execute(delete(SystemConfig).where(SystemConfig.key == "marker"))
+        db.add(SystemConfig(key="mutated_after_oldest", value="1"))
+        await db.commit()
+
+    await backups.restore_backup(oldest.name)
+
+    # 恢复成功即点名备份全程未被删除；目标数据（最旧备份时刻）生效
+    assert await _system_config(runtime_db, "marker") is not None
+    assert await _system_config(runtime_db, "mutated_after_oldest") is None
+    items = backups.list_backups()
+    names = [item.name for item in items]
+    assert oldest.name in names, "点名备份不得在 pre_restore prune 中丢失"
+    assert any(item.reason == "pre_restore" for item in items)
+    assert len(items) <= 10
+
+@pytest.mark.asyncio
 async def test_restore_failure_rebinds_original_live(runtime_db, runtime_paths, monkeypatch):
     info = await backups.create_backup("manual")
 

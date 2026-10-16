@@ -99,11 +99,13 @@ def _finalize_backup_file(tmp: Path) -> None:
         raise RuntimeError(f"备份完整性检查失败: {result[0]}")
 
 
-def backup_database(source: Path, paths: RuntimePaths, schema_tag: str) -> Path:
+def backup_database(source: Path, paths: RuntimePaths, schema_tag: str,
+                    protected: set[str] | frozenset[str] = frozenset()) -> Path:
     """一致性备份并原子发布到 ``paths.backups``，随后执行保留策略。
 
-    临时文件 → integrity_check → 0600 → ``os.replace``；失败不产生
-    半成品，也不影响既有备份。
+    ``protected`` 为本次 prune 不可删除的文件名集合（恢复流程保护
+    点名备份）。临时文件 → integrity_check → 0600 → ``os.replace``；
+    失败不产生半成品，也不影响既有备份。
     """
     ensure_runtime_directories(paths)
     target = unique_path(paths.backups,
@@ -117,18 +119,30 @@ def backup_database(source: Path, paths: RuntimePaths, schema_tag: str) -> Path:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    prune_backups(paths)
+    prune_backups(paths, protected=protected)
     return target
 
 
-def prune_backups(paths: RuntimePaths, keep: int = BACKUP_KEEP) -> None:
-    """按文件名时间序保留最近 ``keep`` 份，删除更早的备份。"""
+def prune_backups(paths: RuntimePaths, keep: int = BACKUP_KEEP,
+                  protected: set[str] | frozenset[str] = frozenset()) -> None:
+    """从最旧的未受保护项开始删除，直到总数 <= ``keep``。
+
+    受保护项（如恢复中点名的备份）跳过不删；若可删项不足则允许
+    暂时超量——恢复流程的正确性优先于硬上限。普通备份不传
+    ``protected``，保留策略不变。
+    """
     if not paths.backups.is_dir():
         return
     names = sorted(entry.name for entry in paths.backups.iterdir()
                    if entry.is_file() and _BACKUP_NAME_RE.match(entry.name))
-    for name in names[:-keep] if keep > 0 else names:
+    excess = len(names) - keep
+    for name in names:
+        if excess <= 0:
+            break
+        if name in protected:
+            continue
         (paths.backups / name).unlink(missing_ok=True)
+        excess -= 1
 
 
 # ===== 备份生命周期入口（管理端点消费） =====
@@ -200,7 +214,10 @@ async def restore_backup(name: str) -> None:
     if selected is None:
         raise LookupError(f"备份不存在: {name}")
 
-    safety = backup_database(paths.database, paths, "pre_restore")
+    # pre_restore 发布触发 prune：保护点名备份，否则满额时最旧的
+    # selected 恰好会被删除，恢复随即失败且点名备份永久丢失
+    safety = backup_database(paths.database, paths, "pre_restore",
+                             protected={selected.name})
     staging = staging_path(paths)
     try:
         # 必须先 await dispose：同步 dispose 无法可靠关闭 aiosqlite 线程连接
