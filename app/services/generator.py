@@ -13,6 +13,7 @@ from app.models import (
     CustomRule, HostMapping, SystemConfig,
 )
 from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
+from app.profile_targets import ProfileTarget, filter_general_for_target
 
 # 默认排除关键词（优先使用系统配置）
 DEFAULT_EXCLUSION_KEYWORDS = r"Remain|Expired|Expire|应急|官网|如需|套餐|去除|剩余|距离|Reset|重置|流量|Traffic|Used|已用|Today|今日|GB|Download|Upload|Speed"
@@ -170,6 +171,10 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
         general.update(profile.general)
     # skip-proxy：默认条目 + 旧残留 + 系统级自定义 + host 勾选域名，合并去重
     general["skip-proxy"] = ", ".join(_build_skip_proxy(profile, sys_config, host_mappings))
+    # 目标能力过滤：跳过 None/空字符串后，丢弃平台不支持键并强制安全值
+    profile_target = ProfileTarget(profile.target) if profile else ProfileTarget.MAC_WORKSTATION
+    general = filter_general_for_target(
+        profile_target, {k: v for k, v in general.items() if v is not None and v != ""})
 
     sections = [
         "# ============================================================",

@@ -566,3 +566,87 @@ async def test_full_config_subscription_prefix(db):
 
     config = await generate_surge_config(db)
     assert "(测试机场) HK-01" in config
+
+
+# ════════════════════════════════════════════
+# 五、General 段目标过滤（平台能力矩阵）
+# ════════════════════════════════════════════
+
+def _general_section(config: str) -> str:
+    start = config.index("[General]")
+    end = config.index("[Proxy]")
+    return config[start:end]
+
+
+async def _add_target_profile(db, name, target, udp_mode, general):
+    from app.models import ConfigProfile
+    profile = ConfigProfile(name=name, is_default=False, locale="zh",
+                            final_action="手动选择", general=general,
+                            target=target, udp_security_mode=udp_mode)
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+@pytest.mark.asyncio
+async def test_general_workstation_keeps_mac_keys_drops_ios(db):
+    """默认 workstation 档案：Mac 专属键保留，iOS/gateway 专属键被过滤"""
+    general = _general_section(await generate_surge_config(db))
+    assert "read-etc-hosts = true" in general
+    assert "use-local-host-item-for-proxy" in general
+    assert "compatibility-mode" not in general
+    assert "auto-suspend" not in general
+    assert "gateway-restricted-to-lan" not in general
+
+
+@pytest.mark.asyncio
+async def test_general_ios_profile_drops_mac_keys(db):
+    """iOS 档案：Mac 专属键全部剔除，强制 compatibility-mode=1 与 auto-suspend=true"""
+    profile = await _add_target_profile(
+        db, "iPhone 档", "ios_mobile", "compatible",
+        {"http-api": "synthetic-admin@127.0.0.1:6172",
+         "read-etc-hosts": True, "wifi-assist": True})
+    general = _general_section(await generate_surge_config(db, profile_id=profile.id))
+    assert "http-api" not in general
+    assert "read-etc-hosts" not in general
+    assert "http-listen" not in general
+    assert "compatibility-mode = 1" in general
+    assert "auto-suspend = true" in general
+    assert "wifi-assist = true" in general
+
+
+@pytest.mark.asyncio
+async def test_general_gateway_profile_forces_lan_restriction(db):
+    """网关档案：保留 Mac 专属键并强制 gateway-restricted-to-lan=true"""
+    profile = await _add_target_profile(
+        db, "网关档", "mac_gateway", "scoped",
+        {"gateway-restricted-to-lan": False, "read-etc-hosts": True})
+    general = _general_section(await generate_surge_config(db, profile_id=profile.id))
+    assert "gateway-restricted-to-lan = true" in general
+    assert "read-etc-hosts = true" in general
+    assert "compatibility-mode" not in general
+
+
+@pytest.mark.asyncio
+async def test_general_forces_safe_udp_values_all_targets(db):
+    """危险 block-quic / UDP 行为值一律被强制为安全值"""
+    profile = await _add_target_profile(
+        db, "危险值档", "mac_workstation", "scoped",
+        {"block-quic": "proxy", "udp-policy-not-supported-behaviour": "DROP"})
+    general = _general_section(await generate_surge_config(db, profile_id=profile.id))
+    assert "block-quic = per-policy" in general
+    assert "udp-policy-not-supported-behaviour = REJECT" in general
+    assert "block-quic = proxy" not in general
+
+
+@pytest.mark.asyncio
+async def test_general_skips_none_and_empty_values(db):
+    """档案值中的 None 与空字符串不写入配置"""
+    profile = await _add_target_profile(
+        db, "空值守卫档", "mac_workstation", "scoped",
+        {"http-api": None, "internet-test-url": "", "loglevel": "info"})
+    general = _general_section(await generate_surge_config(db, profile_id=profile.id))
+    assert not any(l.startswith("http-api ") for l in general.splitlines())
+    assert not any(l.startswith("internet-test-url ") for l in general.splitlines())
+    assert "loglevel = info" in general
