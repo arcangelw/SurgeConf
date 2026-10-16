@@ -280,6 +280,17 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     )
     general_rules = general_rules_result.scalars().all()
 
+    # rule_text 语义是一行一条规则：任何 CR/LF（绕库/legacy 多行 row）整体
+    # fail closed，绝不把第二物理行输出——防 FINAL / PROCESS-NAME 等借道
+    # 绕过目标能力过滤与 FINAL 专属检测。错误只含位置与 id，不回显规则内容
+    multiline_errors = [
+        f"{'前置' if r.position == 'pre' else '通用'}自定义规则 #{r.id} 包含换行："
+        "一行一条规则，请拆分为多条后重试"
+        for r in (*pre_rules, *general_rules)
+        if "\r" in r.rule_text or "\n" in r.rule_text]
+    if multiline_errors:
+        raise InvalidConfiguration(multiline_errors)
+
     # 目标能力过滤（iOS）：Mac 进程规则（PROCESS-*）与 MAC-ADDRESS 不进入
     # iOS 产物——结构化/括号感知检测，覆盖顶层与 AND/OR/NOT 嵌套，全局与
     # 当前档案作用域同口径；被过滤的规则不进入 rule_actions（不参与引用校验）

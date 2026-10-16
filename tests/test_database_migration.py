@@ -660,3 +660,172 @@ async def test_unversioned_nullable_sort_order_not_stamped_as_0004(tmp_path):
         await prepare_database(paths, legacy)
     # 诊断内容已由 match 校验（sort_order 列名进入错误消息）
     assert (paths.database.read_bytes() if paths.database.exists() else None) == before
+
+
+# ===== 0005：udp_exceptions 表（FK CASCADE / unique / index / CHECK） =====
+
+
+def _udp_exceptions_constraints(path: Path) -> dict:
+    """读取迁移产物的 udp_exceptions 结构化约束：FK / unique / index / CHECK"""
+    engine = sqlalchemy.create_engine(f"sqlite:///{path}")
+    try:
+        inspector = sqlalchemy.inspect(engine)
+        fks = {fk["name"]: fk for fk in inspector.get_foreign_keys("udp_exceptions")}
+        uniques = {u["name"]: u for u in inspector.get_unique_constraints("udp_exceptions")}
+        indexes = {i["name"]: i for i in inspector.get_indexes("udp_exceptions")}
+        checks = {cc["name"]: cc["sqltext"]
+                  for cc in inspector.get_check_constraints("udp_exceptions")}
+    finally:
+        engine.dispose()
+    return {"fk": fks, "unique": uniques, "index": indexes, "check": checks}
+
+
+@pytest.mark.asyncio
+async def test_legacy_0004_upgrades_to_0005_udp_exceptions(tmp_path):
+    """0004 旧库经 staging 升级 head：udp_exceptions 表齐全且 stamp 到 0005，
+    FK ON DELETE CASCADE、三元唯一、(profile_id, enabled, sort_order) 索引、
+    match_type CHECK 全部落盘"""
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    command.upgrade(database_migration._alembic_config(legacy),
+                    "0004_rule_source_ip_rules")
+
+    paths = runtime_paths(tmp_path / "app-support")
+    result = await prepare_database(paths, legacy)
+    assert result.source == "legacy"
+    assert sqlite_scalar(paths.database, "SELECT version_num FROM alembic_version") \
+        == "0005_udp_exceptions"
+
+    c = _udp_exceptions_constraints(paths.database)
+    fk = c["fk"]["fk_udp_exceptions_profile_id"]
+    assert fk["referred_table"] == "config_profiles"
+    assert fk["options"]["ondelete"] == "CASCADE"
+    assert c["unique"]["uq_udp_exceptions_profile_match"]["column_names"] == \
+        ["profile_id", "match_type", "match_value"]
+    assert c["index"]["ix_udp_exceptions_profile_enabled_sort"]["column_names"] == \
+        ["profile_id", "enabled", "sort_order"]
+    assert database_migration._normalize_check_expression(
+        c["check"]["ck_udp_exceptions_match_type"]) == \
+        "match_type IN ('process', 'mac_address')"
+
+
+def test_0005_downgrade_drops_udp_exceptions(tmp_path):
+    """head → 0004 downgrade：udp_exceptions 表与索引一并消失，可逆"""
+    db_path = tmp_path / "downgrade.db"
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+    command.downgrade(database_migration._alembic_config(db_path),
+                      "0004_rule_source_ip_rules")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    finally:
+        conn.close()
+    assert "udp_exceptions" not in tables
+
+
+@pytest.mark.asyncio
+async def test_unversioned_0005_complete_identified(tmp_path):
+    """无版本 0005 完整库（列+CHECK+nullable 全符合）仍精确识别为 head"""
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    command.upgrade(database_migration._alembic_config(legacy), "head")
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("DROP TABLE alembic_version")
+        conn.execute("DROP TABLE data_migration_records")
+    conn.close()
+    assert database_migration.identify_unversioned_schema(legacy) == \
+        "0005_udp_exceptions"
+
+
+def _make_unversioned_0005_sans_constraints(db_path: Path, ddl: str) -> None:
+    """0004 库 + 外部工具手建 udp_exceptions（列名齐全但按给定 DDL 缺约束）"""
+    command.upgrade(database_migration._alembic_config(db_path),
+                    "0004_rule_source_ip_rules")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute(ddl)
+        conn.execute("DROP TABLE alembic_version")
+    conn.close()
+
+
+_UNCONSTRAINED_UDP_DDL = (
+    "CREATE TABLE udp_exceptions ("
+    "id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL, "
+    "match_type VARCHAR(20) NOT NULL, match_value VARCHAR(255) NOT NULL, "
+    "display_name VARCHAR(100), enabled BOOLEAN NOT NULL DEFAULT 1, "
+    "sort_order INTEGER NOT NULL DEFAULT 0)"
+)
+
+_NULLABLE_UDP_DDL = (
+    "CREATE TABLE udp_exceptions ("
+    "id INTEGER PRIMARY KEY, profile_id INTEGER, match_type VARCHAR(20), "
+    "match_value VARCHAR(255), display_name VARCHAR(100), enabled BOOLEAN, "
+    "sort_order INTEGER)"
+)
+
+
+@pytest.mark.parametrize(("ddl", "problem"), [
+    (_UNCONSTRAINED_UDP_DDL, "ck_udp_exceptions_match_type"),
+    (_NULLABLE_UDP_DDL, "match_value"),
+])
+def test_unversioned_0005_missing_constraints_fail_closed(tmp_path, ddl, problem):
+    """无版本库列指纹与 0005 一致但缺 CHECK / 列可空性不符（外部工具建表）：
+    识别 fail closed，绝不猜测性 stamp"""
+    db_path = tmp_path / "sans.db"
+    _make_unversioned_0005_sans_constraints(db_path, ddl)
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert problem in details
+
+
+def test_unversioned_0004_without_udp_exceptions_still_identified(tmp_path):
+    """0004 形状（无 udp_exceptions 表）仍识别为 0004：新 revision 不回溯误伤"""
+    db_path = tmp_path / "legacy0004.db"
+    command.upgrade(database_migration._alembic_config(db_path),
+                    "0004_rule_source_ip_rules")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("DROP TABLE alembic_version")
+    conn.close()
+    assert database_migration.identify_unversioned_schema(db_path) == \
+        "0004_rule_source_ip_rules"
+
+
+def test_udp_exceptions_check_constraints_match_metadata(tmp_path):
+    """强制器：ORM metadata、SCHEMA_REVISION_CHECKS、Alembic 产物的
+    udp_exceptions CHECK 三处同名同表达式"""
+    from sqlalchemy.schema import CheckConstraint
+
+    from app.models import UdpException
+
+    head = database_migration._head_revision()
+    registered = database_migration._accumulated_required_checks(head)["udp_exceptions"]
+    metadata_checks = {
+        c.name: database_migration._normalize_check_expression(c.sqltext.text)
+        for c in UdpException.__table__.constraints
+        if isinstance(c, CheckConstraint)
+    }
+    assert set(metadata_checks) == set(registered) == {"ck_udp_exceptions_match_type"}
+    assert metadata_checks == {
+        name: database_migration._normalize_check_expression(expr)
+        for name, expr in registered.items()
+    }
+
+    path = tmp_path / "head.db"
+    command.upgrade(database_migration._alembic_config(path), "head")
+    c = _udp_exceptions_constraints(path)
+    assert database_migration._normalize_check_expression(
+        c["check"]["ck_udp_exceptions_match_type"]) == \
+        metadata_checks["ck_udp_exceptions_match_type"]
+
+
+def test_0005_head_fingerprint_covers_udp_exception_columns():
+    """head 指纹的 udp_exceptions 列集合与 ORM metadata 一致（防登记漂移）"""
+    from app.models import UdpException
+
+    head = database_migration._head_revision()
+    fingerprint = database_migration.schema_fingerprints()[head]
+    assert fingerprint["udp_exceptions"] == \
+        {c.name for c in UdpException.__table__.columns}

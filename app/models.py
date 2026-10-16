@@ -1,4 +1,5 @@
-from sqlalchemy import CheckConstraint, Column, Integer, String, Boolean, Text, DateTime, JSON
+from sqlalchemy import (CheckConstraint, Column, Integer, String, Boolean, Text,
+                         DateTime, JSON, ForeignKey, Index, UniqueConstraint)
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -157,3 +158,35 @@ class DataMigrationRecord(Base):
 
     key = Column(String(100), primary_key=True, comment="业务迁移标识，见 app/services/data_migrations.py")
     applied_at = Column(DateTime, server_default=func.now(), nullable=False, comment="应用时间")
+
+
+class UdpException(Base):
+    """目标感知 UDP 例外：workstation=process / gateway=mac_address（见 app/udp_policy.py）。
+
+    约束名/表达式与 nullable 同 migrations/versions/0005_udp_exceptions.py、
+    SCHEMA_REVISION_CHECKS / SCHEMA_REVISION_COLUMN_NULLABILITY 三处一致；
+    删除依赖数据库级 ON DELETE CASCADE（路由不手工 delete）；
+    repr 不回显 match_value（敏感值最小披露）。
+    """
+    __tablename__ = "udp_exceptions"
+    __table_args__ = (
+        CheckConstraint("match_type IN ('process', 'mac_address')",
+                        name="ck_udp_exceptions_match_type"),
+        UniqueConstraint("profile_id", "match_type", "match_value",
+                         name="uq_udp_exceptions_profile_match"),
+        Index("ix_udp_exceptions_profile_enabled_sort", "profile_id", "enabled", "sort_order"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    profile_id = Column(Integer, ForeignKey("config_profiles.id", ondelete="CASCADE"),
+                        nullable=False, comment="所属配置方案")
+    match_type = Column(String(20), nullable=False, comment="匹配类型: process/mac_address")
+    match_value = Column(String(255), nullable=False, comment="匹配值；错误与日志不回显")
+    display_name = Column(String(100), nullable=True, comment="显示名称")
+    enabled = Column(Boolean, nullable=False, default=True, server_default="1")
+    sort_order = Column(Integer, nullable=False, default=0, server_default="0")
+
+    def __repr__(self) -> str:
+        # 最小披露：只含定位与状态元数据，绝不含 match_value / display_name
+        return (f"<UdpException id={self.id!r} profile_id={self.profile_id!r} "
+                f"match_type={self.match_type!r} enabled={self.enabled!r}>")

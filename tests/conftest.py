@@ -3,6 +3,7 @@
 import asyncio
 import pytest
 import pytest_asyncio
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.database import Base
@@ -55,6 +56,24 @@ async def db():
         await session.commit()
         yield session
 
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def db_fk_on():
+    """每连接 PRAGMA foreign_keys=ON 的空内存库（与运行时 DatabaseRuntime 同口径）：
+    专用于验证数据库级 ON DELETE CASCADE 的真实行为，不依赖路由手工删除"""
+    engine = create_async_engine("sqlite+aiosqlite://", echo=False)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_conn, _connection_record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
     await engine.dispose()
 
 

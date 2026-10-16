@@ -118,6 +118,13 @@ SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
     "0003_profile_targets": {("config_profiles", "target"),
                              ("config_profiles", "udp_security_mode")},
     "0004_rule_source_ip_rules": {("rule_sources", "ip_rules")},
+    "0005_udp_exceptions": {("udp_exceptions", "id"),
+                            ("udp_exceptions", "profile_id"),
+                            ("udp_exceptions", "match_type"),
+                            ("udp_exceptions", "match_value"),
+                            ("udp_exceptions", "display_name"),
+                            ("udp_exceptions", "enabled"),
+                            ("udp_exceptions", "sort_order")},
 }
 
 # 各 revision 必需的命名 CHECK 约束（表 → 约束名 → 冻结的规范化表达式）。
@@ -137,6 +144,12 @@ SCHEMA_REVISION_CHECKS: dict[str, dict[str, dict[str, str]]] = {
                 "NOT (target = 'ios_mobile' AND udp_security_mode = 'scoped')",
         },
     },
+    "0005_udp_exceptions": {
+        "udp_exceptions": {
+            "ck_udp_exceptions_match_type":
+                "match_type IN ('process', 'mac_address')",
+        },
+    },
 }
 
 # 各 revision 相对更早 revision 新增/收紧的列可空性要求：(表, 列) → 期望 nullable。
@@ -145,6 +158,11 @@ SCHEMA_REVISION_CHECKS: dict[str, dict[str, dict[str, str]]] = {
 # True = 可空，False = NOT NULL。
 SCHEMA_REVISION_COLUMN_NULLABILITY: dict[str, dict[tuple[str, str], bool]] = {
     "0004_rule_source_ip_rules": {("rule_sources", "sort_order"): False},
+    "0005_udp_exceptions": {("udp_exceptions", "profile_id"): False,
+                            ("udp_exceptions", "match_type"): False,
+                            ("udp_exceptions", "match_value"): False,
+                            ("udp_exceptions", "enabled"): False,
+                            ("udp_exceptions", "sort_order"): False},
 }
 
 # 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建

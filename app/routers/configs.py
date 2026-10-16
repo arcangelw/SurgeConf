@@ -11,15 +11,16 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from pydantic import BaseModel
 from typing import Optional
 
 from app.database import get_db
-from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
+from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping, UdpException
 from app.profile_targets import (ProfileTarget, UdpSecurityMode,
                                  default_target_for_role, default_udp_mode,
                                  validate_target_mode)
+from app.udp_policy import udp_match_types_allowed_for
 from app.services.profile_resolution import (DefaultProfileMissing, ProfileNotFound,
                                              resolve_profile)
 from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
@@ -90,6 +91,15 @@ class RuleSourceUpdate(BaseModel):
     category: Optional[str] = None
     sort_order: Optional[int] = None
     enabled: Optional[bool] = None
+
+def _reject_multiline_rule_text(rule_text: str) -> None:
+    """CustomRule.rule_text 语义是一行一条规则：含任何 CR/LF 一律 422。
+    第二物理行可能携带 FINAL / PROCESS-NAME 等借道绕过结构化检测，
+    保存端与生成端（绕库存量）同口径 fail closed。错误不回显规则内容。"""
+    if "\r" in rule_text or "\n" in rule_text:
+        raise HTTPException(
+            422, "rule_text 必须是单行规则：不允许换行，请拆分为多条规则")
+
 
 async def _require_profile(db: AsyncSession, profile_id: int) -> ConfigProfile:
     """显式 id 解析：不存在直接 404，绝不回退默认档案（resolve_profile 唯一语义）"""
@@ -215,6 +225,20 @@ async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSe
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
+    # 改变 target 前查询 UDP 例外兼容性：存在新目标不允许的例外类型时 422，
+    # detail 只给数量（不回显 type/value/name），事务不提交、不自动删除；
+    # target 不变（或未提供）不额外阻止
+    if target_provided and new_target is not ProfileTarget(profile.target):
+        allowed_values = {t.value for t in udp_match_types_allowed_for(new_target)}
+        incompatible = select(func.count()).select_from(UdpException).where(
+            UdpException.profile_id == profile_id)
+        if allowed_values:
+            incompatible = incompatible.where(UdpException.match_type.not_in(allowed_values))
+        count = (await db.execute(incompatible)).scalar_one()
+        if count:
+            raise HTTPException(
+                422, f"目标切换与现有 UDP 例外不兼容：请先删除或调整 {count} 条例外")
+
     update_data = data.model_dump(exclude_unset=True)
     update_data.pop("target", None)
     update_data.pop("udp_security_mode", None)
@@ -251,7 +275,8 @@ async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSe
 
 @router.delete("/profiles/{profile_id}")
 async def delete_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
-    """级联删除：单事务内删除该档案的定制规则、Host 映射与档案本体"""
+    """级联删除：custom_rules / host_mappings 无 DB 外键（0001 基线），
+    单事务内手工删除；UDP 例外由 FK ON DELETE CASCADE 数据库级清除"""
     profile = await _require_profile(db, profile_id)
     from sqlalchemy import delete as sa_delete
     await db.execute(sa_delete(CustomRule).where(CustomRule.profile_id == profile_id))
@@ -624,6 +649,7 @@ async def create_custom_rule(data: CustomRuleCreate, db: AsyncSession = Depends(
     # FINAL 为生成器专属终结规则（按档案 final_action 追加且恰一条），
     # pre/general 任何自定义 FINAL（内置 action 与 policy action 均同）
     # 在保存端拒绝；生成校验端对绕过写入的存量同样 fail closed
+    _reject_multiline_rule_text(data.rule_text)
     if is_final_rule(data.rule_text):
         raise HTTPException(
             422, "FINAL 是生成器专属终结规则，不允许保存为自定义规则；兜底策略请在档案设置中修改 final_action")
@@ -654,6 +680,8 @@ async def update_custom_rule(rule_id: int, data: CustomRuleUpdate, db: AsyncSess
     update_data = data.model_dump(exclude_unset=True)
     # 更新端同口径拦截：把 rule_text 改成 FINAL 拒绝（不改 rule_text 的
     # 更新如排序/启停不受影响）
+    if update_data.get("rule_text") is not None:
+        _reject_multiline_rule_text(update_data["rule_text"])
     if update_data.get("rule_text") is not None and is_final_rule(update_data["rule_text"]):
         raise HTTPException(
             422, "FINAL 是生成器专属终结规则，不允许保存为自定义规则；兜底策略请在档案设置中修改 final_action")

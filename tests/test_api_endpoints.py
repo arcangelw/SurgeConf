@@ -736,3 +736,169 @@ async def test_create_rule_custom_source_still_works(client):
         "action": "DIRECT", "rule_type": "RULE-SET", "sort_order": 200})
     assert resp.status_code == 200, resp.text
     assert len((await client.get("/api/configs/rules")).json()) == before + 1
+
+
+# ===== 多行 rule_text：保存端 422 / 生成端 fail closed =====
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rule_text", [
+    "# 注释\nPROCESS-NAME,ExampleVideo,DIRECT",   # 第二行携带 Mac 专属规则
+    "# 注释\nFINAL,DIRECT",                       # 第二行携带 FINAL
+    "DOMAIN-SUFFIX,example.com,DIRECT\r\nDOMAIN,key.com,DIRECT",  # CRLF
+])
+async def test_create_custom_rule_multiline_rejected(client, rule_text):
+    """保存端拒绝任何含 CR/LF 的 rule_text：一行一条规则，数据库不落新行"""
+    before = len((await client.get("/api/configs/custom-rules")).json())
+    resp = await client.post("/api/configs/custom-rules", json={
+        "profile_id": None, "position": "general", "rule_text": rule_text})
+    assert resp.status_code == 422
+    assert "单行" in resp.json()["detail"]
+    assert len((await client.get("/api/configs/custom-rules")).json()) == before
+
+
+@pytest.mark.asyncio
+async def test_update_custom_rule_multiline_rejected_keeps_original(client):
+    """更新端把 rule_text 改成多行：422 且原文本保持不变"""
+    created = await client.post("/api/configs/custom-rules", json={
+        "profile_id": None, "position": "general",
+        "rule_text": "DOMAIN-SUFFIX,keep.example,DIRECT"})
+    rid = created.json()["id"]
+    resp = await client.put(f"/api/configs/custom-rules/{rid}", json={
+        "rule_text": "# 注释\nFINAL,DIRECT"})
+    assert resp.status_code == 422
+    rules = {r["id"]: r for r in (await client.get("/api/configs/custom-rules")).json()}
+    assert rules[rid]["rule_text"] == "DOMAIN-SUFFIX,keep.example,DIRECT"
+
+
+@pytest.mark.asyncio
+async def test_single_line_comment_and_rule_not_harmed(client):
+    """合法单行注释与单行规则不误伤：保存端照常受理（多行拦截只针对
+    CR/LF）；合法规则正常进入产物。注释行在生成端因无法解析策略段被
+    既有校验拒绝（与多行拦截无关），故 preview 用纯规则档案验证"""
+    ios = await _create(client, "单行iOS档", target="ios_mobile")
+    note = await client.post("/api/configs/custom-rules", json={
+        "profile_id": ios, "position": "general", "rule_text": "# 单行注释：放行示例"})
+    assert note.status_code == 200, note.text     # 单行注释：保存端不误伤
+    # 删掉注释行使档案回到纯规则形态（生成端对注释行的既有拒绝不属本任务）
+    await client.delete(f"/api/configs/custom-rules/{note.json()['id']}")
+    rule = await client.post("/api/configs/custom-rules", json={
+        "profile_id": ios, "position": "general",
+        "rule_text": "DOMAIN-SUFFIX,keep.example,DIRECT"})
+    assert rule.status_code == 200, rule.text
+    preview = await client.get(f"/api/configs/preview?profile_id={ios}")
+    assert preview.status_code == 200, preview.text
+    assert "keep.example" in preview.json()["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("target", "rule_text"), [
+    ("ios_mobile", "# 注释\nPROCESS-NAME,ExampleVideo,DIRECT"),
+    ("mac_workstation", "# 注释\nFINAL,DIRECT"),
+])
+async def test_generate_multiline_rule_fails_closed(client, target, rule_text):
+    """绕库直写的多行 row（保存端拦截的存量）：生成 fail closed（422 +
+    invalid_configuration），绝不把第二物理行输出；错误不回显规则内容"""
+    from app.models import CustomRule as Rule
+    pid = await _create(client, f"多行档-{target}", target=target)
+    async with client._test_factory() as db:
+        db.add(Rule(profile_id=pid, rule_text=rule_text, position="general",
+                    sort_order=0, enabled=True))
+        await db.commit()
+
+    preview = await client.get(f"/api/configs/preview?profile_id={pid}")
+    assert preview.status_code == 422
+    body = preview.json()["detail"]
+    assert body["code"] == "invalid_configuration"
+    joined = " ".join(body["errors"])
+    assert "包含换行" in joined
+    # 最小披露：错误不回显规则内容（注释/第二物理行均不出现）
+    assert "PROCESS-NAME" not in joined and "FINAL,DIRECT" not in joined
+    assert "ExampleVideo" not in joined
+
+
+# ===== 档案 target 更新 × UDP 例外兼容性 =====
+
+
+async def _add_udp_exception(client, profile_id: int, match_type: str,
+                             match_value: str, display_name: str = "客厅设备"):
+    """直插 UDP 例外（CRUD 路由属后续任务）：绕 API 用底层会话"""
+    from app.models import UdpException
+    async with client._test_factory() as db:
+        db.add(UdpException(profile_id=profile_id, match_type=match_type,
+                            match_value=match_value, display_name=display_name,
+                            enabled=True, sort_order=0))
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_update_target_udp_exception_incompatible_422(client):
+    """workstation(process 例外) → gateway：422 且 detail 只给数量；
+    事务不提交（target 不变）；target 不变/未提供不额外阻止"""
+    pid = await _create(client, "UDP兼容档", target="mac_workstation")
+    await _add_udp_exception(client, pid, "process", "ExampleVideo")
+    await _add_udp_exception(client, pid, "process", "SecondProc")
+
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"target": "mac_gateway"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "2 条例外" in detail
+    # 最小披露：不含 type/value/display_name
+    for secret in ("process", "ExampleVideo", "SecondProc", "客厅设备"):
+        assert secret not in detail
+
+    # 事务未提交：target 保持 workstation，模式组合校验仍生效
+    assert (await _detail(client, pid))["target"] == "mac_workstation"
+    ios_scoped = await client.put(f"/api/configs/profiles/{pid}",
+                                  json={"target": "ios_mobile",
+                                        "udp_security_mode": "scoped"})
+    assert ios_scoped.status_code == 422
+    assert (await _detail(client, pid))["target"] == "mac_workstation"
+
+    # target 不变（同值 PUT）与不带 target 的更新不额外阻止
+    same = await client.put(f"/api/configs/profiles/{pid}",
+                            json={"target": "mac_workstation"})
+    assert same.status_code == 200, same.text
+    rename = await client.put(f"/api/configs/profiles/{pid}",
+                              json={"description": "只改描述"})
+    assert rename.status_code == 200, rename.text
+
+
+@pytest.mark.asyncio
+async def test_update_target_compatible_exceptions_do_not_block(client):
+    """无例外或例外类型兼容（gateway→workstation 清掉 mac_address 后）不阻止切换"""
+    pid = await _create(client, "网关档", target="mac_gateway")
+    resp = await client.put(f"/api/configs/profiles/{pid}", json={"target": "mac_workstation"})
+    assert resp.status_code == 200, resp.text
+    assert (await _detail(client, pid))["target"] == "mac_workstation"
+
+    await _create(client, "iOS档", target="ios_mobile")
+    ios_profiles = [p["id"] for p in (await client.get("/api/configs/profiles")).json()]
+    ios_pid = ios_profiles[-1]
+    to_mac = await client.put(f"/api/configs/profiles/{ios_pid}",
+                              json={"target": "mac_workstation"})
+    assert to_mac.status_code == 200, to_mac.text
+
+
+# ===== 档案删除 × UDP 例外 DB 级 cascade（client runtime 每连接 FK ON） =====
+
+
+@pytest.mark.asyncio
+async def test_delete_profile_db_cascades_udp_exceptions(client):
+    """删除档案：UDP 例外由数据库级 ON DELETE CASCADE 清除（路由不手工删），
+    无孤儿行；其他档案的例外不受影响"""
+    from sqlalchemy import select as sa_select
+    from app.models import UdpException
+
+    pid = await _create(client, "UDP删除档", target="mac_gateway")
+    other = await _create(client, "UDP保留档", target="mac_gateway")
+    await _add_udp_exception(client, pid, "mac_address", "02:00:00:00:00:01")
+    await _add_udp_exception(client, other, "mac_address", "02-00-00-00-00-01")
+
+    resp = await client.delete(f"/api/configs/profiles/{pid}")
+    assert resp.status_code == 200
+
+    async with client._test_factory() as db:
+        remaining = (await db.execute(sa_select(UdpException))).scalars().all()
+        assert [(e.profile_id, e.match_value) for e in remaining] == \
+            [(other, "02-00-00-00-00-01")]
