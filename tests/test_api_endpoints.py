@@ -257,7 +257,7 @@ async def test_profiles_list_and_detail_contract(client):
     data = (await client.get("/api/configs/profiles")).json()
     assert data
     assert set(data[0]) == {"id", "name", "description", "is_default", "locale",
-                            "final_action", "token_configured"}
+                            "token_configured"}
     assert data[0]["token_configured"] is False  # 未生成过 token 的档案
 
     detail = (await client.get("/api/configs/profiles/1")).json()

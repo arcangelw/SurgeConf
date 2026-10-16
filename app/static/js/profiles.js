@@ -500,6 +500,14 @@ function renderGenerateTab(profileId) {
 
 // ===== 订阅 Token：明文仅存在于一次性对话框，关闭即清空 =====
 
+function buildSubscribeUrl(profileId, token) {
+  // 纯函数：协议/端口来自当前页面，地址取当前下拉选择；token 逐参数安全编码
+  const ip = document.getElementById(`ip-select-${profileId}`)?.value || "127.0.0.1";
+  const port = SERVER_PORT === "80" || SERVER_PORT === "443" ? "" : `:${SERVER_PORT}`;
+  return `${location.protocol}//${encodeURIComponent(ip)}${port}`
+    + `/api/configs/profiles/${Number(profileId)}/subscribe?token=${encodeURIComponent(token)}`;
+}
+
 function renderTokenStatus(profileId) {
   const profile = allProfiles.find(p => p.id === profileId);
   const configured = !!profile?.token_configured;

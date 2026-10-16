@@ -122,6 +122,110 @@ async def test_fresh_database_gets_schema_seed_and_migration_records(tmp_path):
     assert not _staging_path(paths).with_name(_staging_path(paths).name + "-wal").exists()
 
 
+# ===== 无版本库精确识别（fix round 1） =====
+
+
+def create_unversioned_complete_head_database(path: Path) -> Path:
+    """合成"无 alembic_version、业务表与 head 指纹完全一致"的库"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    engine = sqlalchemy.create_engine(f"sqlite:///{path}")
+    tables = [t for t in Base.metadata.sorted_tables if t.name != "data_migration_records"]
+    Base.metadata.create_all(engine, tables=tables)
+    engine.dispose()
+    return path
+
+
+@pytest.mark.asyncio
+async def test_unversioned_complete_0002_stamps_0002_not_baseline(tmp_path):
+    """无版本但完整 0002：stamp 0002（no-op 升级），绝不统一 stamp 0001"""
+    legacy = create_unversioned_complete_head_database(
+        tmp_path / "repo" / "data" / "surge_conf.db")
+    paths = runtime_paths(tmp_path / "app-support")
+    result = await prepare_database(paths, legacy)
+    assert result.source == "legacy"
+    assert sqlite_scalar(paths.database, "SELECT version_num FROM alembic_version") \
+        == database_migration._head_revision()
+    cols = {row[1] for row in sqlite_rows(paths.database, "PRAGMA table_info(config_profiles)")}
+    assert "subscription_token_hash" in cols
+    assert sqlite_scalar(paths.database, "PRAGMA integrity_check") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_unversioned_extra_column_rejected_without_data_values(tmp_path):
+    """额外列：明确拒绝；错误消息只含表/列名，不含任何数据值"""
+    paths = runtime_paths(tmp_path / "app-support")
+    legacy = create_current_schema_database(tmp_path / "repo" / "data" / "surge_conf.db")
+    secret_value = "SECRET-VALUE-must-not-leak"
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("ALTER TABLE config_profiles ADD COLUMN rogue_column TEXT")
+        conn.execute("INSERT INTO config_profiles (name, rogue_column) VALUES (?, ?)",
+                     ("档", secret_value))
+    conn.close()
+
+    before = paths.database.read_bytes() if paths.database.exists() else None
+    with pytest.raises(RuntimeError, match="rogue_column") as excinfo:
+        await prepare_database(paths, legacy)
+    assert secret_value not in str(excinfo.value)
+    assert (paths.database.read_bytes() if paths.database.exists() else None) == before
+
+
+@pytest.mark.asyncio
+async def test_unversioned_mixed_revision_columns_rejected(tmp_path):
+    """混合列（0001 + 0002 之外再加列）：精确识别失败，明确拒绝"""
+    paths = runtime_paths(tmp_path / "app-support")
+    legacy = create_unversioned_complete_head_database(
+        tmp_path / "repo" / "data" / "surge_conf.db")
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN stray_column TEXT")
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="stray_column"):
+        await prepare_database(paths, legacy)
+
+
+@pytest.mark.asyncio
+async def test_unversioned_missing_column_rejected(tmp_path):
+    """缺失列（真实 0001 也不匹配）：拒绝并列出列名"""
+    paths = runtime_paths(tmp_path / "app-support")
+    legacy = create_current_schema_database(tmp_path / "repo" / "data" / "surge_conf.db")
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("ALTER TABLE subscriptions DROP COLUMN tag")
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="tag"):
+        await prepare_database(paths, legacy)
+
+
+def test_head_fingerprint_matches_current_metadata():
+    """指纹单一更新点强制器：head 指纹必须与当前 Base.metadata 一致，
+    模型新增列时必须同步更新 SCHEMA_REVISION_DELTAS"""
+    fingerprints = database_migration.schema_fingerprints()
+    head = database_migration._head_revision()
+    assert head in fingerprints
+    expected = {
+        table.name: {column.name for column in table.columns}
+        for table in Base.metadata.sorted_tables
+        if table.name != "data_migration_records"
+    }
+    actual = {table: set(columns) for table, columns in fingerprints[head].items()}
+    assert actual == expected
+
+
+def test_baseline_fingerprint_is_frozen_0001():
+    """0001 指纹不含 0002 新列（冻结快照，不受模型演进影响）"""
+    baseline = database_migration.schema_fingerprints()["0001_current_schema"]
+    assert "subscription_token_hash" not in baseline["config_profiles"]
+    assert set(baseline) == {
+        "subscriptions", "proxy_nodes", "region_groups", "service_groups",
+        "config_profiles", "custom_rules", "host_mappings", "rule_sources",
+        "system_config",
+    }
+
+
 @pytest.mark.asyncio
 async def test_live_pending_data_migration_applies_and_backs_up(tmp_path):
     """live 已在 head 但业务迁移有缺口：时间戳备份 + staging 补齐后原子替换"""

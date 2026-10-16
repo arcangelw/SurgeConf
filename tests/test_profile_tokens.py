@@ -202,7 +202,7 @@ async def test_profiles_list_is_minimal_and_no_legacy_token(admin_client):
     data = (await admin_client.get("/api/configs/profiles")).json()
     assert data
     assert set(data[0]) == {"id", "name", "description", "is_default", "locale",
-                            "final_action", "token_configured"}
+                            "token_configured"}
     assert data[0]["token_configured"] is False
 
 

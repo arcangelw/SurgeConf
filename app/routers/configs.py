@@ -91,7 +91,6 @@ async def list_profiles(db: AsyncSession = Depends(get_db)):
             "description": p.description,
             "is_default": p.is_default,
             "locale": p.locale,
-            "final_action": p.final_action,
             "token_configured": bool(p.subscription_token_hash),
         }
         for p in profiles

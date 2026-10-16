@@ -51,9 +51,6 @@ def run_alembic_upgrade(database_path: Path) -> None:
     command.upgrade(_alembic_config(database_path), "head")
 
 
-def _stamp_baseline(database_path: Path) -> None:
-    command.stamp(_alembic_config(database_path), BASELINE_REVISION)
-
 
 def _head_revision() -> str:
     return ScriptDirectory(str(PROJECT_ROOT / "migrations")).get_current_head()
@@ -82,50 +79,116 @@ def pending_data_migration_keys(database_path: Path) -> list:
         return [key for key in DATA_MIGRATIONS if key not in recorded]
 
 
-# 0001 基线之后新增的列：无版本旧库缺少它们属正常，由 alembic upgrade 补齐，
-# 不得作为"schema 不在已知基线"的中止理由
-POST_BASELINE_COLUMNS = {("config_profiles", "subscription_token_hash")}
+# ===== 无版本库识别：冻结的 revision → 表/列指纹 =====
+
+# 0001 基线快照（表 → 列）。冻结声明，不随 Base.metadata 演进；
+# data_migration_records 与 alembic_version 不参与识别（前者缺失时由 _sync_schema 补建）。
+_BASELINE_TABLE_COLUMNS: dict[str, set[str]] = {
+    "subscriptions": {"id", "name", "url", "tag", "color", "enabled", "auto_update",
+                      "update_interval", "last_update", "created_at", "updated_at"},
+    "proxy_nodes": {"id", "name", "subscription_id", "node_type", "server", "port",
+                    "config", "region_auto", "region_manual", "pinned_services",
+                    "enabled", "created_at"},
+    "region_groups": {"id", "name", "display_name", "icon_url", "filter_regex",
+                      "sort_order", "enabled", "auto_enabled", "manual_enabled",
+                      "created_at"},
+    "service_groups": {"id", "name", "display_name", "icon_url", "group_type",
+                       "policies", "sort_order", "enabled", "created_at"},
+    "config_profiles": {"id", "name", "description", "is_default", "locale",
+                        "final_action", "general", "dns", "url_rewrites",
+                        "header_rewrites", "mitm", "created_at", "updated_at"},
+    "custom_rules": {"id", "profile_id", "rule_text", "position", "sort_order",
+                     "enabled", "comment"},
+    "host_mappings": {"id", "profile_id", "domain", "target", "sort_order",
+                      "enabled", "skip_proxy"},
+    "rule_sources": {"id", "name", "url", "action", "rule_type", "category",
+                     "enabled", "sort_order", "created_at"},
+    "system_config": {"id", "key", "value"},
+}
+
+# 各 revision 相对前一 revision 新增的 (表, 列)。
+# **新增 revision 时唯一需要更新的地方**；测试强制 head 指纹与 Base.metadata 一致。
+SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
+    "0002_profile_subscription_tokens": {("config_profiles", "subscription_token_hash")},
+}
+
+# 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建
+_IDENTIFY_IGNORED_TABLES = {"alembic_version", "data_migration_records"}
 
 
-def _expected_columns() -> dict:
-    """0001 基线期望的表→列（data_migration_records 属 0001 新表，缺失时补建）"""
-    columns = {
-        table.name: {column.name for column in table.columns}
-        for table in Base.metadata.sorted_tables
-        if table.name != "data_migration_records"
-    }
-    for table, column in POST_BASELINE_COLUMNS:
-        columns[table].discard(column)
-    return columns
+def schema_fingerprints() -> dict[str, dict[str, frozenset[str]]]:
+    """revision → 表→列指纹：0001 基线 + 逐 revision 冻结增量推导"""
+    fingerprints: dict[str, dict[str, frozenset[str]]] = {}
+    tables = {table: set(columns) for table, columns in _BASELINE_TABLE_COLUMNS.items()}
+    fingerprints[BASELINE_REVISION] = {t: frozenset(c) for t, c in tables.items()}
+    for revision, additions in SCHEMA_REVISION_DELTAS.items():
+        for table, column in additions:
+            tables.setdefault(table, set()).add(column)
+        fingerprints[revision] = {t: frozenset(c) for t, c in tables.items()}
+    return fingerprints
 
 
-def _validate_current_schema(database_path: Path) -> None:
-    """无版本库 stamp 前的硬校验：未知或不完整 schema 中止并给出表/列名"""
-    expected = _expected_columns()
-    problems = []
+def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]]]:
+    """实际库的表集合与表→列集合（排除簿记表）"""
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as conn:
-        actual_tables = {
+        tables = {
             row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")
+        } - _IDENTIFY_IGNORED_TABLES
+        columns = {
+            table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for table in tables
         }
-        for table, columns in expected.items():
-            if table not in actual_tables:
-                problems.append(f"缺表 {table}")
-                continue
-            actual_columns = {
-                row[1] for row in conn.execute(f"PRAGMA table_info({table})")
-            }
-            missing = columns - actual_columns
-            if missing:
-                problems.append(f"{table} 缺列: {', '.join(sorted(missing))}")
-        unknown = actual_tables - set(expected) - {"alembic_version", "data_migration_records"}
-        if unknown:
-            problems.append(f"未知表: {', '.join(sorted(unknown))}")
-    if problems:
+    return tables, columns
+
+
+def identify_unversioned_schema(database_path: Path) -> str | None:
+    """无版本库精确识别：表/列与某个 revision 指纹完全一致才返回该 revision。
+
+    额外列、缺失列或混合多个 revision 的列都返回 None（绝不猜测性 stamp）。
+    """
+    actual_tables, actual_columns = _actual_schema(database_path)
+    for revision, fingerprint in schema_fingerprints().items():
+        if actual_tables != set(fingerprint):
+            continue
+        if all(actual_columns[table] == set(columns)
+               for table, columns in fingerprint.items()):
+            return revision
+    return None
+
+
+def _schema_mismatch_details(database_path: Path) -> list[str]:
+    """与最近 revision 指纹的差异描述：只含表/列名，绝不含数据值"""
+    fingerprint = schema_fingerprints()[_head_revision()]
+    actual_tables, actual_columns = _actual_schema(database_path)
+    problems: list[str] = []
+    for table in sorted(set(fingerprint) - actual_tables):
+        problems.append(f"缺表 {table}")
+    for table in sorted(actual_tables - set(fingerprint)):
+        problems.append(f"额外表 {table}")
+    for table, expected in fingerprint.items():
+        if table not in actual_columns:
+            continue
+        missing = expected - actual_columns[table]
+        extra = actual_columns[table] - expected
+        if missing:
+            problems.append(f"{table} 缺列: {', '.join(sorted(missing))}")
+        if extra:
+            problems.append(f"{table} 额外列: {', '.join(sorted(extra))}")
+    if not problems:
+        problems.append("schema 与已知 revision 指纹均不一致（混合列）")
+    return problems
+
+
+def _validate_current_schema(database_path: Path) -> str:
+    """无版本库 stamp 前的硬校验：精确匹配已知 revision，否则中止并给表/列名"""
+    revision = identify_unversioned_schema(database_path)
+    if revision is None:
         raise RuntimeError(
-            "数据库 schema 不在已知基线，中止迁移（不做猜测性修补）: "
-            + "; ".join(problems)
+            "数据库 schema 不精确匹配任何已知 revision，中止迁移（不做猜测性修补）: "
+            + "; ".join(_schema_mismatch_details(database_path))
         )
+    return revision
 
 
 # ===== staging 与原子发布 =====
@@ -180,8 +243,9 @@ def _sync_schema(database_path: Path) -> None:
         run_alembic_upgrade(database_path)
         return
     if alembic_version(database_path) is None:
-        # 无版本库：先验证是已知基线（业务表/列齐全、无未知表），补建 0001 新表后 stamp
-        _validate_current_schema(database_path)
+        # 无版本库：精确识别 schema 所属 revision 后 stamp 该 revision 再升级，
+        # 额外/缺失/混合列在识别阶段明确拒绝（绝不确定性地统一 stamp 基线）
+        revision = _validate_current_schema(database_path)
         with sqlite3.connect(database_path) as conn:
             exists = conn.execute(
                 "SELECT name FROM sqlite_master "
@@ -189,7 +253,7 @@ def _sync_schema(database_path: Path) -> None:
             ).fetchone()
             if not exists:
                 conn.execute(_DATA_MIGRATION_RECORDS_DDL)
-        _stamp_baseline(database_path)
+        command.stamp(_alembic_config(database_path), revision)
     run_alembic_upgrade(database_path)
 
 
