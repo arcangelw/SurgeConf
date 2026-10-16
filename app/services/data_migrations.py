@@ -5,6 +5,7 @@
 因此用户之后删除默认规则不会被每次启动重新补回。
 """
 
+import re
 import sys
 
 from sqlalchemy import delete, select, update
@@ -326,10 +327,17 @@ async def _migrate_retire_no_resolve_keywords(db) -> int:
     return 1
 
 
-def _normalized_rule_text(text: str) -> str:
-    """规则文本空白规范化：仅折叠/移除空白（语义无关的历史排版差异），
-    不折叠大小写、不做子串或域名模糊匹配"""
-    return "".join(text.split())
+def _normalized_rule_text(text: str) -> str | None:
+    """规则文本受限规范化：返回 None 表示直接判不匹配。
+
+    - 含 \\r / \\n 一律返回 None（不得跨物理行折叠）
+    - 仅忽略逗号分隔符两侧的 ASCII 水平空白（空格 / \\t）与整行首尾水平空白
+    - 保留 token 内部空白、括号结构与所有其他字符；不折叠大小写、
+      不处理 Unicode 空白、不做全局 split
+    """
+    if "\r" in text or "\n" in text:
+        return None
+    return re.sub(r"[ \t]*,[ \t]*", ",", text.strip(" \t"))
 
 
 async def _migrate_udp_security_modes(db) -> int:

@@ -691,6 +691,53 @@ async def test_udp_mode_migration_preserves_user_lookalikes(db):
     async with await _fresh_view(db) as fresh:
         remaining = {row.id for row in (await fresh.execute(select(CustomRule))).scalars().all()}
     assert {r.id for r in keep} <= remaining
+
+
+@pytest.mark.asyncio
+async def test_udp_mode_migration_whitespace_normalization_boundaries(db):
+    """规范器边界：仅逗号分隔符两侧 ASCII 水平空白与整行首尾水平空白视为等价；
+    token 内空白 / CR / LF / 括号内非分隔空白 / Unicode 空白一律不折叠"""
+    s0, s1, s3 = (LEGACY_MANAGED_STUN_SIGNATURES[0], LEGACY_MANAGED_STUN_SIGNATURES[1],
+                  LEGACY_MANAGED_STUN_SIGNATURES[3])
+    keep = [
+        # token 内空格（ST UN ≠ STUN）
+        CustomRule(profile_id=None, position="pre", sort_order=s3["sort_order"],
+                   rule_text="PROTOCOL,ST UN,REJECT", comment=s3["comment"]),
+        # token 内制表符
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,ST\tUN,REJECT", comment=s0["comment"]),
+        # token 内换行：含 \n 直接判不匹配（不得跨物理行折叠）
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,ST\nUN,REJECT", comment=s0["comment"]),
+        # token 内 CR：同上直接判不匹配
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,ST\rUN,REJECT", comment=s0["comment"]),
+        # 括号内非分隔空白（UDP 与 ) 之间的空格不在逗号两侧）
+        CustomRule(profile_id=None, position="pre", sort_order=s1["sort_order"],
+                   rule_text="AND,((PROTOCOL,UDP ),(DEST-PORT,3478)),REJECT", comment=s1["comment"]),
+        # Unicode 空白（全角空格）不折叠
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,stun\u3000,REJECT", comment=s0["comment"]),
+    ]
+    doomed = [
+        # 逗号后 ASCII tab（分隔符两侧水平空白）→ 等价删除
+        CustomRule(profile_id=None, position="pre", sort_order=s1["sort_order"],
+                   rule_text="AND,((PROTOCOL,UDP),\t(DEST-PORT,3478)),REJECT", comment=s1["comment"]),
+        # 逗号前空格（分隔符两侧水平空白）→ 等价删除
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,stun ,REJECT", comment=s0["comment"]),
+        # 整行首尾水平空白（行级 trim，无语义）→ 等价删除
+        CustomRule(profile_id=None, position="pre", sort_order=s3["sort_order"],
+                   rule_text="  PROTOCOL,STUN,REJECT\t", comment=s3["comment"]),
+    ]
+    db.add_all((*keep, *doomed))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        remaining = {row.id for row in (await fresh.execute(select(CustomRule))).scalars().all()}
+    assert {r.id for r in keep} <= remaining
     assert not ({r.id for r in doomed} & remaining)
 
 
