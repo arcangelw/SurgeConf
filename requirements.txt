@@ -9,3 +9,4 @@ python-multipart==0.0.19
 pydantic==2.10.4
 greenlet==3.2.1
 alembic==1.14.0
+itsdangerous==2.2.0

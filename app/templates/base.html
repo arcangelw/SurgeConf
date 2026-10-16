@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}SurgeConf{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/style.css?v={{ asset_ver }}">
+  {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
 </head>
 <body>
   <div class="layout">
@@ -20,7 +20,7 @@
         <a href="/profiles">{{ t["nav.profiles"] }}</a>
         <div class="nav-section" style="margin-top:auto;border-top:1px solid var(--border);padding-top:8px;">{{ t["nav.section_system"] }}</div>
         <a href="/settings">{{ t["nav.settings"] }}</a>
-      </nav>
+        <a href="javascript:void(0)" onclick="logout()">{{ t["nav.logout"] }}</a>
     </aside>
     <div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
     <main class="main">

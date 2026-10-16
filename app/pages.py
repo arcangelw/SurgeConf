@@ -1,10 +1,10 @@
-"""页面路由：渲染 5 个 Jinja2 模板页（按 Surge 功能模块组织）。"""
+"""页面路由：渲染 Jinja2 模板页与公开登录页（按 Surge 功能模块组织）。"""
 
 import os
 import subprocess
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.i18n import get_translations, DEFAULT_LOCALE
@@ -40,12 +40,15 @@ def _get_locale(request: Request) -> str:
 
 def _render(request: Request, template: str, extra: dict | None = None):
     locale = _get_locale(request)
+    session = getattr(request.state, "session", None)
+    csrf_token = session.get("csrf") if isinstance(session, dict) else None
     ctx = {
         "request": request,
         "t": get_translations(locale),
         "locale": locale,
         "locale_names": LOCALE_NAMES,
         "asset_ver": ASSET_VER,
+        "csrf_token": csrf_token,
     }
     if extra:
         ctx.update(extra)
@@ -76,3 +79,12 @@ async def page_profiles(request: Request):
 @router.get("/settings", response_class=HTMLResponse)
 async def page_settings(request: Request):
     return _render(request, "settings.html")
+
+
+@router.get("/login", response_class=HTMLResponse)
+async def page_login(request: Request):
+    """登录页公开渲染；已持有有效会话时直接回到首页"""
+    from app.security import resolve_session
+    if resolve_session(request) is not None:
+        return RedirectResponse(url="/", status_code=307)
+    return _render(request, "login.html")

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ t["login.title"] }} - SurgeConf{% endblock %}
+{% block content %}
+<div style="min-height:60vh;display:flex;align-items:center;justify-content:center;">
+  <div class="card" style="width:100%;max-width:380px;">
+    <div class="card-header"><h3>{{ t["login.title"] }}</h3></div>
+    <p style="font-size:13px;color:var(--text2);margin:0 0 16px;">{{ t["login.desc"] }}</p>
+    <div class="form-group">
+      <label>{{ t["login.password"] }}</label>
+      <input type="password" id="login-password" autocomplete="current-password"
+             style="width:100%;" onkeydown="if(event.key==='Enter'){event.preventDefault();doLogin();}">
+    </div>
+    <button class="btn btn-primary" id="login-btn" style="width:100%;margin-top:8px;" onclick="doLogin()">{{ t["login.submit"] }}</button>
+    <p id="login-error" style="display:none;color:var(--danger, #e5484d);font-size:13px;margin-top:12px;"></p>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function doLogin() {
+  const btn = document.getElementById("login-btn");
+  const err = document.getElementById("login-error");
+  const pwd = document.getElementById("login-password").value;
+  err.style.display = "none";
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pwd }),
+    });
+    if (resp.ok) { window.location.href = "/"; return; }
+    const body = await resp.json().catch(() => ({}));
+    err.textContent = body.detail || {{ t["login.error"] | tojson }};
+    err.style.display = "block";
+  } catch (e) {
+    err.textContent = e.message;
+    err.style.display = "block";
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+{% endblock %}

@@ -17,6 +17,29 @@
   </div>
 </div>
 
+<div class="card">
+  <div class="card-header"><h3>{{ t["settings.access_title"] }}</h3></div>
+  <p class="gen-hint" style="margin:0 0 12px;">{{ t["settings.access_hint"] }}</p>
+  <div class="form-group">
+    <label>{{ t["settings.access_mode"] }}</label>
+    <select id="access-mode" style="width:100%;max-width:360px;" onchange="updateAccessUI()">
+      <option value="local_only">{{ t["settings.access_local_only"] }}</option>
+      <option value="lan_authenticated">{{ t["settings.access_lan"] }}</option>
+    </select>
+    <p id="access-mode-hint" style="font-size:12px;color:var(--text2);margin:6px 0 0;"></p>
+  </div>
+  <div class="form-group" id="access-current-group" style="display:none;">
+    <label>{{ t["settings.access_current_password"] }}</label>
+    <input type="password" id="access-current-password" autocomplete="current-password" style="width:100%;max-width:360px;">
+  </div>
+  <div class="form-group">
+    <label>{{ t["settings.access_new_password"] }}</label>
+    <input type="password" id="access-new-password" autocomplete="new-password" style="width:100%;max-width:360px;">
+    <p style="font-size:12px;color:var(--text2);margin:6px 0 0;">{{ t["settings.access_password_hint"] }}</p>
+  </div>
+  <button class="btn btn-primary" onclick="saveAccess(this)">{{ t["btn.save"] }}</button>
+</div>
+
 <!-- 全局 General：自定义 Skip Proxy（general 页平移） -->
 <div class="card gen-section">
   <div class="card-header">

@@ -1,0 +1,139 @@
+"""管理认证端点：登录、登出、会话查询与访问模式切换。
+
+公开端点（登录/登出/会话查询）不读取任何管理业务数据；
+``PUT /api/settings/access`` 受访问矩阵与 CSRF 保护（见 ``app.security``）。
+"""
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+
+from app.database import get_db
+from app.models import SystemConfig
+from app.security import (COOKIE_NAME, SESSION_MAX_AGE,
+                          get_session_signer, hash_admin_password,
+                          load_access_settings, require_csrf,
+                          verify_admin_password)
+
+router = APIRouter(tags=["认证"])
+
+
+def _set_session_cookie(response: Response, token: str, request: Request) -> None:
+    response.set_cookie(
+        COOKIE_NAME, token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="strict",
+        path="/",
+        secure=request.url.scheme == "https",
+    )
+
+
+class LoginBody(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+
+
+@router.post("/api/auth/login")
+async def login(body: LoginBody, request: Request, response: Response):
+    settings = await load_access_settings()
+    if not settings.password_hash:
+        return JSONResponse(status_code=403,
+                            content={"detail": "未设置管理密码"})
+    if not verify_admin_password(body.password, settings.password_hash):
+        return JSONResponse(status_code=401, content={"detail": "密码错误"})
+    token, csrf = get_session_signer().issue(loopback_implicit=False)
+    _set_session_cookie(response, token, request)
+    return {
+        "authenticated": True,
+        "csrf_token": csrf,
+        "admin_access": settings.admin_access,
+        "installation_role": settings.installation_role,
+    }
+
+
+@router.post("/api/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"authenticated": False}
+
+
+@router.get("/api/auth/session")
+async def session_info(request: Request):
+    from app.security import resolve_session
+    session = resolve_session(request)
+    if session is None:
+        return {"authenticated": False}
+    settings = await load_access_settings()
+    return {
+        "authenticated": True,
+        "csrf_token": session["csrf"],
+        "admin_access": settings.admin_access,
+        "installation_role": settings.installation_role,
+        "password_configured": settings.password_configured,
+    }
+
+
+class AccessUpdate(BaseModel):
+    installation_role: Literal["home_gateway"]
+    admin_access: Literal["local_only", "lan_authenticated"]
+    current_password: str | None = Field(default=None, max_length=128)
+    new_password: str | None = Field(default=None, max_length=128)
+
+
+@router.put("/api/settings/access")
+async def update_access(body: AccessUpdate, request: Request, db=Depends(get_db)):
+    """访问模式切换与管理密码设置。
+
+    首次启用 ``lan_authenticated`` 必须同时设置密码；
+    已配置密码后任何修改（含切换模式）都要求验证当前密码。
+    响应只返回角色、访问模式与 ``password_configured``，绝不返回哈希。
+    """
+    # 中间件放行后有效会话挂在 request.state；显式复查兜底
+    if not require_csrf(request):
+        return JSONResponse(status_code=403,
+                            content={"detail": "CSRF token missing or invalid"})
+
+    settings = await load_access_settings()
+
+    if settings.password_configured:
+        if not body.current_password or not verify_admin_password(
+                body.current_password, settings.password_hash or ""):
+            return JSONResponse(status_code=403, content={"detail": "当前密码错误"})
+    elif body.current_password:
+        return JSONResponse(status_code=400,
+                            content={"detail": "尚未设置管理密码，无需提供当前密码"})
+
+    if body.admin_access == "lan_authenticated" and not settings.password_configured:
+        if not body.new_password:
+            return JSONResponse(status_code=400,
+                                content={"detail": "首次启用局域网管理必须设置密码"})
+
+    new_hash = settings.password_hash
+    if body.new_password is not None:
+        if not body.new_password.strip():
+            return JSONResponse(status_code=400, content={"detail": "新密码不能为空"})
+        new_hash = hash_admin_password(body.new_password)
+
+    values = {
+        "installation_role": body.installation_role,
+        "admin_access": body.admin_access,
+        "admin_password_hash": new_hash,
+    }
+    result = await db.execute(
+        select(SystemConfig).where(SystemConfig.key.in_(values.keys())))
+    existing = {row.key: row for row in result.scalars().all()}
+    for key, value in values.items():
+        row = existing.get(key)
+        if row:
+            row.value = value
+        else:
+            db.add(SystemConfig(key=key, value=value))
+    await db.commit()
+    return {
+        "installation_role": body.installation_role,
+        "admin_access": body.admin_access,
+        "password_configured": bool(new_hash),
+    }

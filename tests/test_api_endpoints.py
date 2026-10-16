@@ -16,12 +16,18 @@ from app.models import ConfigProfile, CustomRule, HostMapping, ProxyNode
 
 @pytest_asyncio.fixture
 async def client(tmp_path, monkeypatch):
-    """独立临时库 + 手动驱动 lifespan（ASGITransport 不触发 lifespan 事件）"""
+    """独立临时库 + 手动驱动 lifespan（ASGITransport 不触发 lifespan 事件）
+
+    lifespan 会把 runtime 重新绑定到 SURGECONF_DATA_DIR 下的 surge_conf.db，
+    因此 create 路径与其保持一致；回环对端经 GET / 获得隐式管理会话后，
+    从页面 meta 提取 CSRF 供所有写请求使用。
+    """
+    import re
     from app.main import app as fastapi_app
     from app.database import DatabaseRuntime, get_db
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
-    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "api_test.db")
+    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
 
     async def override_get_db():
         async with test_runtime.session_factory() as session:
@@ -32,6 +38,10 @@ async def client(tmp_path, monkeypatch):
          patch("app.bootstrap.database", test_runtime):
         async with fastapi_app.router.lifespan_context(fastapi_app):
             async with AsyncClient(transport=ASGITransport(app=fastapi_app), base_url="http://test") as c:
+                page = await c.get("/")
+                meta = re.search(r'name="csrf-token" content="([^"]+)"', page.text)
+                assert meta, "回环 GET / 应签发隐式会话并输出 CSRF meta"
+                c.headers["X-CSRF-Token"] = meta.group(1)
                 c._test_factory = test_runtime.session_factory
                 yield c
 
@@ -62,7 +72,7 @@ async def test_delete_profile_cascades(client, tmp_path):
     assert all(p["id"] != pid for p in after.json())
 
     # 通过独立会话直查数据库：关联行已清零且已持久化
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/runtime/api_test.db")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/runtime/surge_conf.db")
     async with async_sessionmaker(engine, class_=AsyncSession)() as s:
         rules = (await s.execute(select(CustomRule).where(CustomRule.profile_id == pid))).scalars().all()
         hosts = (await s.execute(select(HostMapping).where(HostMapping.profile_id == pid))).scalars().all()

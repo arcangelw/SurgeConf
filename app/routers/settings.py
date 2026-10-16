@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -60,12 +61,17 @@ async def reset_data():
 
 # ===== 系统级配置（排除关键词、其他分组等） =====
 
+# 访问控制键由 PUT /api/settings/access 专用端点管理，
+# 防止批量端点读出密码哈希或绕过密码验证改写访问模式
+PROTECTED_CONFIG_KEYS = {"installation_role", "admin_access", "admin_password_hash"}
+
+
 @router.get("/config")
 async def get_sys_config(db=Depends(get_db)):
-    """获取所有系统级配置"""
+    """获取所有系统级配置（访问控制键除外）"""
     result = await db.execute(select(SystemConfig))
     configs = {row.key: row.value for row in result.scalars().all()}
-    return configs
+    return {k: v for k, v in configs.items() if k not in PROTECTED_CONFIG_KEYS}
 
 
 
@@ -74,9 +80,12 @@ class SysConfigBatchUpdate(BaseModel):
 
 @router.put("/config/batch")
 async def update_sys_config_batch(data: SysConfigBatchUpdate, db=Depends(get_db)):
-    """批量 upsert 系统配置：单事务单 commit"""
+    """批量 upsert 系统配置：单事务单 commit（访问控制键走专用端点）"""
     if not data.configs:
         return {"updated": 0}
+    if PROTECTED_CONFIG_KEYS & data.configs.keys():
+        return JSONResponse(status_code=400,
+                            content={"detail": "访问控制配置请使用 PUT /api/settings/access"})
     result = await db.execute(select(SystemConfig).where(SystemConfig.key.in_(data.configs.keys())))
     existing = {cfg.key: cfg for cfg in result.scalars().all()}
     for key, value in data.configs.items():

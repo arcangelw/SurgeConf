@@ -1,8 +1,22 @@
 /** 公共 API 工具 */
 
+/** 从页面 meta 读取当前会话 CSRF 值 */
+function csrfToken() {
+  return document.querySelector('meta[name="csrf-token"]')?.content || "";
+}
+
+/** 统一 fetch：登录态失效跳登录页 */
+async function apiFetch(url, options = {}) {
+  const resp = await fetch(url, options);
+  if (resp.status === 401 && !url.startsWith("/api/auth/")) {
+    window.location.href = "/login";
+  }
+  return resp;
+}
+
 const API = {
   async get(url) {
-    const resp = await fetch(url);
+    const resp = await apiFetch(url);
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `GET ${url}: ${resp.status}`);
@@ -10,9 +24,9 @@ const API = {
     return resp.json();
   },
   async post(url, data) {
-    const resp = await fetch(url, {
+    const resp = await apiFetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
       body: JSON.stringify(data),
     });
     if (!resp.ok) {
@@ -22,9 +36,9 @@ const API = {
     return resp.json();
   },
   async put(url, data) {
-    const resp = await fetch(url, {
+    const resp = await apiFetch(url, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
       body: JSON.stringify(data),
     });
     if (!resp.ok) {
@@ -34,7 +48,7 @@ const API = {
     return resp.json();
   },
   async del(url) {
-    const resp = await fetch(url, { method: "DELETE" });
+    const resp = await apiFetch(url, { method: "DELETE", headers: { "X-CSRF-Token": csrfToken() } });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `DELETE ${url}: ${resp.status}`);
@@ -42,11 +56,17 @@ const API = {
     return resp.json();
   },
   async getText(url) {
-    const resp = await fetch(url);
+    const resp = await apiFetch(url);
     if (!resp.ok) throw new Error(`GET ${url}: ${resp.status}`);
     return resp.text();
   },
 };
+
+/** 退出登录：清除会话后回登录页 */
+async function logout() {
+  try { await fetch("/api/auth/logout", { method: "POST" }); } catch (e) { /* 忽略 */ }
+  window.location.href = "/login";
+}
 
 function toast(message, type = "success") {
   const container = document.querySelector(".toast-container") || (() => {
