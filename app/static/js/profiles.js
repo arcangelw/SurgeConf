@@ -776,20 +776,28 @@ async function loadProfileStats(profileId) {
 // ===== Profile 基础 CRUD =====
 
 async function showAddProfile() {
+  // 新建默认目标 = 实例角色映射（与后端省略 target 时同一规则）。
+  // 会话读取失败 fail closed：明确报错且不打开弹窗——绝不能替用户
+  // 静默选定一个目标并提交（用户未明确选择时宁可不创建）。
+  let session;
+  try {
+    session = await API.get("/api/auth/session");
+  } catch (e) {
+    toast(I18N["profile.session_load_failed"], "error");
+    return;
+  }
+  if (!session || !session.authenticated ||
+      !ROLE_DEFAULT_TARGET[session.installation_role]) {
+    toast(I18N["profile.session_load_failed"], "error");
+    return;
+  }
   document.getElementById("profile-modal-title").textContent = I18N["profile.new"];
   document.getElementById("profile-edit-id").value = "";
   document.getElementById("profile-name").value = "";
   document.getElementById("profile-desc").value = "";
   document.getElementById("profile-locale").value = document.documentElement.lang === "en" ? "en" : "zh";
   document.getElementById("profile-default").checked = false;
-  // 新建默认目标 = 实例角色映射（与后端省略 target 时同一规则）；会话读取
-  // 失败按默认角色 fail-closed 回落 mac_gateway
-  let role = "home_gateway";
-  try {
-    const s = await API.get("/api/auth/session");
-    if (s && s.authenticated && ROLE_DEFAULT_TARGET[s.installation_role]) role = s.installation_role;
-  } catch (e) { /* 会话不可得：用默认角色 */ }
-  document.getElementById("profile-target").value = ROLE_DEFAULT_TARGET[role];
+  document.getElementById("profile-target").value = ROLE_DEFAULT_TARGET[session.installation_role];
   onProfileTargetChange();
   showModal("profile-modal");
 }

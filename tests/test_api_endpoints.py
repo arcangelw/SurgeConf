@@ -558,3 +558,79 @@ async def test_role_target_mapping_covers_all_valid_roles(client):
     assert set(DEFAULT_TARGET_BY_ROLE) == VALID_INSTALLATION_ROLES
     assert DEFAULT_TARGET_BY_ROLE["work_computer"].value == "mac_workstation"
     assert DEFAULT_TARGET_BY_ROLE["home_gateway"].value == "mac_gateway"
+
+
+@pytest.mark.asyncio
+async def test_create_role_resolution_reuses_request_session(client, monkeypatch):
+    """省略 target 的角色解析必须复用请求注入的同一 session：
+    spy 捕获 create 端点收到的 db，断言与 Depends(get_db) 注入实例同一对象，
+    而非另开 session 的全局 factory 产物。"""
+    import app.routers.configs as configs_router
+    from app.database import get_db
+    from app.main import app as fastapi_app
+
+    captured = {"role_db": None, "request_db": None}
+    orig_resolve = configs_router.resolve_installation_role
+
+    async def _spy(db):
+        captured["role_db"] = db
+        return await orig_resolve(db)
+
+    monkeypatch.setattr(configs_router, "resolve_installation_role", _spy)
+
+    orig_dep = fastapi_app.dependency_overrides[get_db]
+
+    async def _tracking_get_db():
+        async for session in orig_dep():
+            if captured["request_db"] is None:
+                captured["request_db"] = session
+            yield session
+
+    fastapi_app.dependency_overrides[get_db] = _tracking_get_db
+    try:
+        resp = await client.post("/api/configs/profiles", json={"name": "同session档"})
+        assert resp.status_code == 200, resp.text
+    finally:
+        fastapi_app.dependency_overrides[get_db] = orig_dep
+
+    assert captured["role_db"] is not None, "create 必须经 resolve_installation_role 取角色"
+    assert captured["role_db"] is captured["request_db"], \
+        "角色解析必须复用请求同一 session，不得另开连接"
+
+
+@pytest.mark.asyncio
+async def test_create_role_falls_back_when_db_value_invalid(client):
+    """库内非法角色行（绕过 API 写入）按 DEFAULT_INSTALLATION_ROLE 回落：
+    linux_toaster → home_gateway → mac_gateway"""
+    from app.models import SystemConfig
+
+    async with client._test_factory() as db:
+        db.add(SystemConfig(key="installation_role", value="linux_toaster"))
+        await db.commit()
+
+    created = await client.post("/api/configs/profiles", json={"name": "非法角色档"})
+    assert created.status_code == 200, created.text
+    profile = await _detail(client, created.json()["id"])
+    assert profile["target"] == "mac_gateway"
+
+
+@pytest.mark.asyncio
+async def test_guide_route_admin_boundary(client):
+    """/guide/{doc} 与管理页同一访问边界：回环管理会话 200；
+    切 lan_authenticated 后旧隐式会话失效 → 302 /login；未知指南 404。"""
+    ok = await client.get("/guide/profile-targets")
+    assert ok.status_code == 200
+    assert "档案目标设备" in ok.text
+    assert "<pre" in ok.text  # 以文档原文渲染，未转义丢失内容
+
+    await client.put("/api/settings/access", json={
+        "installation_role": "home_gateway", "admin_access": "lan_authenticated",
+        "new_password": "guide-test-pass"})
+    redirect = await client.get("/guide/profile-targets")
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "/login"
+
+    login = await client.post("/api/auth/login", json={"password": "guide-test-pass"})
+    assert login.status_code == 200
+    assert (await client.get("/guide/profile-targets")).status_code == 200
+    assert (await client.get("/guide/not-exist")).status_code == 404

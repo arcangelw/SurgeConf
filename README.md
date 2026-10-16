@@ -151,11 +151,11 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 
 | 目标 | 用途 | 最低版本 |
 |---|---|---|
-| `mac_workstation` | 单台 Mac 桌面使用 | Surge Mac 5.10.3 |
-| `mac_gateway` | Mac 作为局域网网关（强制 `gateway-restricted-to-lan`） | Surge Mac 5.10.3 |
+| `mac_workstation` | 单台 Mac 桌面使用 | Surge Mac 6.6.0 (Build 11270) |
+| `mac_gateway` | Mac 作为局域网网关（强制 `gateway-restricted-to-lan`） | Surge Mac 6.6.0 (Build 11270) |
 | `ios_mobile` | iPhone / iPad（UDP 模式仅 strict / compatible） | Surge iOS 5.14.6 |
 
-实例角色（设置页 → 访问控制）决定**新建档案省略目标时的默认值**（工作电脑 → Mac 工作站，家庭网关 → Mac 网关），不改写已有档案，也不是 Surge 网关（Gateway VM）开关。General 字段按目标裁剪：iOS 产物不含 Mac-only 键，网关强制仅本网段访问。两实例部署、能力矩阵、UDP 阶段边界与 Token 安全详见 [docs/PROFILE_TARGETS.md](docs/PROFILE_TARGETS.md)。
+实例角色（设置页 → 访问控制）决定**新建档案省略目标时的默认值**（工作电脑 → Mac 工作站，家庭网关 → Mac 网关），不改写已有档案，也不是 Surge 网关（Gateway VM）开关。General 字段按目标裁剪：iOS 产物不含 Mac-only 键，网关强制仅本网段访问。两实例部署、能力矩阵、UDP 阶段边界与 Token 安全详见 [docs/PROFILE_TARGETS.md](docs/PROFILE_TARGETS.md)（管理界面内可经设置页「打开运行指南」链接访问，路径 `/guide/profile-targets`）。
 
 ### launchd 配置持久化
 

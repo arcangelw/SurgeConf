@@ -91,18 +91,44 @@ async function restoreBackupFile(name) {
 // ===== 访问控制（本机 / 局域网登录） =====
 
 let accessConfigured = false;
+let accessLoaded = false;  // session 成功加载并回显后才允许提交
+
+/** 访问控制表单控件集合：加载成功前禁用，防未回显状态下误提交 */
+const ACCESS_FORM_IDS = ["installation-role", "access-mode",
+  "access-current-password", "access-new-password", "access-save-btn"];
+
+function setAccessFormDisabled(disabled) {
+  for (const id of ACCESS_FORM_IDS) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  }
+}
 
 async function loadAccess() {
   try {
     const s = await API.get("/api/auth/session");
-    if (!s.authenticated) return;
+    if (!s || !s.authenticated) {
+      // 未认证（如 lan 模式登录态失效）：锁定表单并明确提示
+      accessLoaded = false;
+      setAccessFormDisabled(true);
+      toast(I18N["settings.access_load_failed"], "error");
+      return;
+    }
     accessConfigured = !!s.password_configured;
     document.getElementById("access-mode").value = s.admin_access;
     // 实例角色回显：仅决定新建档案默认目标，非法/缺失值回落默认角色
     const roleSel = document.getElementById("installation-role");
     if (roleSel) roleSel.value = s.installation_role === "work_computer" ? "work_computer" : "home_gateway";
     updateAccessUI();
-  } catch (e) { /* 静默：设置页本身已受访问矩阵保护 */ }
+    accessLoaded = true;
+    setAccessFormDisabled(false);
+  } catch (e) {
+    // 加载失败（含成功后再次失效）：明确报错并回锁表单——回显值已不可信，
+    // saveAccess guard 同步复位，杜绝基于过期会话的提交
+    accessLoaded = false;
+    setAccessFormDisabled(true);
+    toast(I18N["settings.access_load_failed"], "error");
+  }
 }
 
 function updateAccessUI() {
@@ -116,6 +142,11 @@ function updateAccessUI() {
 }
 
 async function saveAccess(btn) {
+  // 会话未成功加载（表单禁用）时防御性拒绝：程序触发也不得提交
+  if (!accessLoaded) {
+    toast(I18N["settings.access_load_failed"], "error");
+    return;
+  }
   const mode = document.getElementById("access-mode").value;
   const roleSel = document.getElementById("installation-role");
   const role = roleSel ? roleSel.value : "home_gateway";

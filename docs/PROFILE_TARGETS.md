@@ -19,29 +19,25 @@ SurgeConf 支持为不同的 Surge 设备形态生成不同的配置产物。每
 - 修改角色**绝不改写已有档案**——每个档案的 target 独立保存。
 - 实例角色**不是 Surge 网关（Gateway VM）的开关**。见下文「Profile 不能开启 Gateway VM」。
 
-创建 API 契约（`POST /api/configs/profiles`）：
+创建 API 契约（`POST /api/configs/profiles`）。以下为**请求体示意，不能直接执行**：该端点要求管理会话（Cookie）与 `X-CSRF-Token` 请求头，直接 `curl` 会得到 401/403。日常操作请使用管理界面（配置方案页 → 新建），或先经 `/api/auth/login` 建立会话并从页面 meta 提取 CSRF Token：
 
-```bash
-# 省略 target：按实例角色取默认（work_computer 实例 → mac_workstation）
-curl -X POST http://127.0.0.1:61830/api/configs/profiles \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Work-daily"}'
+```json
+// 省略 target：按实例角色取默认（work_computer 实例 → mac_workstation）
+{"name": "Work-daily"}
 
-# 显式 target 优先（本例为虚构名称；home_gateway 实例也可显式建 iOS 档案）
-curl -X POST http://127.0.0.1:61830/api/configs/profiles \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Phone", "target": "ios_mobile"}'
+// 显式 target 优先（本例为虚构名称；home_gateway 实例也可显式建 iOS 档案）
+{"name": "Phone", "target": "ios_mobile"}
 ```
 
 `target` 与 `udp_security_mode` 均不允许显式 `null`（422）：省略即取默认（目标默认模式 / 实例角色默认目标）。
 
 ## 三个目标与最低版本
 
-| 目标 | 用途 | 最低版本 | 依据 |
+| 目标 | 用途 | 最低版本 | 说明 |
 |---|---|---|---|
-| `mac_workstation` | 单台 Mac 桌面使用 | Surge Mac 5.10.3 | 产物强制输出 `block-quic`（5.10.3 引入） |
-| `mac_gateway` | Mac 作为局域网网关 | Surge Mac 5.10.3 | 同上；另强制 `gateway-restricted-to-lan`（5.8.1 引入，被 block-quic 下限覆盖） |
-| `ios_mobile` | iPhone / iPad | Surge iOS 5.14.6 | 产物强制输出 `block-quic`（iOS 5.14.6 引入） |
+| `mac_workstation` | 单台 Mac 桌面使用 | Surge Mac 6.6.0 (Build 11270) | 项目以该版本为基准开发，产物经其 `surge-cli --check` 校验 |
+| `mac_gateway` | Mac 作为局域网网关 | Surge Mac 6.6.0 (Build 11270) | 同上；另强制 `gateway-restricted-to-lan = true` 仅接受本网段设备 |
+| `ios_mobile` | iPhone / iPad | Surge iOS 5.14.6 | 产物强制输出 `block-quic` 等键（iOS 5.14.6 引入） |
 
 低于上述版本的 Surge 可能无法解析产物中的强制键，导入前请先升级客户端。
 
@@ -85,7 +81,7 @@ General 字段能力由唯一能力矩阵（`app/profile_targets.py`）派生，
 
 ## 数据与 Token 安全
 
-- 档案列表 API 仅返回最小披露字段（`id` / `name` / `description` / `is_default` / `locale` / `target` / `udp_security_mode` / `token_configured`）；`token_configured` 是布尔状态，**任何接口都不回显 Token 明文或哈希**。
+- 档案列表 API 仅返回最小披露字段（`id` / `name` / `description` / `is_default` / `locale` / `target` / `udp_security_mode` / `token_configured`）；列表与详情**不回显 Token 明文或哈希**，签发/轮换响应是唯一一次明文例外。
 - 订阅 Token（`POST /api/configs/profiles/{id}/token`）只在生成/轮换的响应里显示一次；管理界面同样只在一次性对话框中展示，关闭即清空。
 - 逐档案订阅端点 `GET /api/configs/profiles/{id}/subscribe?token=...` 是唯一免管理会话的只读路径，与登录会话、CSRF 完全隔离；轮换使旧链接立即失效。
 - MITM 证书等秘密字段在详情里只返回 `{"configured": true/false}`。

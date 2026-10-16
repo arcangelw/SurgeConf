@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ guide_title }} - SurgeConf{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ guide_title }}</h1>
+</div>
+<div class="card">
+  <pre style="margin:0;white-space:pre-wrap;font-size:13px;line-height:1.7;">{{ guide_body }}</pre>
+</div>
+{% endblock %}

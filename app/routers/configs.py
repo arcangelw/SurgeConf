@@ -24,7 +24,8 @@ from app.services.profile_resolution import (DefaultProfileMissing, ProfileNotFo
                                              resolve_profile)
 from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
                                resolve_runtime_paths)
-from app.security import issue_profile_token, load_access_settings, verify_profile_token
+from app.security import (issue_profile_token, resolve_installation_role,
+                          verify_profile_token)
 from app.services.backups import unique_path
 from app.services.config_validation import InvalidConfiguration, validate_rule_order
 from app.services.generator import generate_surge_config
@@ -160,9 +161,10 @@ async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(g
         raise HTTPException(422, "target 不允许显式 null：省略该字段以使用实例角色默认目标")
     if data.target is None:
         # 未显式指定 target：按实例角色单向映射取默认（显式 target 优先；
-        # 角色变化只影响此后创建，已有档案不受影响）
-        settings = await load_access_settings()
-        data.target = default_target_for_role(settings.installation_role)
+        # 角色变化只影响此后创建，已有档案不受影响）。角色经请求同一
+        # session 读取（resolve_installation_role），不另开连接
+        role = await resolve_installation_role(db)
+        data.target = default_target_for_role(role)
     # 显式 null 不等于省略：区分「未提供」（用目标默认模式）与「显式非法值」
     if data.udp_security_mode is None and "udp_security_mode" in data.model_fields_set:
         raise HTTPException(422, "udp_security_mode 不允许显式 null：省略该字段以使用目标默认模式")

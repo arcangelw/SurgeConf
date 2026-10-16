@@ -174,7 +174,8 @@ def test_session_secret_rejects_symlink(tmp_path):
 # ===== local_only：回环隐式管理，非回环一律拒绝 =====
 
 @pytest.mark.parametrize("path", ["/", "/api/subscriptions", "/api/configs/profiles",
-                                  "/login", "/api/auth/login", "/api/auth/session"])
+                                  "/login", "/api/auth/login", "/api/auth/session",
+                                  "/guide/profile-targets"])
 @pytest.mark.asyncio
 async def test_local_only_rejects_non_loopback(client_from_lan, path):
     assert (await client_from_lan.get(path)).status_code == 403

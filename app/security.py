@@ -295,6 +295,24 @@ async def load_access_settings() -> AccessSettings:
     )
 
 
+async def resolve_installation_role(db) -> str:
+    """用调用方注入的同一请求 session 解析实例角色。
+
+    与 ``load_access_settings`` 同一收敛规则（缺失/非法回落
+    ``DEFAULT_INSTALLATION_ROLE``），但不另开数据库 session——业务端点
+    （如档案创建）在自身事务内读取，避免读写分叉。合法值集合始终取
+    ``VALID_INSTALLATION_ROLES`` 唯一登记。
+    """
+    from sqlalchemy import select
+    from app.models import SystemConfig
+
+    result = await db.execute(
+        select(SystemConfig).where(SystemConfig.key == "installation_role"))
+    row = result.scalar_one_or_none()
+    role = (row.value or "") if row else ""
+    return role if role in VALID_INSTALLATION_ROLES else DEFAULT_INSTALLATION_ROLE
+
+
 # ===== 请求判定 =====
 
 class Decision:

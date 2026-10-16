@@ -81,6 +81,34 @@ async def page_settings(request: Request):
     return _render(request, "settings.html")
 
 
+GUIDE_DOC_PATHS = {
+    "profile-targets": "PROFILE_TARGETS.md",
+}
+
+
+@router.get("/guide/{doc}", response_class=HTMLResponse)
+async def page_guide(doc: str, request: Request):
+    """仓库文档指南页（如 docs/PROFILE_TARGETS.md）。
+
+    非公开路径：与全部管理页同一访问边界（local_only 非回环 403、
+    lan_authenticated 未登录 302 /login），未认证设备不可读取。
+    """
+    from fastapi import HTTPException
+    filename = GUIDE_DOC_PATHS.get(doc)
+    if not filename:
+        raise HTTPException(404, "指南不存在")
+    path = os.path.join(os.path.dirname(BASE_DIR), "docs", filename)
+    try:
+        with open(path, encoding="utf-8") as f:
+            body = f.read()
+    except OSError as exc:
+        raise HTTPException(404, "指南文档缺失") from exc
+    return _render(request, "guide.html", {
+        "guide_title": "docs/" + filename,
+        "guide_body": body,
+    })
+
+
 @router.get("/login", response_class=HTMLResponse)
 async def page_login(request: Request):
     """登录页公开渲染；已持有当前模式下有效会话时直接回到首页"""

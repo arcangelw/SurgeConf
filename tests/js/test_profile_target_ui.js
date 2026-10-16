@@ -55,6 +55,8 @@ const I18N_STUB = {
   "tab.overview": "概览", "tab.general": "General",
   "settings.access_local_hint": "local", "settings.access_lan_hint": "lan",
   "settings.access_password_required": "需要密码", "settings.access_saved": "已保存",
+  "settings.access_load_failed": "访问设置加载失败，表单暂不可用；请刷新页面重试。",
+  "profile.session_load_failed": "无法读取管理会话，请刷新页面重试；未确认实例角色前不打开新建弹窗。",
 };
 
 function makeElement(initial) {
@@ -82,7 +84,7 @@ const optionValues = (sel) =>
   [...String(sel.innerHTML).matchAll(/<option value="([^"]*)"/g)].map(m => m[1]);
 
 /** 独立 profiles.js context；role 控制 /api/auth/session，profiles 控制列表 */
-function createProfilesPage({ role = "home_gateway", sessionFails = false, profiles = [] } = {}) {
+function createProfilesPage({ role = "home_gateway", sessionFails = false, unauthenticated = false, profiles = [] } = {}) {
   const elements = new Map();
   const calls = { post: [], put: [], del: [], modals: [], toasts: [] };
   const documentStub = {
@@ -98,7 +100,7 @@ function createProfilesPage({ role = "home_gateway", sessionFails = false, profi
     async get(url) {
       if (url.includes("/api/auth/session")) {
         if (sessionFails) throw new Error("session unavailable");
-        return { authenticated: true, installation_role: role,
+        return { authenticated: !unauthenticated, installation_role: role,
                  admin_access: "local_only", password_configured: false };
       }
       if (url === "/api/configs/profiles") return profiles;
@@ -133,8 +135,9 @@ function createProfilesPage({ role = "home_gateway", sessionFails = false, profi
 }
 
 /** 独立 settings.js context */
-function createSettingsPage({ role = "work_computer", passwordConfigured = false } = {}) {
+function createSettingsPage({ role = "work_computer", passwordConfigured = false, sessionFails = false } = {}) {
   const elements = new Map();
+  const sessionState = { fails: sessionFails };
   const calls = { put: [], toasts: [] };
   const documentStub = {
     documentElement: { lang: "zh" },
@@ -144,9 +147,12 @@ function createSettingsPage({ role = "work_computer", passwordConfigured = false
   };
   const API = {
     async get(url) {
-      if (url.includes("/api/auth/session")) return { authenticated: true,
-        installation_role: role, admin_access: "local_only",
-        password_configured: passwordConfigured };
+      if (url.includes("/api/auth/session")) {
+        if (sessionState.fails) throw new Error("session unavailable");
+        return { authenticated: true,
+          installation_role: role, admin_access: "local_only",
+          password_configured: passwordConfigured };
+      }
       if (url.includes("/api/settings/config")) return { exclusion_keywords: "" };
       if (url.includes("/api/settings/skip-proxy")) return { items: [] };
       if (url.includes("/api/settings/backups")) return [];
@@ -170,7 +176,7 @@ function createSettingsPage({ role = "work_computer", passwordConfigured = false
   vm.runInContext(SETTINGS_SRC + `
 ;globalThis.__hooks = { saveAccess, loadAccess };`, sandbox, { filename: "settings.js" });
   const reg = (id, initial) => { const el = makeElement(initial); elements.set(id, el); return el; };
-  return { sandbox, elements, reg, calls };
+  return { sandbox, elements, reg, calls, failSession: () => { sessionState.fails = true; } };
 }
 
 const drain = () => new Promise((r) => setTimeout(r, 0));
@@ -202,10 +208,26 @@ const drain = () => new Promise((r) => setTimeout(r, 0));
     page.reg("profile-name"); page.reg("profile-desc");
     page.reg("profile-locale"); page.reg("profile-default");
     const target = page.reg("profile-target", { value: "" });
-    const mode = page.reg("profile-mode"); page.reg("profile-target-hint");
+    page.reg("profile-mode"); page.reg("profile-target-hint");
     await page.sandbox.__hooks.showAddProfile();
-    assert.equal(target.value, "mac_gateway", "会话失败回落默认角色目标");
-    assert.equal(mode.value, "scoped");
+    assert.ok(page.calls.toasts.some(t => t.type === "error"), "会话不可得必须报错");
+    assert.deepEqual(page.calls.modals.filter(m => m[0] === "show"), [], "会话不可得不打开弹窗");
+    assert.equal(page.calls.post.length, 0, "会话不可得绝不发出创建 POST");
+    assert.equal(target.value, "", "不预填任何目标（用户未明确选择）");
+    await drain();
+  }
+  {
+    // 未认证会话（authenticated: false）同样 fail closed
+    const page = createProfilesPage({ unauthenticated: true });
+    page.reg("profile-modal-title"); page.reg("profile-edit-id");
+    page.reg("profile-name"); page.reg("profile-desc");
+    page.reg("profile-locale"); page.reg("profile-default");
+    page.reg("profile-target", { value: "" });
+    page.reg("profile-mode"); page.reg("profile-target-hint");
+    await page.sandbox.__hooks.showAddProfile();
+    assert.ok(page.calls.toasts.some(t => t.type === "error"), "未认证会话必须报错");
+    assert.deepEqual(page.calls.modals.filter(m => m[0] === "show"), [], "未认证不打开弹窗");
+    assert.equal(page.calls.post.length, 0, "未认证绝不发出创建 POST");
     await drain();
   }
 
@@ -297,39 +319,80 @@ const drain = () => new Promise((r) => setTimeout(r, 0));
     await drain();
   }
 
-  // ===== settings.js：角色回显 + saveAccess 提交所选角色 =====
-  {
-    const page = createSettingsPage({ role: "work_computer" });
-    const roleSel = page.reg("installation-role", { value: "home_gateway" });
-    page.reg("access-mode", { value: "local_only" });
+  // ===== settings.js：三态门控（未完成禁用 / 失败禁用+报错 / 成功启用）=====
+  const regAccessForm = (page, { roleValue = "home_gateway" } = {}) => {
+    const els = {
+      role: page.reg("installation-role", { value: roleValue, disabled: true }),
+      mode: page.reg("access-mode", { value: "local_only", disabled: true }),
+      save: page.reg("access-save-btn", { disabled: true }),
+      current: page.reg("access-current-password", { value: "", disabled: true }),
+      next: page.reg("access-new-password", { value: "", disabled: true }),
+    };
     page.reg("access-mode-hint"); page.reg("access-current-group");
-    page.reg("access-current-password"); page.reg("access-new-password");
-    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
-    // loadAccess 已在模块加载时执行；这里再验证保存路径提交 select 当前值
-    assert.equal(page.calls.put.length, 1);
-    assert.equal(page.calls.put[0].url, "/api/settings/access");
-    assert.equal(page.calls.put[0].body.installation_role, "home_gateway",
-      "saveAccess 提交 select 所选角色（非硬编码）");
-    await drain();
+    return els;
+  };
+  const allDisabled = (els) => [els.role, els.mode, els.save, els.current, els.next]
+    .every(e => e.disabled === true);
+
+  {
+    // 态1：session 请求未完成——控件保持 HTML 初始禁用（真实异步：不 await）
+    const page = createSettingsPage({ role: "work_computer" });
+    const els = regAccessForm(page);
+    const pending = page.sandbox.__hooks.loadAccess();  // 不等待
+    assert.ok(allDisabled(els), "session 未完成时表单全部禁用");
+    assert.equal(page.calls.put.length, 0, "禁用态 saveAccess 不应已被程序触发");
+    await pending; await drain();
+    assert.ok(!allDisabled(els), "session 成功后表单启用");
   }
   {
-    // loadAccess 回显：角色 work_computer 填入 select
-    const page = createSettingsPage({ role: "work_computer" });
-    const roleSel = page.reg("installation-role", { value: "home_gateway" });
-    page.reg("access-mode", { value: "local_only" });
-    page.reg("access-mode-hint"); page.reg("access-current-group");
+    // 态2：session 请求失败——toast 报错且保持禁用；saveAccess guard 拒绝提交
+    const page = createSettingsPage({ sessionFails: true });
+    const els = regAccessForm(page);
     await page.sandbox.__hooks.loadAccess();
-    assert.equal(roleSel.value, "work_computer", "loadAccess 回显实例角色");
-    await drain();
+    assert.ok(page.calls.toasts.some(t => t.msg.includes("加载失败")), "加载失败明确报错");
+    assert.ok(allDisabled(els), "失败后表单保持禁用");
+    // 程序触发 saveAccess（绕过 disabled 控件）：guard 仍拒绝
+    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    assert.equal(page.calls.put.length, 0, "guard 拒绝未加载状态的提交");
+    assert.ok(page.calls.toasts.some(t => t.msg.includes("加载失败")), "guard 报错提示");
+  }
+  {
+    // 态2b：成功启用后 session 再失效——回锁表单 + guard 复位（浏览器重验发现的缺口）
+    const page = createSettingsPage({ role: "work_computer" });
+    const els = regAccessForm(page);
+    await page.sandbox.__hooks.loadAccess();
+    assert.ok(!allDisabled(els), "先成功启用");
+    page.failSession();  // 切换 stub 为失败
+    await page.sandbox.__hooks.loadAccess();
+    assert.ok(allDisabled(els), "成功后再失败必须回锁全部控件");
+    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    assert.equal(page.calls.put.length, 0, "guard 复位后拒绝提交");
+  }
+  {
+    // 态3：session 成功——回显角色 + 启用 + saveAccess 提交所选角色（非硬编码）
+    const page = createSettingsPage({ role: "work_computer" });
+    const els = regAccessForm(page, { roleValue: "home_gateway" });
+    await page.sandbox.__hooks.loadAccess();
+    assert.equal(els.role.value, "work_computer", "loadAccess 回显实例角色");
+    assert.ok(!allDisabled(els), "成功后全部启用");
+    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    assert.equal(page.calls.put.length, 1);
+    assert.equal(page.calls.put[0].url, "/api/settings/access");
+    assert.equal(page.calls.put[0].body.installation_role, "work_computer",
+      "saveAccess 提交 select 当前值（回显后的角色）");
+    // 用户显式改选后提交所选值（非硬编码）
+    els.role.value = "home_gateway";
+    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    assert.equal(page.calls.put.length, 2);
+    assert.equal(page.calls.put[1].body.installation_role, "home_gateway",
+      "saveAccess 提交用户改选的角色");
   }
   {
     // 非法角色回落 home_gateway（后端已收敛，前端防御）
     const page = createSettingsPage({ role: "linux_toaster" });
-    const roleSel = page.reg("installation-role", { value: "work_computer" });
-    page.reg("access-mode", { value: "local_only" });
-    page.reg("access-mode-hint"); page.reg("access-current-group");
+    const els = regAccessForm(page, { roleValue: "work_computer" });
     await page.sandbox.__hooks.loadAccess();
-    assert.equal(roleSel.value, "home_gateway", "非法角色回落默认");
+    assert.equal(els.role.value, "home_gateway", "非法角色回落默认");
   }
 
   console.log("test_profile_target_ui.js: all assertions passed");
