@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, DateTime, JSON
+from sqlalchemy import CheckConstraint, Column, Integer, String, Boolean, Text, DateTime, JSON
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -67,6 +67,19 @@ class ServiceGroup(Base):
 
 class ConfigProfile(Base):
     __tablename__ = "config_profiles"
+    # 与 migrations/versions/0003_profile_targets.py 中 batch 约束同名同表达式；
+    # 无版本库识别（SCHEMA_REVISION_CHECKS）据此 fail-closed
+    __table_args__ = (
+        CheckConstraint(
+            "target IN ('mac_workstation', 'mac_gateway', 'ios_mobile')",
+            name="ck_config_profiles_target"),
+        CheckConstraint(
+            "udp_security_mode IN ('strict', 'scoped', 'compatible')",
+            name="ck_config_profiles_udp_security_mode"),
+        CheckConstraint(
+            "NOT (target = 'ios_mobile' AND udp_security_mode = 'scoped')",
+            name="ck_config_profiles_target_udp_mode"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), nullable=False, unique=True, comment="配置名称")

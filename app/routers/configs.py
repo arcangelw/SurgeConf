@@ -149,6 +149,9 @@ async def get_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/profiles")
 async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(get_db)):
+    # 显式 null 不等于省略：区分「未提供」（用目标默认模式）与「显式非法值」
+    if data.udp_security_mode is None and "udp_security_mode" in data.model_fields_set:
+        raise HTTPException(422, "udp_security_mode 不允许显式 null：省略该字段以使用目标默认模式")
     mode = data.udp_security_mode or default_udp_mode(data.target)
     try:
         validate_target_mode(data.target, mode)

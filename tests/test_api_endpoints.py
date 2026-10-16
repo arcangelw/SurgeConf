@@ -381,6 +381,19 @@ async def test_missing_profile_id_never_falls_back_to_default(client):
 
 @pytest.mark.asyncio
 async def test_export_missing_profile_is_404(client):
-    """导出不存在的档案：404（显式 id 解析，不回退默认档案）"""
-    resp = await client.post("/api/configs/profiles/9999/exports", json={"confirm": True})
+    """导出不存在的档案：命中真实 /api/configs/{id}/exports 路由的显式解析 404"""
+    resp = await client.post("/api/configs/9999/exports", json={"confirm": True})
     assert resp.status_code == 404
+    # 区别于路由不存在的默认 404（detail="Not Found"），证明命中 _require_profile
+    assert resp.json()["detail"] == "配置方案不存在"
+
+
+@pytest.mark.asyncio
+async def test_create_profile_explicit_null_mode_rejected(client):
+    """显式 null 的 udp_security_mode 是 422（不是“省略”），且不落库"""
+    before = (await client.get("/api/configs/profiles")).json()
+    resp = await client.post("/api/configs/profiles", json={
+        "name": "空模式档", "target": "ios_mobile", "udp_security_mode": None})
+    assert resp.status_code == 422
+    after = (await client.get("/api/configs/profiles")).json()
+    assert [p["name"] for p in after] == [p["name"] for p in before]

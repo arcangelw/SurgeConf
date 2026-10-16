@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy
+from alembic import command
 
 from app.database import Base
 from app.runtime_paths import RuntimePaths
@@ -31,18 +32,21 @@ def runtime_paths(root: Path) -> RuntimePaths:
 
 
 def create_current_schema_database(path: Path) -> Path:
-    """合成"当前基线业务表、无 alembic_version / 无 data_migration_records"的旧式库"""
+    """合成 0001 基线指纹、无 alembic_version / 无 data_migration_records 的旧式库。
+
+    经 Alembic 建到 0001 再剔除簿记表：ORM metadata 声明了 0003 的命名
+    CHECK 约束（引用 target/udp_security_mode 列），直接 create_all 后
+    DROP COLUMN 会被 SQLite 拒绝，且基线库本就不该带 0003 约束。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    engine = sqlalchemy.create_engine(f"sqlite:///{path}")
-    tables = [t for t in Base.metadata.sorted_tables if t.name != "data_migration_records"]
-    Base.metadata.create_all(engine, tables=tables)
-    # 合成 pre-Alembic 基线：剔除基线之后各 revision 新增的列（真实旧库没有它们）
-    post_baseline = {col for delta in database_migration.SCHEMA_REVISION_DELTAS.values()
-                     for col in delta}
-    with engine.begin() as conn:
-        for table, column in sorted(post_baseline):
-            conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN {column}")
+    command.upgrade(database_migration._alembic_config(path),
+                    database_migration.BASELINE_REVISION)
+    conn = sqlite3.connect(path)
+    with conn:
+        conn.execute("DROP TABLE alembic_version")
+        conn.execute("DROP TABLE data_migration_records")
+    conn.close()
     return path
 
 
@@ -138,8 +142,9 @@ def create_unversioned_complete_head_database(path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_unversioned_complete_0002_stamps_0002_not_baseline(tmp_path):
-    """无版本但完整 0002：stamp 0002（no-op 升级），绝不统一 stamp 0001"""
+async def test_unversioned_complete_head_stamps_head_not_baseline(tmp_path):
+    """无版本但列+约束与完整 head 指纹一致：stamp 当前 head（no-op 升级），
+    绝不统一 stamp 0001"""
     legacy = create_unversioned_complete_head_database(
         tmp_path / "repo" / "data" / "surge_conf.db")
     paths = runtime_paths(tmp_path / "app-support")
@@ -150,6 +155,83 @@ async def test_unversioned_complete_0002_stamps_0002_not_baseline(tmp_path):
     cols = {row[1] for row in sqlite_rows(paths.database, "PRAGMA table_info(config_profiles)")}
     assert "subscription_token_hash" in cols
     assert sqlite_scalar(paths.database, "PRAGMA integrity_check") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_unversioned_head_columns_without_checks_rejected(tmp_path):
+    """列指纹与 head 一致但缺 0003 CHECK 约束：fail closed，绝不 stamp head。
+
+    模拟外部工具直接 ALTER TABLE ADD COLUMN 加列（无约束）的真实 SQLite 库。
+    """
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    command.upgrade(database_migration._alembic_config(legacy),
+                    "0002_profile_subscription_tokens")
+    conn = sqlite3.connect(legacy)
+    with conn:
+        conn.execute("DROP TABLE alembic_version")
+        conn.execute("ALTER TABLE config_profiles ADD COLUMN target VARCHAR(20) "
+                     "NOT NULL DEFAULT 'mac_workstation'")
+        conn.execute("ALTER TABLE config_profiles ADD COLUMN udp_security_mode VARCHAR(20) "
+                     "NOT NULL DEFAULT 'scoped'")
+    conn.close()
+
+    paths = runtime_paths(tmp_path / "app-support")
+    before = paths.database.read_bytes() if paths.database.exists() else None
+    with pytest.raises(RuntimeError, match="ck_config_profiles") as excinfo:
+        await prepare_database(paths, legacy)
+    details = str(excinfo.value)
+    for name in ("ck_config_profiles_target", "ck_config_profiles_udp_security_mode",
+                 "ck_config_profiles_target_udp_mode"):
+        assert name in details
+    assert (paths.database.read_bytes() if paths.database.exists() else None) == before
+
+
+@pytest.mark.asyncio
+async def test_prepared_head_rejects_invalid_target_and_mode_rows(tmp_path):
+    """prepare 之后的 head 库在 DB 层拒绝三类非法写入：目标集合 / 模式集合 / iOS+scoped"""
+    paths = runtime_paths(tmp_path / "app-support")
+    await prepare_database(paths, tmp_path / "missing.db")
+    bad_rows = [
+        ("坏目标", 0, "linux", "scoped"),
+        ("坏模式", 0, "mac_workstation", "loose"),
+        ("坏组合", 0, "ios_mobile", "scoped"),
+    ]
+    for name, is_default, target, mode in bad_rows:
+        conn = sqlite3.connect(paths.database)
+        with pytest.raises(sqlite3.IntegrityError):
+            with conn:
+                conn.execute(
+                    "INSERT INTO config_profiles (name, is_default, target, udp_security_mode) "
+                    "VALUES (?, ?, ?, ?)", (name, is_default, target, mode))
+        conn.close()
+
+
+def test_alembic_head_check_constraints_match_metadata(tmp_path):
+    """强制器：迁移产物、ORM metadata、SCHEMA_REVISION_CHECKS 三处约束名一致"""
+    from sqlalchemy.schema import CheckConstraint
+
+    from app.models import ConfigProfile
+
+    expected = {c.name for c in ConfigProfile.__table__.constraints
+                if isinstance(c, CheckConstraint)}
+    registered = set(database_migration.SCHEMA_REVISION_CHECKS[
+        database_migration._head_revision()]["config_profiles"])
+    assert expected == registered == {
+        "ck_config_profiles_target",
+        "ck_config_profiles_udp_security_mode",
+        "ck_config_profiles_target_udp_mode",
+    }
+
+    path = tmp_path / "head.db"
+    command.upgrade(database_migration._alembic_config(path), "head")
+    engine = sqlalchemy.create_engine(f"sqlite:///{path}")
+    try:
+        actual = {cc["name"] for cc in
+                  sqlalchemy.inspect(engine).get_check_constraints("config_profiles")}
+    finally:
+        engine.dispose()
+    assert actual == expected
 
 
 @pytest.mark.asyncio

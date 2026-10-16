@@ -1,4 +1,5 @@
 import os
+import sqlalchemy
 import sqlite3
 from argparse import Namespace
 from dataclasses import dataclass
@@ -118,6 +119,20 @@ SCHEMA_REVISION_DELTAS: dict[str, set[tuple[str, str]]] = {
                              ("config_profiles", "udp_security_mode")},
 }
 
+# 各 revision 必需的命名 CHECK 约束（表 → 约束名集合）。
+# **新增带约束的 revision 时在此登记**；无版本库识别缺任一必需约束即 fail-closed
+#（列指纹一致也不 stamp）。约束名同时由 ORM metadata（models.py __table_args__）
+# 与对应迁移声明，三处必须同名。
+SCHEMA_REVISION_CHECKS: dict[str, dict[str, frozenset[str]]] = {
+    "0003_profile_targets": {
+        "config_profiles": frozenset({
+            "ck_config_profiles_target",
+            "ck_config_profiles_udp_security_mode",
+            "ck_config_profiles_target_udp_mode",
+        }),
+    },
+}
+
 # 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建
 _IDENTIFY_IGNORED_TABLES = {"alembic_version", "data_migration_records"}
 
@@ -134,40 +149,59 @@ def schema_fingerprints() -> dict[str, dict[str, frozenset[str]]]:
     return fingerprints
 
 
-def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]]]:
+def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]]:
     assert_sqlite_database_safe(database_path)
-    """实际库的表集合与表→列集合（排除簿记表）"""
-    with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as conn:
-        tables = {
-            row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")
-        } - _IDENTIFY_IGNORED_TABLES
-        columns = {
-            table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-            for table in tables
-        }
-    return tables, columns
+    """实际库的表集合、表→列集合、表→命名 CHECK 约束集合（排除簿记表）。
+
+    约束经 SQLAlchemy inspector 读取，不解析 sqlite_master DDL 文本
+    （避免依赖空白/顺序的脆弱正则）。
+    """
+    engine = sqlalchemy.create_engine(f"sqlite:///{database_path}")
+    try:
+        inspector = sqlalchemy.inspect(engine)
+        tables = {t for t in inspector.get_table_names()
+                  if t not in _IDENTIFY_IGNORED_TABLES}
+        columns = {t: {c["name"] for c in inspector.get_columns(t)} for t in tables}
+        checks = {t: {cc["name"] for cc in inspector.get_check_constraints(t)}
+                  for t in tables}
+    finally:
+        engine.dispose()
+    return tables, columns, checks
+
+
+def _missing_required_checks(revision: str, actual_checks: dict[str, set[str]]) -> set[str]:
+    """revision 必需但库中缺失的 CHECK 约束名（跨表打平）"""
+    missing: set[str] = set()
+    for table, required in SCHEMA_REVISION_CHECKS.get(revision, {}).items():
+        missing |= required - actual_checks.get(table, set())
+    return missing
 
 
 def identify_unversioned_schema(database_path: Path) -> str | None:
-    """无版本库精确识别：表/列与某个 revision 指纹完全一致才返回该 revision。
+    """无版本库精确识别：表/列与某个 revision 指纹完全一致、且该 revision
+    必需的命名 CHECK 约束齐全，才返回该 revision。
 
-    额外列、缺失列或混合多个 revision 的列都返回 None（绝不猜测性 stamp）。
+    额外列、缺失列、混合多个 revision 的列或缺任一必需约束都返回 None
+    （绝不猜测性 stamp）。
     """
-    actual_tables, actual_columns = _actual_schema(database_path)
+    actual_tables, actual_columns, actual_checks = _actual_schema(database_path)
     for revision, fingerprint in schema_fingerprints().items():
         if actual_tables != set(fingerprint):
             continue
-        if all(actual_columns[table] == set(columns)
-               for table, columns in fingerprint.items()):
-            return revision
+        if not all(actual_columns[table] == set(columns)
+                   for table, columns in fingerprint.items()):
+            continue
+        if _missing_required_checks(revision, actual_checks):
+            continue
+        return revision
     return None
 
 
 def _schema_mismatch_details(database_path: Path) -> list[str]:
-    """与最近 revision 指纹的差异描述：只含表/列名，绝不含数据值"""
-    fingerprint = schema_fingerprints()[_head_revision()]
-    actual_tables, actual_columns = _actual_schema(database_path)
+    """与最近 revision 指纹的差异描述：只含表/列/约束名，绝不含数据值"""
+    head = _head_revision()
+    fingerprint = schema_fingerprints()[head]
+    actual_tables, actual_columns, actual_checks = _actual_schema(database_path)
     problems: list[str] = []
     for table in sorted(set(fingerprint) - actual_tables):
         problems.append(f"缺表 {table}")
@@ -182,6 +216,10 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
             problems.append(f"{table} 缺列: {', '.join(sorted(missing))}")
         if extra:
             problems.append(f"{table} 额外列: {', '.join(sorted(extra))}")
+    for table, required in SCHEMA_REVISION_CHECKS.get(head, {}).items():
+        missing = required - actual_checks.get(table, set())
+        if missing:
+            problems.append(f"{table} 缺 CHECK 约束: {', '.join(sorted(missing))}")
     if not problems:
         problems.append("schema 与已知 revision 指纹均不一致（混合列）")
     return problems
