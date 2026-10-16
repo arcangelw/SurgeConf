@@ -75,6 +75,43 @@
     </div>
   </div>
 </div>
+
+<!-- UDP 例外编辑弹窗：完整值输入仅用于当次请求；关闭（按钮/ESC/遮罩）即清空 -->
+<div class="modal-overlay" id="udp-exception-modal">
+  <div class="modal" style="max-width:560px;">
+    <h3 id="udp-exception-modal-title">{{ t["profile.udp_exc_new"] }}</h3>
+    <input type="hidden" id="udp-exc-edit-id">
+    <input type="hidden" id="udp-exc-profile-id" value="">
+    <div class="form-group" id="udp-exc-current-row" style="display:none;">
+      <label>{{ t["profile.udp_current_masked_label"] }}</label>
+      <code id="udp-exc-current-masked" style="font-size:12px;"></code>
+    </div>
+    <div class="form-group">
+      <label id="udp-exc-value-label">{{ t["profile.udp_value_label_process"] }}</label>
+      <input type="text" id="udp-exc-value" autocomplete="off" placeholder="{{ t["profile.udp_placeholder_process"] }}">
+      <p id="udp-exc-value-hint" style="font-size:11px;color:var(--text2);margin-top:4px;">{{ t["profile.udp_hint_process_format"] }}</p>
+    </div>
+    <div class="form-group">
+      <label>{{ t["profile.udp_display_name_label"] }}</label>
+      <input type="text" id="udp-exc-display-name" placeholder="{{ t["profile.udp_display_name_placeholder"] }}">
+    </div>
+    <div style="display:flex;gap:16px;">
+      <div class="form-group">
+        <label class="checkbox" style="margin-top:28px;">
+          <input type="checkbox" id="udp-exc-enabled" checked> {{ t["profile.udp_enabled_label"] }}
+        </label>
+      </div>
+      <div class="form-group" style="flex:1;">
+        <label>{{ t["profile.udp_sort_label"] }}</label>
+        <input type="number" id="udp-exc-sort" value="0">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeUdpExceptionDialog()">{{ t["btn.cancel"] }}</button>
+      <button class="btn btn-primary" onclick="saveUdpException(this)">{{ t["btn.save"] }}</button>
+    </div>
+  </div>
+</div>
 {{ m.custom_rule_modal() }}
 {{ m.host_modal() }}
 

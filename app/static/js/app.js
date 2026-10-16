@@ -53,7 +53,8 @@ const API = {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `DELETE ${url}: ${resp.status}`);
     }
-    return resp.json();
+    // 204 No Content 无响应体（如 UDP 例外删除）：不得调用 resp.json()
+    return resp.status === 204 ? null : resp.json();
   },
   async getText(url) {
     const resp = await apiFetch(url);

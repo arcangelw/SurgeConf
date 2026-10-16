@@ -83,6 +83,7 @@ async def page_settings(request: Request):
 
 GUIDE_DOC_PATHS = {
     "profile-targets": "PROFILE_TARGETS.md",
+    "udp-compatibility": "UDP_COMPATIBILITY.md",
 }
 
 

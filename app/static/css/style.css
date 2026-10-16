@@ -1196,3 +1196,28 @@ textarea {
   .px-item .px-grip { display: none; }
   .px-add { width: auto; margin-top: 0; }
 }
+
+/* ===== UDP 安全 Tab：模式行 / 说明块 / scoped 警告 ===== */
+.udp-mode-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.udp-mode-select { max-width: 340px; min-width: 0; }
+.udp-note { font-size: 12px; color: var(--text2); margin: 0 0 10px; line-height: 1.7; }
+.udp-note-warn { color: var(--warning); }
+.udp-fastpath {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; margin: 0 0 12px; background: var(--surface2);
+}
+.udp-fastpath strong { display: block; font-size: 12px; margin-bottom: 4px; }
+.udp-fastpath p { margin: 0; font-size: 12px; color: var(--text2); line-height: 1.7; }
+.udp-fastpath a { color: var(--primary); }
+.udp-scoped-warn {
+  display: flex; gap: 8px; align-items: flex-start;
+  background: rgba(253, 203, 110, 0.12);
+  border: 1px solid rgba(253, 203, 110, 0.45);
+  color: var(--warning); border-radius: 10px;
+  padding: 10px 12px; font-size: 12px; line-height: 1.7;
+  margin: 0 0 12px;
+}
+
+@media (max-width: 768px) {
+  .udp-mode-select { max-width: 100%; flex: 1 1 160px; }
+}
