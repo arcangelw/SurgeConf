@@ -695,8 +695,8 @@ async def test_udp_mode_migration_preserves_user_lookalikes(db):
 
 @pytest.mark.asyncio
 async def test_udp_mode_migration_whitespace_normalization_boundaries(db):
-    """规范器边界：仅逗号分隔符两侧 ASCII 水平空白与整行首尾水平空白视为等价；
-    token 内空白 / CR / LF / 括号内非分隔空白 / Unicode 空白一律不折叠"""
+    """规范器边界：仅逗号分隔符两侧 ASCII 水平空白视为等价；
+    token 内空白 / CR / LF / 括号内非分隔空白 / Unicode 空白 / 行首尾空白一律保留"""
     s0, s1, s3 = (LEGACY_MANAGED_STUN_SIGNATURES[0], LEGACY_MANAGED_STUN_SIGNATURES[1],
                   LEGACY_MANAGED_STUN_SIGNATURES[3])
     keep = [
@@ -718,6 +718,12 @@ async def test_udp_mode_migration_whitespace_normalization_boundaries(db):
         # Unicode 空白（全角空格）不折叠
         CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
                    rule_text="DOMAIN-KEYWORD,stun\u3000,REJECT", comment=s0["comment"]),
+        # 行首空格（不位于任何逗号一侧）→ 保留
+        CustomRule(profile_id=None, position="pre", sort_order=s3["sort_order"],
+                   rule_text=" PROTOCOL,STUN,REJECT", comment=s3["comment"]),
+        # 行尾 tab（不位于任何逗号一侧）→ 保留
+        CustomRule(profile_id=None, position="pre", sort_order=s3["sort_order"],
+                   rule_text="PROTOCOL,STUN,REJECT\t", comment=s3["comment"]),
     ]
     doomed = [
         # 逗号后 ASCII tab（分隔符两侧水平空白）→ 等价删除
@@ -726,9 +732,6 @@ async def test_udp_mode_migration_whitespace_normalization_boundaries(db):
         # 逗号前空格（分隔符两侧水平空白）→ 等价删除
         CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
                    rule_text="DOMAIN-KEYWORD,stun ,REJECT", comment=s0["comment"]),
-        # 整行首尾水平空白（行级 trim，无语义）→ 等价删除
-        CustomRule(profile_id=None, position="pre", sort_order=s3["sort_order"],
-                   rule_text="  PROTOCOL,STUN,REJECT\t", comment=s3["comment"]),
     ]
     db.add_all((*keep, *doomed))
     await db.commit()
