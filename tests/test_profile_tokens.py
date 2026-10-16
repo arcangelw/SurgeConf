@@ -85,7 +85,8 @@ async def _seed_subscription_and_node(admin_client) -> int:
             config="HK-01 = trojan, 1.2.3.4, 443, password=topsecret",
             subscription_id=sub.id, enabled=True,
             stable_key=stable_node_key(
-                {"config": "HK-01 = trojan, 1.2.3.4, 443, password=topsecret"}),
+                {"name": "HK-01",
+                 "config": "HK-01 = trojan, 1.2.3.4, 443, password=topsecret"}),
         ))
         await db.commit()
         return sub.id

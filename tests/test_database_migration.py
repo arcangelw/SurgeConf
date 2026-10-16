@@ -1049,7 +1049,8 @@ def _insert_node(conn, *, node_id: int, sub_id, config: str,
         "INSERT INTO proxy_nodes (id, name, subscription_id, node_type, server, "
         "port, config, region_manual, pinned_services, enabled) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (node_id, name or f"node{node_id}", sub_id, node_type, server, port,
+        (node_id, name or config.split("=", 1)[0].strip() or f"node{node_id}",
+         sub_id, node_type, server, port,
          config, region_manual,
          _json.dumps(pins) if pins is not None else None, enabled))
 
@@ -1383,13 +1384,72 @@ def test_0006_frozen_canonicalizer_matches_runtime(tmp_path):
     from app.services.node_identity import stable_node_key
 
     vectors = (
-        ("US A = trojan, edge.example.com, 443, password=synthetic",
-         "US Renamed = TROJAN , EDGE.Example.COM , 0443 , password=synthetic",
+        ("US A", "US A = trojan, edge.example.com, 443, password=synthetic",
+         "US Renamed", "US Renamed = TROJAN , EDGE.Example.COM , 0443 , password=synthetic",
          "905a00f8e51b5ad424b686a4dcfc4b693ff2cfd9ca59b2e9ca6f95cea4e63f13"),
-        ("JP = ss, relay.example.jp, 8388, aes-256-gcm, password=alpha",
-         "JP 2 = ss, relay.example.jp, 8388, password=alpha, aes-256-gcm",
+        ("JP", "JP = ss, relay.example.jp, 8388, aes-256-gcm, password=alpha",
+         "JP 2", "JP 2 = ss, relay.example.jp, 8388, password=alpha, aes-256-gcm",
          "2a9e16a3d2d8cc906cdcb2b92b94beded9a962953e3c773b5ddaeef4b0a1f865"),
+        ("edge=a=b", 'edge=a=b = trojan, edge.example.com, 443, password="x,y", sni=a.example',
+         "zzz", 'zzz = TROJAN, EDGE.example.com, 443, sni=a.example, password="x,y"',
+         "bfd02a8d4134e7cfbab060528cfcbb3c78bcca99a9d77e8827107cae5d2f9754"),
+        ("v6", "v6 = trojan, [2001:0DB8:0000::0001], 443, password=p # backup node",
+         "v6b", "v6b = trojan, 2001:db8::1, 443, password=p",
+         "6489872da8054837f3b501ee9e29b8cc8a7b42734476b361bdcae8cc8c797f28"),
     )
-    for first, second, expected in vectors:
-        assert stable_node_key({"config": first}) == expected
-        assert stable_node_key({"config": second}) == expected
+    for name_a, first, name_b, second, expected in vectors:
+        assert stable_node_key({"name": name_a, "config": first}) == expected
+        assert stable_node_key({"name": name_b, "config": second}) == expected
+
+
+# ===== Fix Round 1：0006 对 name=/转义/注释/IPv6/IDNA/重复参数名的处理 =====
+
+def test_0006_computes_keys_for_hardened_configs(tmp_path):
+    """name 含 =、quoted comma、inline comment、IPv6 压缩、IDNA 域名的
+    订阅节点都能算出与运行时一致的 stable_key"""
+    from app.services.node_identity import stable_node_key
+
+    cases = [
+        # (name, config)
+        ("edge=a=b", 'edge=a=b = trojan, edge.example.com, 443, password="x,y", sni=a.example'),
+        ("v6", "v6 = trojan, [2001:0DB8:0000::0001], 443, password=p # backup node"),
+        ("u", "u = ss, BÜCHER.example.COM, 443, password=p"),
+        ("esc", 'esc = trojan, h.example.com, 443, password="a\\"b"'),
+    ]
+    db_path = _make_0005_database(tmp_path / "hardened.db")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        _insert_subscription(conn, sub_id=1)
+        for index, (name, config) in enumerate(cases, start=1):
+            _insert_node(conn, node_id=index, sub_id=1, name=name, config=config)
+    conn.close()
+
+    command.upgrade(database_migration._alembic_config(db_path), "head")
+
+    rows = dict(sqlite_rows(db_path, "SELECT name, stable_key FROM proxy_nodes"))
+    for name, config in cases:
+        assert rows[name] == stable_node_key({"name": name, "config": config})
+
+
+@pytest.mark.asyncio
+async def test_0006_duplicate_parameter_key_aborts_and_keeps_source(tmp_path):
+    """订阅节点 config 含重复（大小写归一后相同的）参数名：迁移失败，
+    源库保持 0005 且字节不变"""
+    legacy = tmp_path / "repo" / "data" / "surge_conf.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    _make_0005_database(legacy)
+    conn = sqlite3.connect(legacy)
+    with conn:
+        _insert_subscription(conn, sub_id=1)
+        _insert_node(conn, node_id=1, sub_id=1,
+                     config="dup = trojan, h.example.com, 443, sni=x, SNI=y")
+    conn.close()
+    before = legacy.read_bytes()
+
+    paths = runtime_paths(tmp_path / "app-support")
+    with pytest.raises(RuntimeError):
+        await prepare_database(paths, legacy)
+
+    assert legacy.read_bytes() == before
+    assert sqlite_scalar(legacy, "SELECT version_num FROM alembic_version") \
+        == "0005_udp_exceptions"

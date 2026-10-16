@@ -88,7 +88,7 @@ async def db_with_nodes(db):
         ProxyNode(name="HK-01", node_type="trojan", server="1.1.1.1", port=443,
                   config=_HK01_CONFIG, region_auto="香港",
                   region_manual="香港", enabled=True, subscription_id=10,
-                  stable_key=stable_node_key({"config": _HK01_CONFIG})),
+                  stable_key=stable_node_key({"name": "HK-01", "config": _HK01_CONFIG})),
         ProxyNode(name="HK-02", node_type="trojan", server="1.1.1.2", port=443,
                   config="HK-02 = trojan, 1.1.1.2, 443, password=x", region_auto="香港",
                   enabled=True),

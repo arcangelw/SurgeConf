@@ -30,8 +30,10 @@ Create Date: 2026-10-17
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
+import unicodedata
 from datetime import datetime, timedelta
 
 import sqlalchemy as sa
@@ -59,16 +61,42 @@ class _FrozenIdentityError(RuntimeError):
 
 
 def _frozen_split_tokens(text):
+    """转义与注释感知的逗号分割（引号内转义解码；前导空格 #/;// 注释截断）"""
     tokens, buf, in_quotes = [], [], False
-    for char in text:
-        if char == '"':
-            in_quotes = not in_quotes
+    index, length = 0, len(text)
+    while index < length:
+        char = text[index]
+        if in_quotes:
+            if char == "\\":
+                if index + 1 >= length:
+                    raise _FrozenIdentityError("节点连接参数包含尾随转义符")
+                nxt = text[index + 1]
+                if nxt == '"':
+                    buf.append('"')
+                elif nxt == "\\":
+                    buf.append("\\")
+                else:
+                    raise _FrozenIdentityError("节点连接参数包含未知转义序列")
+                index += 2
+                continue
+            if char == '"':
+                in_quotes = False
             buf.append(char)
-        elif char == "," and not in_quotes:
-            tokens.append("".join(buf))
-            buf = []
         else:
-            buf.append(char)
+            if char == '"':
+                in_quotes = True
+                buf.append(char)
+            elif char == ",":
+                tokens.append("".join(buf))
+                buf = []
+            elif char in "#;" and index > 0 and text[index - 1] == " ":
+                break  # inline comment：丢弃其余内容
+            elif (char == "/" and index + 1 < length and text[index + 1] == "/"
+                    and index > 0 and text[index - 1] == " "):
+                break
+            else:
+                buf.append(char)
+        index += 1
     if in_quotes:
         raise _FrozenIdentityError("节点连接参数包含未闭合引号")
     tokens.append("".join(buf))
@@ -100,56 +128,106 @@ def _frozen_port(raw):
     return str(port)
 
 
-def _frozen_key(config):
+def _frozen_host(raw):
+    """IP 文本标准压缩（去 IPv6 方括号）；非 ASCII 域名 NFC→IDNA→lower；
+    单一尾点去除"""
+    host = raw
+    if any(ch.isspace() for ch in host):
+        raise _FrozenIdentityError("节点主机名格式非法")
+    if host.startswith("[") and host.endswith("]") and len(host) > 2:
+        host = host[1:-1]
+    if ":" in host:
+        try:
+            return str(ipaddress.ip_address(host))
+        except ValueError:
+            raise _FrozenIdentityError("节点主机名格式非法") from None
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ValueError:
+        pass
+    if host.endswith("."):
+        host = host[:-1]
+    if not host:
+        raise _FrozenIdentityError("节点主机名格式非法")
+    if host.isascii():
+        return host.lower()
+    normalized = unicodedata.normalize("NFC", host)
+    try:
+        return normalized.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        raise _FrozenIdentityError("节点主机名格式非法") from None
+
+
+def _frozen_extract(config, name):
+    """以显示名精确定位 name 空白* = 分隔（显示名可含 =，绝不按首个 = 切分）"""
+    if not isinstance(name, str) or not name.strip():
+        raise _FrozenIdentityError("节点缺少显示名")
+    if not config.startswith(name):
+        raise _FrozenIdentityError("节点连接配置与显示名不匹配")
+    rest = config[len(name):]
+    index = 0
+    while index < len(rest) and rest[index] in (" ", "\t"):
+        index += 1
+    if index >= len(rest) or rest[index] != "=":
+        raise _FrozenIdentityError("节点连接配置缺少连接表达")
+    expression = rest[index + 1:]
+    if not expression.strip():
+        raise _FrozenIdentityError("节点连接配置缺少连接表达")
+    return expression
+
+
+def _frozen_key(config, name):
     if not isinstance(config, str) or not config.strip():
         raise _FrozenIdentityError("节点缺少连接配置")
     if any(char in config for char in ("\r", "\n", "\0")):
         raise _FrozenIdentityError("节点连接配置包含非法控制字符")
-    if "=" not in config:
-        raise _FrozenIdentityError("节点连接配置缺少连接表达")
-    _, _, expression = config.partition("=")
-    if not expression.strip():
-        raise _FrozenIdentityError("节点连接配置缺少连接表达")
+    expression = _frozen_extract(config, name)
     tokens = [_frozen_token(t) for t in _frozen_split_tokens(expression)]
     if len(tokens) < 3:
         raise _FrozenIdentityError("节点连接参数不完整")
     protocol = tokens[0]
     if any(ch.isspace() for ch in protocol):
         raise _FrozenIdentityError("节点协议名格式非法")
-    host = tokens[1]
-    if any(ch.isspace() for ch in host):
-        raise _FrozenIdentityError("节点主机名格式非法")
+    host = _frozen_host(tokens[1])
     port = _frozen_port(tokens[2])
-    positional, key_values = [], []
+    positional, key_values, seen_keys = [], [], set()
     for token in tokens[3:]:
         if "=" in token:
             key, _, value = token.partition("=")
             key = key.strip().lower()
             if not key or any(ch.isspace() for ch in key):
                 raise _FrozenIdentityError("节点参数名格式非法")
+            if key in seen_keys:
+                raise _FrozenIdentityError("节点连接参数存在重复参数名")
+            seen_keys.add(key)
             key_values.append((key, _frozen_token(value)))
         else:
             positional.append(token)
-    parts = [protocol.lower(), host.lower(), port, *positional,
+    parts = [protocol.lower(), host, port, *positional,
              *(f"{k}={v}" for k, v in sorted(key_values))]
     canonical = "\n".join(parts).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
-# golden vectors：算法漂移（与 0006 冻结版不一致）时升级直接失败
 _GOLDEN_VECTORS = (
-    ("US A = trojan, edge.example.com, 443, password=synthetic",
-     "US Renamed = TROJAN , EDGE.Example.COM , 0443 , password=synthetic",
+    ("US A", "US A = trojan, edge.example.com, 443, password=synthetic",
+     "US Renamed", "US Renamed = TROJAN , EDGE.Example.COM , 0443 , password=synthetic",
      "905a00f8e51b5ad424b686a4dcfc4b693ff2cfd9ca59b2e9ca6f95cea4e63f13"),
-    ("JP = ss, relay.example.jp, 8388, aes-256-gcm, password=alpha",
-     "JP 2 = ss, relay.example.jp, 8388, password=alpha, aes-256-gcm",
+    ("JP", "JP = ss, relay.example.jp, 8388, aes-256-gcm, password=alpha",
+     "JP 2", "JP 2 = ss, relay.example.jp, 8388, password=alpha, aes-256-gcm",
      "2a9e16a3d2d8cc906cdcb2b92b94beded9a962953e3c773b5ddaeef4b0a1f865"),
+    ("edge=a=b", "edge=a=b = trojan, edge.example.com, 443, password=\"x,y\", sni=a.example",
+     "zzz", "zzz = TROJAN, EDGE.example.com, 443, sni=a.example, password=\"x,y\"",
+     "bfd02a8d4134e7cfbab060528cfcbb3c78bcca99a9d77e8827107cae5d2f9754"),
+    ("v6", "v6 = trojan, [2001:0DB8:0000::0001], 443, password=p # backup node",
+     "v6b", "v6b = trojan, 2001:db8::1, 443, password=p",
+     "6489872da8054837f3b501ee9e29b8cc8a7b42734476b361bdcae8cc8c797f28"),
 )
 
 
 def _verify_frozen_algorithm() -> None:
-    for first, second, expected in _GOLDEN_VECTORS:
-        if _frozen_key(first) != expected or _frozen_key(second) != expected:
+    for name_a, first, name_b, second, expected in _GOLDEN_VECTORS:
+        if _frozen_key(first, name_a) != expected or _frozen_key(second, name_b) != expected:
             raise RuntimeError("0006 canonicalizer drifted from golden vectors")
 
 
@@ -236,12 +314,12 @@ def upgrade() -> None:
         batch.add_column(sa.Column("stable_key", sa.String(length=64), nullable=True))
 
     nodes = bind.execute(sa.text(
-        "SELECT id, subscription_id, config, region_manual, pinned_services, enabled "
+        "SELECT id, subscription_id, name, config, region_manual, pinned_services, enabled "
         "FROM proxy_nodes WHERE subscription_id IS NOT NULL")).mappings().all()
 
     groups: dict[tuple[int, str], list] = {}
     for node in nodes:
-        key = _frozen_key(node["config"])  # 非法 config → 迁移失败，源库不变
+        key = _frozen_key(node["config"], node["name"])  # 非法 config → 迁移失败，源库不变
         bind.execute(sa.text(
             "UPDATE proxy_nodes SET stable_key = :key WHERE id = :id"),
             {"key": key, "id": node["id"]})

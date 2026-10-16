@@ -166,3 +166,159 @@ def test_failure_messages_never_echo_config_on_crlf():
     with pytest.raises(NodeIdentityError) as excinfo:
         stable_node_key({"name": "A", "config": config})
     assert "injected" not in str(excinfo.value)
+
+
+# ===== Fix Round 1：重复参数名 / name 含 = / 转义与注释 / 主机规范 =====
+
+import pytest
+
+from app.services.node_identity import canonical_connection_bytes
+
+
+# --- 重复（大小写归一后的）参数名：fail closed ---
+
+@pytest.mark.parametrize("config", [
+    "n = trojan, h.example.com, 443, sni=x, sni=y",
+    "n = trojan, h.example.com, 443, sni=x, SNI=y",
+    "n = trojan, h.example.com, 443, SNI=x, sni=y",
+    'n = trojan, h.example.com, 443, sni="x", sni=y',
+])
+def test_duplicate_parameter_key_fails_closed(config):
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": config})
+
+
+def test_duplicate_parameter_key_failure_does_not_echo_values():
+    with pytest.raises(NodeIdentityError) as excinfo:
+        stable_node_key({"name": "n",
+                         "config": "n = trojan, h.example.com, 443, secret-a=1, SECRET-B=2, secret-a=3"})
+    assert "secret-a" not in str(excinfo.value)
+
+
+def test_distinct_parameter_keys_still_allowed():
+    node = parsed_node(name="n", config="n = trojan, h.example.com, 443, sni=x, skip-cert-verify=true")
+    assert stable_node_key(node)
+
+
+# --- 显示名含 =（URI fragment 解码产物）：按 name 精确定位分隔 ---
+
+def test_stable_key_supports_name_containing_equals():
+    first = parsed_node(name="edge=a=b", config="edge=a=b = trojan, edge.example.com, 443, password=x")
+    second = parsed_node(name="renamed", config="renamed = TROJAN, EDGE.example.com, 0443, password=x")
+    assert stable_node_key(first) == stable_node_key(second)
+
+
+def test_name_mismatch_fails_closed():
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "wrong", "config": "n = trojan, h.example.com, 443, password=x"})
+
+
+def test_missing_separator_after_name_fails_closed():
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": "n trojan, h.example.com, 443"})
+
+
+def test_uri_fragment_encoded_name_flows_to_identity():
+    """URI fragment %3D → parser 产出 name 含 = → identity 按 name 提取连接"""
+    from app.services.subscription import _parse_uri
+
+    node = _parse_uri("trojan://pw@edge.example.com:443?sni=edge.example.com#edge%3Da%3Db")
+    assert node is not None
+    assert node["name"] == "edge=a=b"
+    key = stable_node_key(node)
+    manual = parsed_node(name="x", config="x = trojan, edge.example.com, 443, password=pw, sni=edge.example.com")
+    assert key == stable_node_key(manual)
+
+
+def test_failure_never_echoes_name_or_host():
+    secret_host = "s3cret-host.example.internal"
+    with pytest.raises(NodeIdentityError) as excinfo:
+        stable_node_key({"name": "n",
+                         "config": f"n = trojan, {secret_host}, 443, sni=x, sni=y"})
+    assert secret_host not in str(excinfo.value)
+
+
+# --- 转义与注释 ---
+
+def test_quoted_escape_sequences_decode():
+    node = {"name": "x", "config": 'x = trojan, h.example.com, 443, password="a\\"b"'}
+    assert canonical_connection_bytes(node) == b'trojan\nh.example.com\n443\npassword=a"b'
+    node2 = {"name": "x", "config": 'x = trojan, h.example.com, 443, password="a\\\\b"'}
+    assert canonical_connection_bytes(node2) == b"trojan\nh.example.com\n443\npassword=a\\b"
+
+
+@pytest.mark.parametrize("config", [
+    'n = trojan, h, 443, password="a\\qb"',   # 未知转义
+    'n = trojan, h, 443, password="ab\\',    # 尾随转义
+], ids=["unknown-escape", "trailing-escape"])
+def test_invalid_escape_fails_closed(config):
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": config})
+
+
+def test_inline_comment_after_space_is_stripped():
+    with_comment = parsed_node(name="v6", config="v6 = trojan, h.example.com, 443, password=p # backup node")
+    without = parsed_node(name="z", config="z = trojan, H.example.com, 443, password=p")
+    assert stable_node_key(with_comment) == stable_node_key(without)
+
+    semicolon = parsed_node(name="s", config="s = trojan, h.example.com, 443, password=p ; note")
+    slashes = parsed_node(name="d", config="d = trojan, h.example.com, 443, password=p // note")
+    assert stable_node_key(semicolon) == stable_node_key(without)
+    assert stable_node_key(slashes) == stable_node_key(without)
+
+
+def test_comment_markers_without_leading_space_are_literal():
+    """无前导空格的 # 与 // 不是注释（如 URL scheme 里的 ://）"""
+    url_node = parsed_node(name="u", config="u = http, h.example.com, 443, url=https://a.example/p, password=p")
+    assert canonical_connection_bytes(url_node) == \
+        b"http\nh.example.com\n443\npassword=p\nurl=https://a.example/p"
+    hash_node = parsed_node(name="m", config="m = trojan, h.example.com, 443, path=a#b")
+    assert b"path=a#b" in canonical_connection_bytes(hash_node)
+
+
+def test_comment_markers_inside_quotes_are_literal():
+    node = {"name": "q", "config": 'q = trojan, h.example.com, 443, password="a#b;c//d"'}
+    assert canonical_connection_bytes(node) == b"trojan\nh.example.com\n443\npassword=a#b;c//d"
+
+
+# --- 主机规范化 ---
+
+def test_ipv6_literal_compressed_and_bracket_stripped():
+    first = parsed_node(name="a", config="a = trojan, [2001:0DB8:0000::0001], 443, password=x")
+    second = parsed_node(name="b", config="b = trojan, 2001:db8::1, 443, password=x")
+    assert stable_node_key(first) == stable_node_key(second)
+    assert canonical_connection_bytes({"name": "a", "config": "a = trojan, [::FFFF:0102:0304], 443, p=k"}) \
+        .split(b"\n")[1] == b"::ffff:1.2.3.4"
+
+
+def test_invalid_ipv6_text_fails_closed():
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": "n = trojan, [2001:zz::1], 443, password=x"})
+
+
+def test_unicode_host_nfc_idna_equivalence():
+    precomposed = parsed_node(name="a", config="a = ss, BÜCHER.example.COM, 443, password=x")
+    decomposed_name = "BU\u0308CHER.example.com"
+    decomposed = parsed_node(name="b", config=f"b = ss, {decomposed_name}, 443, password=x")
+    punycode = parsed_node(name="c", config="c = ss, xn--bcher-kva.example.com, 443, password=x")
+    keys = {stable_node_key(precomposed), stable_node_key(decomposed), stable_node_key(punycode)}
+    assert len(keys) == 1
+
+
+def test_trailing_dot_host_equivalence():
+    first = parsed_node(name="a", config="a = trojan, example.com., 443, password=x")
+    second = parsed_node(name="b", config="b = trojan, EXAMPLE.com, 443, password=x")
+    assert stable_node_key(first) == stable_node_key(second)
+
+
+def test_distinct_hosts_remain_distinct():
+    first = parsed_node(name="a", config="a = ss, xn--bcher-kva.example.com, 443, password=x")
+    second = parsed_node(name="b", config="b = ss, bucher.example.com, 443, password=x")
+    assert stable_node_key(first) != stable_node_key(second)
+
+
+def test_host_with_whitespace_fails_closed():
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": "n = ss, bad host.example, 443, password=x"})
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": "n = ss, ☃.example\tcom, 443, password=x"})

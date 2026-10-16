@@ -33,7 +33,7 @@ def _make_node(name, region_manual=None, sub_id=None):
         name=name, node_type="trojan", server="0.0.0.0", port=443,
         config=f"{name} = trojan, 0.0.0.0, 443, password=x",
         region_manual=region_manual, enabled=True,
-        stable_key=stable_node_key({"config": f"{name} = trojan, 0.0.0.0, 443, password=x"})
+        stable_key=stable_node_key({"name": name, "config": f"{name} = trojan, 0.0.0.0, 443, password=x"})
         if sub_id is not None else None,
     )
     n.subscription_id = sub_id
@@ -84,7 +84,7 @@ class TestDisplayName:
         node = ProxyNode(name="HK-01", node_type="trojan", server="0.0.0.0", port=443,
                          config="HK-01 = trojan, 0.0.0.0, 443, password=x",
                          subscription_id=5,
-                         stable_key=stable_node_key({"config": "HK-01 = trojan, 0.0.0.0, 443, password=x"}))
+                         stable_key=stable_node_key({"name": "HK-01", "config": "HK-01 = trojan, 0.0.0.0, 443, password=x"}))
         assert _display_name(node, {5: "机场A"}) == "(机场A) HK-01"
 
 
@@ -622,7 +622,7 @@ async def test_full_config_subscription_prefix(db):
     db.add(ProxyNode(name="HK-01", node_type="trojan", server="1.1.1.1", port=443,
                      config="HK-01 = trojan, 1.1.1.1, 443, password=x",
                      enabled=True, subscription_id=1,
-                     stable_key=stable_node_key({"config": "HK-01 = trojan, 1.1.1.1, 443, password=x"})))
+                     stable_key=stable_node_key({"name": "HK-01", "config": "HK-01 = trojan, 1.1.1.1, 443, password=x"})))
     await db.commit()
 
     config = await generate_surge_config(db)

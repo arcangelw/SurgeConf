@@ -11,7 +11,9 @@ from app.services.subscription import cleanup_orphan_nodes
 
 def _subscribed(config: str, **overrides) -> dict:
     """订阅节点公共字段：stable_key 由连接配置计算（CHECK 要求非 NULL）"""
-    fields = {"config": config, "stable_key": stable_node_key({"config": config})}
+    fields = {"config": config,
+              "stable_key": stable_node_key(
+                  {"name": config.split("=", 1)[0].strip(), "config": config})}
     fields.update(overrides)
     return fields
 
