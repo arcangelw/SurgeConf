@@ -394,6 +394,9 @@ function collectGeneralValues(profileId) {
       return null;
     }
   }
+  // custom JSON 重新注入的 forced 键同样移除：以可信 metadata 为准；
+  // 普通键与表外未知键保留在 payload，交由后端校验（未知/危险键 422）
+  for (const key of forcedKeys) delete values[key];
   return values;
 }
 

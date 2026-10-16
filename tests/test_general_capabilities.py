@@ -431,3 +431,12 @@ class TestSaveValuesEndpoint:
                                         "block-quic",
                                         "udp-policy-not-supported-behaviour"}
         assert "skip-proxy" not in profile.general
+
+
+def test_i18n_general_keys_complete():
+    """zh/en 均含 forced 徽标与 tags 占位键（防止新增键覆盖既有键）"""
+    from app.i18n import TRANSLATIONS
+    for locale in ("zh", "en"):
+        table = TRANSLATIONS[locale]
+        assert table.get("general.forced_badge"), locale
+        assert table.get("general.tags_placeholder"), locale
