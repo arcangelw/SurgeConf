@@ -368,6 +368,85 @@ async def test_dangling_migration_disabled_same_name_candidates_do_not_block(db)
     assert action == "Global"
 
 
+
+# 参数化场景表：(中文旧 action, en 输出候选, 规则源名, 规则源 URL)
+_LOCALIZED_BLOCK_CASES = [
+    ("英国", "United Kingdom", "Stream EU (non_ip)",
+     "https://ruleset.skk.moe/List/non_ip/stream_eu.conf"),
+    ("韩国", "Korea", "Stream KR (non_ip)",
+     "https://ruleset.skk.moe/List/non_ip/stream_kr.conf"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_action,en_name,rs_name,rs_url", _LOCALIZED_BLOCK_CASES)
+async def test_dangling_migration_blocked_by_english_output_node(
+        db, legacy_action, en_name, rs_name, rs_url):
+    """enabled 节点名 = 旧 action 的 en 输出候选（en 档案引用有效）：不改写"""
+    db.add(ProxyNode(name=en_name, node_type="trojan", server="203.0.113.4", port=443,
+                     config=f"{en_name} = trojan, 203.0.113.4, 443, password=x",
+                     enabled=True))
+    db.add(RuleSource(name=rs_name, url=rs_url, action=legacy_action,
+                      rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == rs_name))).scalar_one()
+    assert action == legacy_action
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_action,en_name,rs_name,rs_url", _LOCALIZED_BLOCK_CASES)
+async def test_dangling_migration_blocked_by_english_output_service_group(
+        db, legacy_action, en_name, rs_name, rs_url):
+    """enabled 服务组名 = 旧 action 的 en 输出候选（恒生成，引用有效）：不改写"""
+    from app.models import ServiceGroup
+
+    db.add(ServiceGroup(name=en_name, group_type="select", policies=["DIRECT"],
+                        sort_order=92, enabled=True))
+    db.add(RuleSource(name=rs_name, url=rs_url, action=legacy_action,
+                      rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == rs_name))).scalar_one()
+    assert action == legacy_action
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_action,en_name,rs_name,rs_url", _LOCALIZED_BLOCK_CASES)
+async def test_dangling_migration_disabled_english_candidates_do_not_block(
+        db, legacy_action, en_name, rs_name, rs_url):
+    """disabled 英文同名节点/服务组不会进入产物：照常确定迁移且幂等"""
+    from app.models import ServiceGroup
+
+    db.add(ProxyNode(name=en_name, node_type="trojan", server="203.0.113.5", port=443,
+                     config=f"{en_name} = trojan, 203.0.113.5, 443, password=x",
+                     enabled=False))
+    db.add(ServiceGroup(name=en_name, group_type="select", policies=["DIRECT"],
+                        sort_order=93, enabled=False))
+    db.add(RuleSource(name=rs_name, url=rs_url, action=legacy_action,
+                      rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))  # 幂等
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == rs_name))).scalar_one()
+    assert action == "Global"
+
+
 @pytest.mark.asyncio
 async def test_dangling_migration_keeps_builtin_and_valid_actions(db):
     """内置动作与有效组引用（服务组/活跃地区组）一律不动"""

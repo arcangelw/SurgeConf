@@ -12,7 +12,7 @@ from sqlalchemy import delete, select, update
 from app.default_config import DEFAULT_RULE_SOURCES, SECURITY_PRE_RULES
 from app.models import (ConfigProfile, CustomRule, DataMigrationRecord,
                         RuleSource, SystemConfig)
-from app.services.config_validation import BUILTIN_ACTIONS
+from app.services.config_validation import BUILTIN_ACTIONS, localized_output_candidates
 from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
 
 
@@ -177,17 +177,22 @@ async def _migrate_dangling_rule_source_actions(db) -> int:
     # 回退目标优先恒生成的 Global 服务组；用户删光服务组时退到内置 DIRECT
     fallback = "Global" if any(sg.name == "Global" and sg.enabled for sg in services) else "DIRECT"
 
-    # 保守守卫：旧 action 可能仍指向有效的同名节点或服务组（canonical
-    # 解析节点优先；服务组恒生成）时绝不改写。迁移层没有完整生成上下文
-    # （订阅前缀 / 信息关键词过滤均不可知），按保守上界处理：只要存在
-    # enabled 同名节点即视为可能有效、保留用户数据；disabled 候选不会
-    # 进入产物，不阻止迁移。不引入对 generator 的循环依赖。
+    # 保守守卫：旧 action 在任一受支持 locale 下的输出名（zh 原名 /
+    # en 中央翻译）可能仍指向有效的同名节点或服务组（canonical 节点
+    # 优先；服务组恒生成）时绝不改写。迁移层不知道请求 locale，也无
+    # 完整生成上下文（订阅前缀 / 信息关键词过滤均不可知），按保守上界
+    # 处理：任一 locale 候选命中 enabled 节点/服务组名即视为可能有效、
+    # 保留用户数据；disabled 候选不会进入产物，不阻止迁移。不引入对
+    # generator 的循环依赖，也不复制第二份翻译表。
     reserved_names = {
         name for name in (await db.execute(
             select(ProxyNode.name).where(ProxyNode.enabled == True))).scalars().all()
         if name
     }
     reserved_names.update(sg.name for sg in services if sg.enabled and sg.name)
+    legacy_output_candidates = {
+        item[3]: localized_output_candidates(item[3]) for item in legacy_stream
+    }
 
     fixed = 0
     candidates = (await db.execute(
@@ -203,8 +208,8 @@ async def _migrate_dangling_rule_source_actions(db) -> int:
         group_generated = rg is not None and rg.enabled and (rg.auto_enabled or rg.manual_enabled)
         if group_generated:
             continue  # 组会生成：引用有效，保留用户选择
-        if legacy_action in reserved_names:
-            continue  # 同名 enabled 节点/服务组可能使旧引用仍有效：保守保留
+        if legacy_output_candidates[legacy_action] & reserved_names:
+            continue  # 任一 locale 输出候选命中 enabled 节点/服务组：保守保留
         rs.action = fallback
         fixed += 1
     return fixed

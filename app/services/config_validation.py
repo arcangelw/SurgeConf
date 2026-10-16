@@ -109,6 +109,20 @@ def resolve_policy_reference(name: str, locale: str, node_names: frozenset[str])
     return translate_policy_name(name, locale)
 
 
+# 受支持的目标 locale（生成器 tc/t 分支与中央翻译共同覆盖的集合）
+SUPPORTED_LOCALES = ("zh", "en")
+
+
+def localized_output_candidates(name: str) -> frozenset[str]:
+    """逻辑名在所有受支持 locale 下的输出名候选（无副作用，纯函数）。
+
+    迁移等无完整生成上下文的调用方用它做保守判定：请求 locale 未知时，
+    任一 locale 的输出可能有效就不得改写。内部复用中央
+    translate_policy_name，不复制第二份翻译表（zh 候选即原名直通）。
+    """
+    return frozenset(translate_policy_name(name, locale) for locale in SUPPORTED_LOCALES)
+
+
 def validate_generated_references(context: GenerationContext) -> None:
     """聚合校验规则 action、策略组成员与 final_action；一次抛出全部错误"""
     errors: list[str] = []
