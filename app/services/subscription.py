@@ -3,6 +3,10 @@
 import re
 import base64
 import logging
+import asyncio
+import ipaddress
+import socket
+import urllib.parse
 import httpx
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -273,37 +277,182 @@ def parse_subscription_content(content: str) -> list[dict]:
     return nodes
 
 
-def _validate_url(url: str) -> str:
-    """验证 URL 防止 SSRF，只允许 http/https 协议和常见代理订阅域名"""
-    import urllib.parse
-    import ipaddress
+# ===== 订阅抓取 SSRF 防护（fetch 阶段） =====
 
+_FETCH_MAX_REDIRECTS = 5
+_FETCH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+class UnsafeSubscriptionTarget(ValueError):
+    """订阅目标解析出非公网全局地址（SSRF 防护 fail-closed）。
+
+    消息为静态文本，绝不包含 host/URL/query 等目标信息；继承
+    ValueError 以沿用 safe_sync_error 的 invalid_content 分类。
+    """
+
+
+def _safe_httpx_url(raw: str) -> httpx.URL:
+    """httpx.URL 构造包装：格式非法（含前导零 IPv4 等变体）统一按
+    UnsafeSubscriptionTarget 拒绝，映射 invalid_content 而非 internal_error。"""
+    try:
+        return httpx.URL(raw)
+    except httpx.InvalidURL as exc:
+        raise UnsafeSubscriptionTarget("订阅 URL 格式非法") from exc
+
+
+def _is_global_public_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address"
+                         ) -> bool:
+    """全局单播公网地址判定（fail closed）。
+
+    - IPv4-mapped IPv6（::ffff:0:0/96）一律拒绝：映射地址原地内嵌
+      v4，等价于绕过 v4 侧校验；
+    - 在 is_global 基础上补排除 multicast（v4 224/4 的 is_global 为
+      True 的历史行为）、reserved、unspecified。
+    """
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return False
+    return (ip.is_global and not ip.is_multicast
+            and not ip.is_reserved and not ip.is_unspecified)
+
+
+def _parse_fetch_target(url: str) -> tuple[str, str, int]:
+    """静态校验：仅 http/https、禁 userinfo、host 必填、端口合法。
+
+    返回 (scheme, host, port)；host 为小写、IPv6 去括号形式，此阶段
+    不触碰网络。
+    """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"不支持的协议: {parsed.scheme}")
-    host = parsed.hostname or ""
+        raise UnsafeSubscriptionTarget("不支持的订阅协议")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise UnsafeSubscriptionTarget("订阅 URL 缺少主机")
+    if parsed.username or parsed.password:
+        raise UnsafeSubscriptionTarget("订阅 URL 不允许携带凭据")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme, host, port
 
-    # 禁止内网域名
-    if host in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
-        raise ValueError("不允许的地址: 内网地址")
 
-    # 尝试 IP 检测
+async def _resolve_host(host: str, port: int) -> list[str]:
+    """默认 DNS 解析（全部 A/AAAA）；失败统一映射为连接错误。
+
+    测试通过 monkeypatch 本函数注入 fake resolver；默认实现仅在
+    真实抓取时使用。
+    """
     try:
-        ip = ipaddress.ip_address(host)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise httpx.ConnectError(
+            "subscription host resolution failed") from exc
+    return [info[4][0] for info in infos]
+
+
+def _validated_connect_addresses(addresses) -> list[str]:
+    """候选地址整体校验：任一非全局 → 整主机拒绝；返回去重连接序列。"""
+    verified: list[str] = []
+    for raw in addresses:
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            raise UnsafeSubscriptionTarget("不允许的地址: 非公网全局地址")
+        if not _is_global_public_ip(ip):
+            raise UnsafeSubscriptionTarget("不允许的地址: 非公网全局地址")
+        if raw not in verified:
+            verified.append(raw)
+    if not verified:
+        raise httpx.ConnectError("subscription host resolved to no addresses")
+    return verified
+
+
+async def _validated_target_addresses(host: str, port: int) -> list[str]:
+    """host → 可连接的全局地址列表。
+
+    IP 字面量直接校验（不触发 DNS）；域名解析全部 A/AAAA 后整体验证，
+    多地址中任一非全局即整主机拒绝。
+    """
+    try:
+        ipaddress.ip_address(host)
     except ValueError:
-        return url  # 域名而非 IP，放行
-
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
-        raise ValueError("不允许的地址: 内网/保留地址")
-
-    return url
+        return _validated_connect_addresses(await _resolve_host(host, port))
+    return _validated_connect_addresses([host])
 
 
-async def fetch_subscription(url: str) -> list[dict]:
-    """拉取订阅链接并解析节点（纯网络阶段，不持有任何数据库事务）"""
-    _validate_url(url)
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(url)
+def _host_header_value(host: str, port: int, scheme: str) -> str:
+    """Host header：原 host（IPv6 加括号），非默认端口显式带端口。"""
+    bracketed = f"[{host}]" if ":" in host else host
+    default_port = 443 if scheme == "https" else 80
+    return bracketed if port == default_port else f"{bracketed}:{port}"
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+async def _request_bound_to_addresses(
+        client, scheme, host, port, logical, addresses) -> httpx.Response:
+    """对已验证地址依序请求：连接级失败换下一个，绝不回退按域名连接。
+
+    连接 URL 用已验证 IP（IPv6 由 httpx 规范加括号）；Host header 与
+    HTTPS SNI（sni_hostname extension，httpcore 以其作为 TLS
+    server_hostname，兼顾 SNI 与证书校验）保留原始 host——解析一经验证
+    即绑定地址，不存在校验后客户端二次 DNS 的 rebinding 窗口。
+    """
+    headers = {"Host": _host_header_value(host, port, scheme)}
+    extensions = ({"sni_hostname": host}
+                  if scheme == "https" and not _is_ip_literal(host)
+                  else None)
+    last_exc: Exception | None = None
+    for address in addresses:
+        try:
+            return await client.get(logical.copy_with(host=address),
+                                    headers=headers, extensions=extensions)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+    raise last_exc
+
+
+async def fetch_subscription(url: str, *,
+                             _transport: "httpx.AsyncBaseTransport | None" = None
+                             ) -> list[dict]:
+    """拉取订阅链接并解析节点（纯网络阶段，不持有任何数据库事务）。
+
+    SSRF 防护（初始与每跳重定向均执行）：
+    - 仅 http/https、禁 userinfo；
+    - 异步解析全部 A/AAAA：任一地址非全局单播公网（loopback/私网/
+      link-local/multicast/reserved/IPv4-mapped IPv6 等）→ 整主机拒绝；
+    - 连接只使用已验证 IP，Host header 与 HTTPS SNI 保留原域名；
+    - trust_env=False：忽略 HTTP(S)_PROXY 等环境代理；
+    - 手动跟随 ≤5 次 301/302/303/307/308，Location 相对当前逻辑 URL
+      解析，每跳目标重新走全部校验。
+
+    失败异常沿用 safe_sync_error 安全分类；本函数不记录任何
+    URL/host/query。
+    """
+    scheme, host, port = _parse_fetch_target(url)
+    logical = _safe_httpx_url(url)
+    async with httpx.AsyncClient(timeout=30, trust_env=False,
+                                 follow_redirects=False,
+                                 transport=_transport) as client:
+        for _hop in range(_FETCH_MAX_REDIRECTS + 1):
+            addresses = await _validated_target_addresses(host, port)
+            resp = await _request_bound_to_addresses(
+                client, scheme, host, port, logical, addresses)
+            if resp.status_code in _FETCH_REDIRECT_STATUSES:
+                location = resp.headers.get("location")
+                if not location:
+                    break  # 无 Location 的 3xx 按终态响应处理
+                logical = logical.join(_safe_httpx_url(location))
+                scheme, host, port = _parse_fetch_target(str(logical))
+                continue
+            resp.raise_for_status()
+            return parse_subscription_content(resp.text)
+        else:
+            raise httpx.TooManyRedirects("subscription redirect limit exceeded")
         resp.raise_for_status()
         return parse_subscription_content(resp.text)
 
