@@ -60,6 +60,7 @@ CATEGORY_NAMES = {
 COMMENT_NAMES = {
     "pre_rules": ("前置自定义规则", "Pre Custom Rules"),
     "udp_managed": ("托管 UDP 安全规则", "Managed UDP Security"),
+    "general_rules": ("通用自定义规则", "General Custom Rules"),
     "lan": ("本地网络", "LAN"),
     "final_rule": ("兜底规则", "Final Rule"),
 }

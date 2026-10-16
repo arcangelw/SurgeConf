@@ -971,6 +971,33 @@ async def test_strict_ignores_exceptions_and_scoped_restores(db):
     assert "AND,((PROCESS-NAME,ExampleVideo),(PROTOCOL,UDP)),DIRECT" in scoped_lines
 
 
+
+@pytest.mark.asyncio
+async def test_rule_section_comments_localized_never_literal_keys(db):
+    """产物段注释全部本地化：任何 COMMENT_NAMES 键都不以 literal key 输出
+
+    守卫键表完整性：缺键（如 general_rules/udp_managed 被误删）会让
+    tcomment 回退输出键名本身，此测试即红。
+    """
+    profile = await _add_target_profile(db, "注释守卫档", "mac_workstation", "scoped", {})
+    _add_rule(db, profile.id, "DOMAIN,pre.example.com,DIRECT", position="pre")
+    _add_rule(db, profile.id, "DOMAIN-SUFFIX,general.example.com,Global", position="general")
+    _add_udp_exception(db, profile.id, "process", "ExampleVideo")
+    await db.commit()
+
+    zh = await generate_surge_config(db, profile.id)
+    assert "# >> 前置自定义规则" in zh
+    assert "# >> 托管 UDP 安全规则" in zh
+    assert "# >> 通用自定义规则" in zh
+    assert "# >> 兜底规则" in zh
+    for key in ("pre_rules", "udp_managed", "general_rules", "lan", "final_rule"):
+        assert f"# >> {key}" not in zh
+
+    en = await generate_surge_config(db, profile.id, locale_override="en")
+    assert "# >> Pre Custom Rules" in en
+    assert "# >> Managed UDP Security" in en
+    assert "# >> General Custom Rules" in en
+
 @pytest.mark.asyncio
 async def test_disabled_exception_not_queried_into_output(db):
     """disabled 例外不进入产物（生成查询只取 enabled）"""
