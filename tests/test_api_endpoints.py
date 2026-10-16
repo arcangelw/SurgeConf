@@ -902,3 +902,235 @@ async def test_delete_profile_db_cascades_udp_exceptions(client):
         remaining = (await db.execute(sa_select(UdpException))).scalars().all()
         assert [(e.profile_id, e.match_value) for e in remaining] == \
             [(other, "02-00-00-00-00-01")]
+
+
+# ===== 订阅调度：interval 校验 / create-update 排期矩阵 / lifespan =====
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", [299, 604801, 0, -300])
+async def test_subscription_create_interval_out_of_range_422(client, interval):
+    """越界间隔：创建与更新均 422，静态错误不回显输入值"""
+    resp = await client.post("/api/subscriptions", json={
+        "name": "越界", "url": "https://sub.example.com/x",
+        "update_interval": interval})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert all(set(e) == {"loc", "type", "msg"} for e in detail)
+    assert str(interval) not in resp.text
+
+    sub_id = (await client.post("/api/subscriptions", json={
+        "name": "基准", "url": "https://sub.example.com/base"})).json()["id"]
+    resp = await client.put(f"/api/subscriptions/{sub_id}",
+                            json={"update_interval": interval})
+    assert resp.status_code == 422
+    assert str(interval) not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_subscription_update_explicit_null_interval_422(client):
+    """显式 null 间隔是非法输入（省略才表示不修改）"""
+    sub_id = (await client.post("/api/subscriptions", json={
+        "name": "空值", "url": "https://sub.example.com/n"})).json()["id"]
+    resp = await client.put(f"/api/subscriptions/{sub_id}",
+                            json={"update_interval": None})
+    assert resp.status_code == 422
+    rows = (await client.get("/api/subscriptions")).json()
+    assert next(s for s in rows if s["id"] == sub_id)["update_interval"] == 86400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", [300, 3600, 604800])
+async def test_subscription_interval_boundaries_accepted(client, interval):
+    """边界值 300 / 604800 及常规值创建成功且原样落库"""
+    resp = await client.post("/api/subscriptions", json={
+        "name": f"边界{interval}", "url": "https://sub.example.com/b",
+        "update_interval": interval})
+    assert resp.status_code == 200
+    sub_id = resp.json()["id"]
+    rows = (await client.get("/api/subscriptions")).json()
+    assert next(s for s in rows if s["id"] == sub_id)["update_interval"] == interval
+
+
+async def _next_of(client, sub_id):
+    rows = (await client.get("/api/subscriptions")).json()
+    return next(s for s in rows if s["id"] == sub_id)["next_update_at"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_create_scheduling_matrix(client):
+    """创建：enabled+auto 立即排期（next 非空）；否则 NULL 不参与调度"""
+    a = (await client.post("/api/subscriptions", json={
+        "name": "排期", "url": "https://sub.example.com/a"})).json()["id"]
+    b = (await client.post("/api/subscriptions", json={
+        "name": "手动", "url": "https://sub.example.com/b",
+        "auto_update": False})).json()["id"]
+    c = (await client.post("/api/subscriptions", json={
+        "name": "停用", "url": "https://sub.example.com/c",
+        "enabled": False})).json()["id"]
+    assert await _next_of(client, a) is not None
+    assert await _next_of(client, b) is None
+    assert await _next_of(client, c) is None
+
+
+@pytest.mark.asyncio
+async def test_subscription_update_scheduling_matrix(client):
+    """更新矩阵：仅在调度相关值实际变化时重算 next（同值全提交不推迟）"""
+    from datetime import datetime, timedelta, timezone
+
+    sub_id = (await client.post("/api/subscriptions", json={
+        "name": "矩阵", "url": "https://sub.example.com/m",
+        "update_interval": 3600})).json()["id"]
+    created_next = await _next_of(client, sub_id)
+    assert created_next is not None
+
+    # 1) 仅改 name：next 不动
+    resp = await client.put(f"/api/subscriptions/{sub_id}", json={"name": "矩阵2"})
+    assert resp.status_code == 200
+    assert await _next_of(client, sub_id) == created_next
+
+    # 2) 全字段提交但值未变：next 不动（UI 全量提交场景）
+    detail = (await client.get(f"/api/subscriptions/{sub_id}")).json()
+    resp = await client.put(f"/api/subscriptions/{sub_id}", json={
+        "name": detail["name"], "url": detail["url"], "tag": detail["tag"],
+        "color": detail["color"], "enabled": detail["enabled"],
+        "auto_update": detail["auto_update"],
+        "update_interval": detail["update_interval"]})
+    assert resp.status_code == 200
+    assert await _next_of(client, sub_id) == created_next
+
+    # 3) enabled+auto 下 interval 改变 → now + 新 interval
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+    resp = await client.put(f"/api/subscriptions/{sub_id}",
+                            json={"update_interval": 7200})
+    assert resp.status_code == 200
+    nxt = datetime.fromisoformat(await _next_of(client, sub_id))
+    t1 = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert t0 + timedelta(seconds=7200) <= nxt <= t1 + timedelta(seconds=7200)
+
+    # 4) auto off → NULL
+    await client.put(f"/api/subscriptions/{sub_id}", json={"auto_update": False})
+    assert await _next_of(client, sub_id) is None
+
+    # 5) 从 auto-off 开启 → now（立即到期）
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+    await client.put(f"/api/subscriptions/{sub_id}", json={"auto_update": True})
+    nxt = datetime.fromisoformat(await _next_of(client, sub_id))
+    t1 = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert t0 <= nxt <= t1
+
+    # 6) 禁用 → NULL
+    await client.put(f"/api/subscriptions/{sub_id}", json={"enabled": False})
+    assert await _next_of(client, sub_id) is None
+
+
+@pytest.mark.asyncio
+async def test_lifespan_starts_scheduler_active(client):
+    """单实例：lifespan 启动调度器为 active，锁文件为 root 下 0600 普通文件"""
+    import stat as stat_mod
+    from app.main import app as fastapi_app
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.subscription_scheduler import SubscriptionScheduler
+
+    scheduler = fastapi_app.state.subscription_scheduler
+    assert isinstance(scheduler, SubscriptionScheduler)
+    assert fastapi_app.state.subscription_scheduler_active is True
+    assert scheduler.active is True
+
+    lock = resolve_runtime_paths().root / "scheduler.lock"
+    st = lock.lstat()
+    assert stat_mod.S_ISREG(st.st_mode) and not stat_mod.S_ISLNK(st.st_mode)
+    assert st.st_mode & 0o777 == 0o600
+    assert lock.stat().st_size == 0  # 不写 PID/路径
+
+
+@pytest.mark.asyncio
+async def test_lifespan_standby_when_lock_held(tmp_path, monkeypatch, capsys):
+    """锁被占：lifespan 进入 standby（正常服务、无 task），退出不抢锁"""
+    from unittest.mock import patch
+    from app.main import app as fastapi_app
+    from app.database import DatabaseRuntime, get_db
+    from app.models import Subscription
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.subscription_scheduler import SubscriptionScheduler
+
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+
+    async def override_get_db():
+        async with test_runtime.session_factory() as session:
+            yield session
+
+    fastapi_app.dependency_overrides[get_db] = override_get_db
+    holder = SubscriptionScheduler(test_runtime, paths.root / "scheduler.lock")
+    assert await holder.start() is True
+    try:
+        with patch("app.database.database", test_runtime), \
+             patch("app.bootstrap.database", test_runtime):
+            async with fastapi_app.router.lifespan_context(fastapi_app):
+                assert fastapi_app.state.subscription_scheduler_active is False
+                sched = fastapi_app.state.subscription_scheduler
+                assert sched._task is None and sched._lock_fd is None
+                # standby 实例数据库仍可正常服务
+                async with test_runtime.session_factory() as db:
+                    db.add(Subscription(name="S", url="https://sub.example.com/s",
+                                        enabled=True, auto_update=True,
+                                        update_interval=3600))
+                    await db.commit()
+            out = capsys.readouterr().err
+            assert "standby" in out
+            # holder 全程持锁未被抢占
+            assert holder.active is True
+    finally:
+        await holder.stop()
+        fastapi_app.dependency_overrides.pop(get_db, None)
+        await test_runtime.dispose()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_stops_scheduler_before_db_dispose(tmp_path, monkeypatch):
+    """清理顺序：调度器先停（task 收敛），之后才 dispose 数据库；锁释放可接管"""
+    from unittest.mock import patch
+    from app.main import app as fastapi_app
+    from app.database import DatabaseRuntime, get_db
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.subscription_scheduler import SubscriptionScheduler
+
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    class _OrderRecordingRuntime(DatabaseRuntime):
+        dispose_seen_scheduler_stopped: bool | None = None
+
+        async def dispose(self):
+            sched = getattr(fastapi_app.state, "subscription_scheduler", None)
+            self.dispose_seen_scheduler_stopped = bool(
+                sched is not None and sched._task is None)
+            await super().dispose()
+
+    test_runtime = _OrderRecordingRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+
+    async def override_get_db():
+        async with test_runtime.session_factory() as session:
+            yield session
+
+    fastapi_app.dependency_overrides[get_db] = override_get_db
+    try:
+        with patch("app.database.database", test_runtime), \
+             patch("app.bootstrap.database", test_runtime):
+            async with fastapi_app.router.lifespan_context(fastapi_app):
+                assert fastapi_app.state.subscription_scheduler_active is True
+                assert fastapi_app.state.subscription_scheduler.active is True
+            # 退出后：dispose 执行时调度器 task 已收敛（stop 先于 dispose）
+            assert test_runtime.dispose_seen_scheduler_stopped is True
+            assert fastapi_app.state.subscription_scheduler._task is None
+            # 锁已释放：新实例可立即接管
+            taker = SubscriptionScheduler(test_runtime, paths.root / "scheduler.lock")
+            assert await taker.start() is True
+            await taker.stop()
+    finally:
+        fastapi_app.dependency_overrides.pop(get_db, None)
+        await test_runtime.dispose()

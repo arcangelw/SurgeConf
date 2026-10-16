@@ -1,10 +1,14 @@
 from sqlalchemy import (CheckConstraint, Column, Integer, String, Boolean, Text,
                          DateTime, JSON, ForeignKeyConstraint,
                          Index, UniqueConstraint, text)
+from sqlalchemy.orm import validates
 from sqlalchemy.sql import func
 from app.database import Base
 
-
+# 自动更新间隔合法范围（秒）：300 秒 – 7 天；单一事实来源，
+# Pydantic 路由校验与 ORM 赋值校验共用
+UPDATE_INTERVAL_MIN = 300
+UPDATE_INTERVAL_MAX = 604800
 class Subscription(Base):
     __tablename__ = "subscriptions"
 
@@ -23,6 +27,18 @@ class Subscription(Base):
     last_node_count = Column(Integer, nullable=True, comment="上次成功同步的节点数(去重后)")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    @validates("update_interval")
+    def _validate_update_interval(self, key, value):
+        """ORM 赋值校验：绕过 API 直接构造/赋值也必须拒绝范围外间隔。
+
+        （数据库加载与 SQLAlchemy 列 default 不经过本钩子；历史库内
+        越界值由同步服务的归一逻辑防御。）
+        """
+        if value is None or not (UPDATE_INTERVAL_MIN <= value <= UPDATE_INTERVAL_MAX):
+            raise ValueError(
+                f"update_interval 必须在 {UPDATE_INTERVAL_MIN}–{UPDATE_INTERVAL_MAX} 秒之间")
+        return value
 
 
 class ProxyNode(Base):

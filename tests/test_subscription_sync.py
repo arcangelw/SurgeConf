@@ -434,9 +434,16 @@ async def test_sync_write_failure_rolls_back_atomically(file_db, monkeypatch):
 async def test_sync_success_schedule(db, monkeypatch, enabled, auto,
                                      interval, expected_next):
     from unittest.mock import AsyncMock
+    from sqlalchemy import update as sa_update
     sub = Subscription(name="S", url=URL, enabled=enabled, auto_update=auto,
-                       update_interval=interval)
+                       update_interval=3600)
     db.add(sub)
+    await db.commit()
+    # ORM 赋值校验拒绝越界间隔：历史库内越界值经 SQL 直写模拟
+    #（同步服务仍按 0006 迁移同口径归一防御）
+    await db.execute(sa_update(Subscription)
+                     .where(Subscription.id == sub.id)
+                     .values(update_interval=interval))
     await db.commit()
     await db.refresh(sub)
     monkeypatch.setattr(subscription_service, "fetch_subscription",
@@ -458,9 +465,16 @@ async def test_sync_success_schedule(db, monkeypatch, enabled, auto,
 async def test_sync_failure_schedule(db, monkeypatch, enabled, auto,
                                      interval, expected_next):
     from unittest.mock import AsyncMock
+    from sqlalchemy import update as sa_update
     sub = Subscription(name="S", url=URL, enabled=enabled, auto_update=auto,
-                       update_interval=interval)
+                       update_interval=3600)
     db.add(sub)
+    await db.commit()
+    # ORM 赋值校验拒绝越界间隔：历史库内越界值经 SQL 直写模拟
+    #（同步服务仍按 0006 迁移同口径归一防御）
+    await db.execute(sa_update(Subscription)
+                     .where(Subscription.id == sub.id)
+                     .values(update_interval=interval))
     await db.commit()
     await db.refresh(sub)
     monkeypatch.setattr(subscription_service, "fetch_subscription",

@@ -133,4 +133,20 @@ async def lifespan(app: FastAPI):
         removed = await cleanup_orphan_nodes(db)
     if removed:
         print(f"[数据维护] 已清理 {removed} 个孤儿节点（归属订阅已删除的残留节点）", file=sys.stderr)
-    yield
+
+    # 单实例自动更新调度器：数据库准备/维护完成后启动；锁竞争进入
+    # standby（本实例正常服务，不运行更新循环）
+    from app.services.subscription_scheduler import SubscriptionScheduler
+    scheduler = SubscriptionScheduler(database, paths.root / "scheduler.lock")
+    app.state.subscription_scheduler = scheduler
+    app.state.subscription_scheduler_active = await scheduler.start()
+    if app.state.subscription_scheduler_active:
+        print("[启动] 订阅自动更新调度器已启动", file=sys.stderr)
+    else:
+        print("[启动] 检测到另一实例正在运行，本实例调度器进入 standby", file=sys.stderr)
+    try:
+        yield
+    finally:
+        # 先停调度器（等待在途同步轮次退出并释放锁），再释放数据库连接
+        await scheduler.stop()
+        await database.dispose()

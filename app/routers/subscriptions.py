@@ -1,15 +1,18 @@
 """订阅管理 API"""
 
+from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
 from app.database import get_db
-from app.models import Subscription, ProxyNode
-from app.services.subscription import sync_subscription, sync_all_subscriptions
+from app.models import (Subscription, ProxyNode, UPDATE_INTERVAL_MIN,
+                        UPDATE_INTERVAL_MAX)
+from app.services.subscription import (sync_subscription,
+                                       sync_all_subscriptions, _utc_naive)
 
 router = APIRouter(prefix="/api/subscriptions", tags=["订阅管理"])
 
@@ -23,7 +26,8 @@ class SubscriptionCreate(BaseModel):
     color: Optional[str] = None
     enabled: bool = True
     auto_update: bool = True
-    update_interval: int = 86400
+    update_interval: int = Field(default=86400, ge=UPDATE_INTERVAL_MIN,
+                                 le=UPDATE_INTERVAL_MAX)
 
 
 class SubscriptionUpdate(BaseModel):
@@ -33,7 +37,16 @@ class SubscriptionUpdate(BaseModel):
     color: Optional[str] = None
     enabled: Optional[bool] = None
     auto_update: Optional[bool] = None
-    update_interval: Optional[int] = None
+    update_interval: Optional[int] = Field(default=None, ge=UPDATE_INTERVAL_MIN,
+                                           le=UPDATE_INTERVAL_MAX)
+
+    @field_validator("update_interval")
+    @classmethod
+    def _reject_explicit_none(cls, value: Optional[int]) -> Optional[int]:
+        """显式 null 的间隔是非法输入（省略才表示不修改）"""
+        if value is None:
+            raise ValueError("update_interval 不可为空")
+        return value
 
 
 @router.get("")
@@ -87,6 +100,8 @@ async def get_subscription(sub_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("")
 async def create_subscription(data: SubscriptionCreate, db: AsyncSession = Depends(get_db)):
+    """创建订阅：enabled+auto 立即排期（next=now），否则不参与调度（NULL）"""
+    now = _utc_naive()
     sub = Subscription(
         name=data.name,
         url=data.url,
@@ -95,6 +110,7 @@ async def create_subscription(data: SubscriptionCreate, db: AsyncSession = Depen
         enabled=data.enabled,
         auto_update=data.auto_update,
         update_interval=data.update_interval,
+        next_update_at=now if (data.enabled and data.auto_update) else None,
     )
     db.add(sub)
     await db.commit()
@@ -104,14 +120,33 @@ async def create_subscription(data: SubscriptionCreate, db: AsyncSession = Depen
 
 @router.put("/{sub_id}")
 async def update_subscription(sub_id: int, data: SubscriptionUpdate, db: AsyncSession = Depends(get_db)):
+    """更新订阅：仅在调度相关值（enabled/auto/interval）实际变化时重算 next。
+
+    - 最终 disabled 或 auto off → NULL；
+    - 从 disabled/auto-off 开启 → now（立即到期）；
+    - 保持 enabled+auto 且 interval 改变 → now + 新 interval；
+    - 仅改 name/url/tag/color 等不动 next（全字段提交但值未变亦然）。
+    """
     result = await db.execute(select(Subscription).where(Subscription.id == sub_id))
     sub = result.scalar_one_or_none()
     if not sub:
         raise HTTPException(404, "订阅不存在")
 
+    was_scheduled = bool(sub.enabled and sub.auto_update)
+    old_interval = sub.update_interval
     update_data = data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(sub, key, value)
+
+    if not (sub.enabled and sub.auto_update):
+        sub.next_update_at = None
+    elif not was_scheduled:
+        sub.next_update_at = _utc_naive()
+    elif sub.update_interval != old_interval:
+        sub.next_update_at = _utc_naive() + timedelta(seconds=sub.update_interval)
+    elif sub.next_update_at is None:
+        # 防御：本应排期的订阅缺 next（历史数据）→ 补 now，绝不静默永不调度
+        sub.next_update_at = _utc_naive()
     await db.commit()
     return {"id": sub.id, "name": sub.name}
 
