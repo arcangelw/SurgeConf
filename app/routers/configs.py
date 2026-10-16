@@ -1,7 +1,13 @@
 """配置方案与生成 API"""
 
 import os
+import re
 import socket
+from datetime import datetime, timezone
+from pathlib import Path
+from secrets import token_hex
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +17,8 @@ from typing import Optional
 
 from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
+from app.runtime_paths import ensure_runtime_directories, resolve_runtime_paths
+from app.services.backups import unique_path
 from app.services.generator import generate_surge_config
 from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
 
@@ -231,6 +239,16 @@ async def delete_rule(rule_id: int, db: AsyncSession = Depends(get_db)):
 
 # ===== 配置生成 =====
 
+def _content_disposition(filename: str) -> str:
+    """RFC 6266 下载头：剥除路径分量，ASCII 回退名 + RFC 5987 UTF-8 编码"""
+    safe = Path(filename).name or "Surge.conf"
+    try:
+        ascii_name = safe.encode("ascii").decode("ascii")
+    except UnicodeEncodeError:
+        ascii_name = "Surge.conf"
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe)}'
+
+
 @router.get("/generate")
 async def generate_config(
     profile_id: Optional[int] = None,
@@ -238,26 +256,50 @@ async def generate_config(
     locale: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    """内存生成配置：不写任何服务器文件（服务端导出走 POST /{profile_id}/exports）"""
     content = await generate_surge_config(db, profile_id, locale)
+    headers = {"Content-Disposition": _content_disposition(filename)} if filename else {}
+    return PlainTextResponse(content, media_type="text/plain", headers=headers)
 
-    # 保存到 data 目录（过滤路径遍历）
-    output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-    os.makedirs(output_dir, exist_ok=True)
-    save_name = (filename or "Surge.conf").replace("/", "").replace("\\", "").replace("..", "")
-    output_path = os.path.join(output_dir, save_name)
-    with open(output_path, "w") as f:
-        f.write(content)
 
-    # 如果指定了 filename，返回带 Content-Disposition 的下载响应
-    if filename:
-        from fastapi.responses import Response
-        return Response(
-            content=content,
-            media_type="text/plain",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+class ExportRequest(BaseModel):
+    """显式服务端导出载荷：必须携带确认位，可自定义安全文件名"""
+    confirm: bool = False
+    filename: Optional[str] = None
+
+
+def _export_filename(raw: Optional[str], profile_id: int) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(raw or "").name).strip("._")
+    if cleaned.lower().endswith(".conf"):
+        cleaned = cleaned[:-5]
+    if cleaned:
+        return cleaned[:80]
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"surge_p{profile_id}_{timestamp}"
+
+
+@router.post("/{profile_id}/exports")
+async def export_config(profile_id: int, data: ExportRequest,
+                        db: AsyncSession = Depends(get_db)):
+    """唯一的服务端导出路径：只写 RuntimePaths.exports，0600 原子发布"""
+    if not data.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail='缺少确认参数：请求体需包含 {"confirm": true}',
         )
-
-    return PlainTextResponse(content, media_type="text/plain")
+    content = await generate_surge_config(db, profile_id, None)
+    paths = resolve_runtime_paths()
+    ensure_runtime_directories(paths)
+    target = unique_path(paths.exports, _export_filename(data.filename, profile_id), ".conf")
+    tmp = paths.exports / f".{target.name}.tmp-{os.getpid()}-{token_hex(4)}"
+    try:
+        tmp.write_bytes(content.encode("utf-8"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return {"name": target.name, "size": target.stat().st_size}
 
 
 @router.get("/subscribe")

@@ -1,19 +1,15 @@
-"""系统设置端点：语言切换、数据重置、系统级配置。"""
+"""系统设置端点：语言切换、备份生命周期、数据重置、系统级配置。"""
 
-from pathlib import Path
-import os
-
-from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.database import database, get_db
+from app.database import get_db
 from app.i18n import DEFAULT_LOCALE
 from app.models import SystemConfig
-from app.runtime_paths import resolve_runtime_paths
-from app.services.database_migration import (PROJECT_ROOT, backup_database,
-                                             prepare_database, sqlite_backup)
+from app.services.backups import (create_backup, list_backups,
+                                  reset_database, restore_backup)
 
 router = APIRouter(prefix="/api/settings", tags=["系统设置"])
 
@@ -27,36 +23,69 @@ async def set_locale(request: Request):
     return response
 
 
-@router.post("/reset")
-async def reset_data():
-    """重置所有数据：先异步关闭引擎并备份，再删除文件走完整 staging 准备流程重建。
+class ConfirmRequest(BaseModel):
+    """破坏性操作（恢复/重置/导出）的显式确认载荷"""
+    confirm: bool = False
 
-    任何失败都先从备份副本还原 live 库并重新绑定，再向上传播异常，
-    避免运行时停留在"引擎存活但文件已删"或未绑定状态。
+
+def _require_confirm(confirm: bool) -> None:
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail='缺少确认参数：请求体需包含 {"confirm": true}',
+        )
+
+
+@router.post("/reset")
+async def reset_data(confirm: ConfirmRequest):
+    """重置所有数据（要求 ``{"confirm": true}``）。
+
+    完整流程（dispose → 强制备份 → staging 重建 → 原子替换 → 重绑）
+    见 ``app.services.backups.reset_database``。
     """
-    paths = resolve_runtime_paths()
-    backup = None
+    _require_confirm(confirm.confirm)
+    await reset_database()
+    return {"reset": True}
+
+
+# ===== 备份生命周期 =====
+
+
+@router.post("/backups")
+async def create_backup_now():
+    """手动备份 live 库（SQLite Backup API 原子发布，最近 10 份保留）"""
+    info = await create_backup("manual")
+    return info.as_dict()
+
+
+@router.get("/backups")
+async def get_backups():
+    """备份列表（时间降序）；只含文件名与元数据，不含绝对路径"""
+    return [item.as_dict() for item in reversed(list_backups())]
+
+
+@router.get("/backups/{name}")
+async def download_backup(name: str):
+    """下载备份：name 必须命中现有备份白名单，拒绝任意路径"""
+    for item in list_backups():
+        if item.name == name:
+            return FileResponse(item.path, media_type="application/octet-stream",
+                                filename=item.name)
+    raise HTTPException(status_code=404, detail="备份不存在")
+
+
+@router.post("/backups/{name}/restore")
+async def restore_backup_now(name: str, confirm: ConfirmRequest):
+    """恢复备份（要求 ``{"confirm": true}``）：先强制备份当前 live 再替换
+
+    失败时原 live 库保持可用并向上传播异常，不返回半成功。
+    """
+    _require_confirm(confirm.confirm)
     try:
-        # 必须先 await dispose：同步 dispose 无法可靠关闭 aiosqlite 线程连接，
-        # 残留连接会继续写已删除文件的 fd；备份副本供失败路径还原
-        await database.dispose()
-        if paths.database.exists():
-            backup = backup_database(paths.database, paths, "reset")
-        # WAL 引入后需连同伴生文件一并删除，否则残留 -wal/-shm 会污染重建的新库
-        for suffix in ("", "-wal", "-shm"):
-            candidate = Path(f"{paths.database}{suffix}")
-            if candidate.exists():
-                candidate.unlink()
-        result = await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
-    except BaseException:
-        if not paths.database.exists() and backup is not None and backup.exists():
-            sqlite_backup(backup, paths.database)
-            os.chmod(paths.database, 0o600)
-        if paths.database.exists():
-            database.bind(paths.database)
-        raise
-    database.bind(paths.database)
-    return {"reset": True, "source": result.source}
+        await restore_backup(name)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="备份不存在")
+    return {"restored": name}
 
 
 # ===== 系统级配置（排除关键词、其他分组等） =====

@@ -1,6 +1,7 @@
 """阶段2 新增事务端点集成测试（ASGI 全栈 + 临时 sqlite 文件库）
 
 覆盖：级联删除档案 / set-default 唯一性 / batch config 幂等 / default-order / 批量 unpin
+追加：显式导出端点只写 exports 目录、generate 无服务器写入与安全响应头
 """
 
 import pytest
@@ -12,6 +13,14 @@ from unittest.mock import patch
 
 from app.default_config import DEFAULT_RULE_SOURCES
 from app.models import ConfigProfile, CustomRule, HostMapping, ProxyNode
+from app.runtime_paths import resolve_runtime_paths
+
+
+@pytest.fixture
+def runtime_paths(tmp_path, monkeypatch):
+    """与 client fixture 同一 SURGECONF_DATA_DIR 的运行时路径（exports 断言用）"""
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    return resolve_runtime_paths()
 
 
 @pytest_asyncio.fixture
@@ -182,3 +191,61 @@ async def test_update_node_null_clears_region(client):
 
     detail = (await client.get(f"/api/nodes/{nid}")).json()
     assert detail["region_auto"] == "香港"
+
+
+# ===== 配置生成端点：内存输出 + 唯一服务端导出路径 =====
+
+
+@pytest.mark.asyncio
+async def test_export_endpoint_writes_only_exports_dir(client, runtime_paths):
+    """显式导出：confirm 门禁、只写 RuntimePaths.exports 且 0600；generate 不写文件"""
+    denied = await client.post("/api/configs/1/exports", json={})
+    assert denied.status_code == 400
+
+    preview = await client.get("/api/configs/preview?profile_id=1")
+    assert preview.status_code == 200
+    inline = await client.get("/api/configs/generate?profile_id=1")
+    assert inline.status_code == 200
+    assert list(runtime_paths.exports.iterdir()) == []
+
+    resp = await client.post("/api/configs/1/exports", json={"confirm": True})
+    assert resp.status_code == 200
+    exported = resp.json()
+    assert exported["name"] and exported["size"] > 0
+
+    files = list(runtime_paths.exports.iterdir())
+    assert [f.name for f in files] == [exported["name"]]
+    assert files[0].stat().st_mode & 0o777 == 0o600
+
+    # 导出文件内容与内存生成一致（utf-8 配置文本）
+    assert files[0].read_text(encoding="utf-8") == inline.text
+
+    # 穿越文件名被消毒为安全的导出名
+    resp = await client.post("/api/configs/1/exports",
+                             json={"confirm": True, "filename": "../../etc/passwd"})
+    assert resp.status_code == 200
+    assert "/" not in resp.json()["name"] and ".." not in resp.json()["name"]
+    assert all("/" not in f.name and ".." not in f.name
+               for f in runtime_paths.exports.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_generate_response_headers_are_safe(client):
+    """generate：内存响应 + Content-Disposition 剥除路径并做 RFC 5987 编码"""
+    resp = await client.get("/api/configs/generate?profile_id=1&filename=..%2F..%2Fpasswd.conf")
+    assert resp.status_code == 200
+    disposition = resp.headers["content-disposition"]
+    assert "attachment" in disposition
+    assert ".." not in disposition and "/" not in disposition.split("UTF-8''")[-1].split("%")[0]
+    assert "filename*=UTF-8''" in disposition
+
+    # 不带 filename：纯文本响应，无下载头
+    resp = await client.get("/api/configs/generate?profile_id=1")
+    assert resp.status_code == 200
+    assert "content-disposition" not in resp.headers
+
+    # 非 ASCII 文件名走 RFC 5987 编码
+    resp = await client.get("/api/configs/generate?profile_id=1&filename=%E9%85%8D%E7%BD%AE.conf")
+    disposition = resp.headers["content-disposition"]
+    assert "filename*=UTF-8''%E9%85%8D%E7%BD%AE.conf" in disposition
+    assert 'filename="Surge.conf"' in disposition

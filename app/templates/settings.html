@@ -79,9 +79,25 @@
 <div class="card">
   <div class="card-header"><h3>{{ t["settings.data_management"] }}</h3></div>
   <div style="display:flex;gap:10px;">
+    <button class="btn btn-primary" onclick="createBackupNow(this)">{{ t["settings.backup_create"] }}</button>
     <button class="btn btn-danger" onclick="resetData()">{{ t["settings.reset_data"] }}</button>
   </div>
-  <p style="font-size:12px;color:var(--text2);margin-top:8px;">{{ t["settings.reset_hint"] }}</p>
+  <p style="font-size:12px;color:var(--text2);margin:8px 0 12px;">{{ t["settings.reset_hint"] }}</p>
+  <div style="overflow-x:auto;">
+    <table style="width:100%;font-size:13px;">
+      <thead>
+        <tr>
+          <th>{{ t["settings.backup_time"] }}</th>
+          <th>{{ t["settings.backup_schema"] }}</th>
+          <th>{{ t["settings.backup_size"] }}</th>
+          <th>{{ t["settings.backup_reason"] }}</th>
+          <th>{{ t["settings.backup_actions"] }}</th>
+        </tr>
+      </thead>
+      <tbody id="backups-tbody"></tbody>
+    </table>
+  </div>
+  <p style="font-size:12px;color:var(--text2);margin-top:8px;">{{ t["settings.backup_hint"] }}</p>
 </div>
 {% endblock %}
 

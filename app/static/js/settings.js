@@ -1,4 +1,4 @@
-/** 系统设置页：语言切换、访问控制、系统配置批量保存、数据重置 */
+/** 系统设置页：语言切换、访问控制、系统配置批量保存、备份生命周期、数据重置 */
 
 async function setLocale(locale) {
   try {
@@ -10,8 +10,80 @@ async function setLocale(locale) {
 async function resetData() {
   if (!(await confirmDialog(I18N["settings.confirm_reset"], { danger: true }))) return;
   try {
-    await API.post("/api/settings/reset");
+    await API.post("/api/settings/reset", { confirm: true });
     toast(I18N["settings.reset_done"]);
+    setTimeout(() => window.location.reload(), 1000);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ===== 备份生命周期 =====
+
+async function loadBackups() {
+  try {
+    renderBackups(await API.get("/api/settings/backups"));
+  } catch (e) { /* 静默：设置页本身已受访问矩阵保护 */ }
+}
+
+function backupReasonLabel(reason) {
+  return I18N[`settings.backup_reason_${reason}`] || reason;
+}
+
+function formatBackupTime(iso) {
+  try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+}
+
+function formatBytes(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+
+function renderBackups(list) {
+  const body = document.getElementById("backups-tbody");
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--text2);">${I18N["settings.backup_empty"]}</td></tr>`;
+    return;
+  }
+  body.innerHTML = list.map((b) => `
+    <tr>
+      <td>${escapeHtml(formatBackupTime(b.created_at))}</td>
+      <td><code>${escapeHtml(b.schema_version)}</code></td>
+      <td>${formatBytes(b.size)}</td>
+      <td>${escapeHtml(backupReasonLabel(b.reason))}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-outline" onclick="downloadBackup('${escapeHtml(b.name)}')">${I18N["settings.backup_download"]}</button>
+        <button class="btn btn-danger" onclick="restoreBackupFile('${escapeHtml(b.name)}')">${I18N["settings.backup_restore"]}</button>
+      </td>
+    </tr>`).join("");
+}
+
+async function createBackupNow(btn) {
+  await withLoading(btn, async () => {
+    try {
+      await API.post("/api/settings/backups", {});
+      toast(I18N["settings.backup_created"]);
+      await loadBackups();
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+/** 下载走浏览器导航：先经同源 API 校验存在，避免把 404/HTML 当文件保存 */
+async function downloadBackup(name) {
+  try {
+    const list = await API.get("/api/settings/backups");
+    if (!list.some((b) => b.name === name)) {
+      toast(I18N["settings.backup_missing"], "error");
+      return;
+    }
+    window.open(`/api/settings/backups/${encodeURIComponent(name)}`, "_blank");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function restoreBackupFile(name) {
+  if (!(await confirmDialog(I18N["settings.confirm_restore"], { danger: true }))) return;
+  try {
+    await API.post(`/api/settings/backups/${encodeURIComponent(name)}/restore`, { confirm: true });
+    toast(I18N["settings.restore_done"]);
     setTimeout(() => window.location.reload(), 1000);
   } catch (e) { toast(e.message, "error"); }
 }
@@ -150,3 +222,5 @@ loadSkipProxy();
 loadSysConfig();
 
 loadAccess();
+
+loadBackups();

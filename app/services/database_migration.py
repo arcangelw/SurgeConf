@@ -2,7 +2,6 @@ import os
 import sqlite3
 from argparse import Namespace
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 from alembic import command
@@ -12,7 +11,9 @@ from alembic.script import ScriptDirectory
 from app.bootstrap import seed_defaults
 from app.database import Base, DatabaseRuntime
 from app.runtime_paths import RuntimePaths, ensure_runtime_directories
+from app.services.backups import backup_database, sqlite_backup
 from app.services.data_migrations import DATA_MIGRATIONS, apply_data_migrations
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 BASELINE_REVISION = "0001_current_schema"
@@ -60,7 +61,7 @@ def _head_revision() -> str:
 
 # ===== 只读检查 =====
 
-def _alembic_version(database_path: Path):
+def alembic_version(database_path: Path):
     """读取 alembic_version；无表/无行返回 None（调用方确保文件存在）"""
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as conn:
         try:
@@ -68,6 +69,7 @@ def _alembic_version(database_path: Path):
         except sqlite3.OperationalError:
             return None
         return row[0] if row else None
+
 
 
 def pending_data_migration_keys(database_path: Path) -> list:
@@ -118,33 +120,13 @@ def _validate_current_schema(database_path: Path) -> None:
         )
 
 
-# ===== SQLite Backup API 与发布 =====
+# ===== staging 与原子发布 =====
 
-def sqlite_backup(source: Path, target: Path) -> None:
-    """SQLite Backup API 复制（正确处理 WAL 与页级一致性），禁止 shutil.copyfile"""
-    source_conn = sqlite3.connect(source)
-    target_conn = sqlite3.connect(target)
-    try:
-        with target_conn:
-            source_conn.backup(target_conn)
-    finally:
-        target_conn.close()
-        source_conn.close()
-
-
-def backup_database(source: Path, paths: RuntimePaths, schema_tag: str) -> Path:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    target = paths.backups / f"surge_conf_{timestamp}_{schema_tag}.db"
-    sqlite_backup(source, target)
-    os.chmod(target, 0o600)
-    return target
-
-
-def _staging_path(paths: RuntimePaths) -> Path:
+def staging_path(paths: RuntimePaths) -> Path:
     return paths.database.with_name(paths.database.name + STAGING_SUFFIX)
 
 
-def _discard_staging(staging: Path) -> None:
+def discard_staging(staging: Path) -> None:
     for suffix in ("", "-wal", "-shm"):
         candidate = staging.with_name(staging.name + suffix)
         if candidate.exists():
@@ -165,7 +147,7 @@ def _checkpoint_and_remove_sidecars(database_path: Path) -> None:
             sidecar.unlink()
 
 
-def _verify_and_publish(staging: Path, target: Path) -> None:
+def verify_and_publish(staging: Path, target: Path) -> None:
     # 读写连接：ro URI 打开 WAL 库会重建 -shm/-wal 伴生文件，无法保证单文件替换
     conn = sqlite3.connect(staging)
     try:
@@ -189,7 +171,7 @@ def _sync_schema(database_path: Path) -> None:
     if not database_path.exists():
         run_alembic_upgrade(database_path)
         return
-    if _alembic_version(database_path) is None:
+    if alembic_version(database_path) is None:
         # 无版本库：先验证是已知基线（业务表/列齐全、无未知表），补建 0001 新表后 stamp
         _validate_current_schema(database_path)
         with sqlite3.connect(database_path) as conn:
@@ -203,7 +185,7 @@ def _sync_schema(database_path: Path) -> None:
     run_alembic_upgrade(database_path)
 
 
-async def _upgrade_staging(staging: Path) -> tuple:
+async def upgrade_staging(staging: Path) -> tuple:
     """staging 上依次完成 schema 推进、种子、业务数据迁移；返回应用的迁移 key"""
     _sync_schema(staging)
     runtime = DatabaseRuntime.create(staging)
@@ -216,49 +198,60 @@ async def _upgrade_staging(staging: Path) -> tuple:
     return tuple(applied)
 
 
+def _remove_live_sidecars(live: Path) -> None:
+    """原子替换前清理 live 残留 -wal/-shm，防止旧伴生文件污染新库"""
+    for suffix in ("-wal", "-shm"):
+        sidecar = live.with_name(live.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+async def rebuild_from_source(source: Path | None, paths: RuntimePaths) -> tuple:
+    """从源库（None 为全新）经 staging 完成 Alembic/种子/业务迁移后原子替换 live。
+
+    prepare_database 与备份恢复/重置共用此链；失败丢弃 staging，
+    live 字节不变（原子性不变量）。
+    """
+    live = paths.database
+    staging = staging_path(paths)
+    discard_staging(staging)
+    try:
+        if source is not None:
+            sqlite_backup(source, staging)
+        applied = await upgrade_staging(staging)
+        _remove_live_sidecars(live)
+        verify_and_publish(staging, live)
+    except BaseException:
+        discard_staging(staging)
+        raise
+    return applied
+
+
 async def prepare_database(paths: RuntimePaths, legacy_path: Path) -> MigrationResult:
     """三路径准备数据库，全部经由 staging 原子发布（见模块 docstring 的不变量）"""
     ensure_runtime_directories(paths)
     live = paths.database
-    staging = _staging_path(paths)
     legacy = Path(legacy_path)
 
     if not live.exists() and legacy.exists():
         # 路径 2：仅旧仓库库存在 —— 备份未升级副本，staging 上完成后原子发布，旧库保持原样
         backup = backup_database(legacy, paths, "pre_alembic")
-        sqlite_backup(legacy, staging)
-        try:
-            applied = await _upgrade_staging(staging)
-            _verify_and_publish(staging, live)
-        except BaseException:
-            _discard_staging(staging)
-            raise
+        applied = await rebuild_from_source(legacy, paths)
         return MigrationResult("legacy", applied, backup)
 
     if live.exists():
         # 路径 3：live 已存在 —— 先只读检查，全部完成则直接复用，不动任何文件
         head = _head_revision()
-        current = _alembic_version(live)
+        current = alembic_version(live)
         schema_pending = current != head
         data_pending = pending_data_migration_keys(live)
         if not schema_pending and not data_pending:
             return MigrationResult("live", (), None)
         # 存在待执行项：时间戳备份 + staging 上完成后原子替换；失败删除 staging，live 字节不变
         backup = backup_database(live, paths, current or "pre_alembic")
-        sqlite_backup(live, staging)
-        try:
-            applied = await _upgrade_staging(staging)
-            _verify_and_publish(staging, live)
-        except BaseException:
-            _discard_staging(staging)
-            raise
+        applied = await rebuild_from_source(live, paths)
         return MigrationResult("live", applied, backup)
 
     # 路径 1：新旧库均不存在 —— staging 上从零构建后原子发布
-    try:
-        applied = await _upgrade_staging(staging)
-        _verify_and_publish(staging, live)
-    except BaseException:
-        _discard_staging(staging)
-        raise
+    applied = await rebuild_from_source(None, paths)
     return MigrationResult("fresh", applied, None)
