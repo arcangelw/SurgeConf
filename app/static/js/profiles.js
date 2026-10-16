@@ -4,7 +4,10 @@
 let dnsPresets = [];
 let profileRegions = [];
 let profileServices = [];
-let fieldMeta = [];      // General 字段元数据（全局共享）
+// General 字段元数据按档案缓存：目标（workstation/gateway/iOS）决定可配置字段与
+// forced 集合，绝不跨档案共享；缓存键即档案 id，乱序/并发响应不会串档
+const fieldMetaByProfile = new Map();   // profileId → 服务端按目标过滤后的字段元数据
+const fieldMetaInflight = new Map();    // profileId → 进行中的加载 Promise（并发去重）
 let serverIps = [];      // 生成 Tab 可选服务器地址（全局共享）
 let allProfiles = [];    // 当前方案列表（loadData 后有效）
 
@@ -33,10 +36,19 @@ async function loadDnsPresets() {
   } catch (e) { /* ignore */ }
 }
 
-async function loadGeneralFields() {
-  try {
-    fieldMeta = await API.get("/api/general/fields");
-  } catch (e) { toast(e.message, "error"); }
+/** 加载指定档案的 General 字段元数据（缓存 + inflight 去重）。
+ *  必须携带 profile_id：不同目标的可配置字段与 forced 集合不同，
+ *  禁止无参请求默认档案后跨档案共用。错误上抛，由调用方统一提示。 */
+function loadGeneralFields(profileId) {
+  const cached = fieldMetaByProfile.get(profileId);
+  if (cached) return Promise.resolve(cached);
+  const inflight = fieldMetaInflight.get(profileId);
+  if (inflight) return inflight;
+  const req = API.get(`/api/general/fields?profile_id=${encodeURIComponent(profileId)}`)
+    .then(meta => { fieldMetaByProfile.set(profileId, meta); return meta; })
+    .finally(() => { fieldMetaInflight.delete(profileId); });
+  fieldMetaInflight.set(profileId, req);
+  return req;
 }
 
 async function loadServerIps() {
@@ -199,7 +211,7 @@ function setGroupCollapsed(groupId, collapsed) {
   } catch { /* 隐私模式等场景忽略 */ }
 }
 
-function renderGeneralTab(profileId) {
+async function renderGeneralTab(profileId) {
   const el = document.getElementById(`tab-content-${profileId}`);
   el.innerHTML = `
     <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
@@ -215,13 +227,23 @@ function renderGeneralTab(profileId) {
         </div>
       </div>
     </details>`;
-  renderGeneralForm(profileId);
-  loadGeneralValues(profileId);
+  // 先取当前档案的字段元数据（目标决定可配置字段与 forced 集合）再渲染/填值；
+  // 加载失败不渲染表单——没有 metadata 就无法判定 forced 键，必须 fail closed
+  let meta;
+  try {
+    meta = await loadGeneralFields(profileId);
+  } catch (e) {
+    toast(e.message, "error");
+    return;
+  }
+  renderGeneralForm(profileId, meta);
+  await loadGeneralValues(profileId);
 }
 
-function renderGeneralForm(profileId) {
+function renderGeneralForm(profileId, meta) {
   const container = document.getElementById(`groups-container-${profileId}`);
-  container.innerHTML = fieldMeta.map(g => {
+  if (!container) return;  // 异步返回时 Tab 已被切换/卸载，放弃本次渲染
+  container.innerHTML = meta.map(g => {
     const groupId = `group-${g.key}`;
     const collapsed = isGroupCollapsed(groupId);
     return `
@@ -324,7 +346,7 @@ function toggleGroup(groupId) {
 
 async function loadGeneralValues(profileId) {
   try {
-    const data = await API.get(`/api/general/values?profile_id=${profileId}`);
+    const data = await API.get(`/api/general/values?profile_id=${encodeURIComponent(profileId)}`);
     fillGeneralForm(profileId, data.values);
   } catch (e) { toast(e.message, "error"); }
 }
@@ -361,8 +383,14 @@ function bool(v) {
 function collectGeneralValues(profileId) {
   const values = {};
   // 服务端强制安全字段不收集：后端保存时无条件写入强制值；
-  // 依据 fieldMeta（服务端元数据）而非 DOM 属性判定，DOM 篡改也不会提交
-  const forcedKeys = new Set((fieldMeta || []).flatMap(g =>
+  // 依据当前档案的 metadata（owner 必须匹配 profileId）而非 DOM 属性判定，
+  // DOM 篡改也不会提交；metadata 缺失说明 owner 不确定，fail closed 拒绝收集
+  const meta = fieldMetaByProfile.get(profileId);
+  if (!meta) {
+    toast(I18N["general.meta_missing"], "error");
+    return null;
+  }
+  const forcedKeys = new Set(meta.flatMap(g =>
     g.fields.filter(f => f.forced === true).map(f => f.key)));
   document.querySelectorAll(`#tab-content-${profileId} [data-key]`).forEach(el => {
     const key = el.dataset.key;
@@ -401,12 +429,14 @@ function collectGeneralValues(profileId) {
 }
 
 async function saveGeneralValues(profileId, btn) {
-  const values = collectGeneralValues(profileId);
-  if (!values) return;
-
   await withLoading(btn, async () => {
     try {
-      await API.put(`/api/general/values?profile_id=${profileId}`, values);
+      // 保存前确保 metadata 属于当前档案（命中缓存或重新拉取，owner 必然匹配）；
+      // 拉取失败则中止提交，不用旧/默认档案的 forced 集合做判定
+      await loadGeneralFields(profileId);
+      const values = collectGeneralValues(profileId);
+      if (!values) return;
+      await API.put(`/api/general/values?profile_id=${encodeURIComponent(profileId)}`, values);
       toast(I18N["msg.saved"]);
     } catch (e) { toast(e.message, "error"); }
   });
@@ -897,7 +927,9 @@ setupRuleModals({
 });
 
 async function init() {
-  await Promise.all([loadDnsPresets(), loadProfileGroups(), loadGeneralFields(), loadServerIps()]);
+  // General 字段元数据不再首屏无参加载：打开各档案 General Tab 时
+  // 由 renderGeneralTab 按 profile_id 拉取（不同目标字段/forced 集合不同）
+  await Promise.all([loadDnsPresets(), loadProfileGroups(), loadServerIps()]);
   loadData();
 }
 init();
