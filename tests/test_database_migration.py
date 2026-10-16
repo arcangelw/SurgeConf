@@ -829,3 +829,193 @@ def test_0005_head_fingerprint_covers_udp_exception_columns():
     fingerprint = database_migration.schema_fingerprints()[head]
     assert fingerprint["udp_exceptions"] == \
         {c.name for c in UdpException.__table__.columns}
+
+
+# ===== fix round 1：0005 新表结构（FK / unique / index）指纹验证 =====
+
+
+def _synth_udp_exceptions(db_path: Path, *,
+                          fk: str | None = "CASCADE",
+                          uq: bool = True,
+                          uq_cols: str = "profile_id, match_type, match_value",
+                          ix: bool = True,
+                          ix_cols: str = "profile_id, enabled, sort_order",
+                          ix_unique: bool = False,
+                          display_name_nullable: bool = True) -> None:
+    """0004 库 + 手工合成 udp_exceptions（默认与 0005 迁移产物 inspector 视图
+    等价；关掉/改写单个结构维度即可构造伪结构）"""
+    command.upgrade(database_migration._alembic_config(db_path),
+                    "0004_rule_source_ip_rules")
+    fk_clause = "" if fk is None else (
+        ", CONSTRAINT fk_udp_exceptions_profile_id "
+        f"FOREIGN KEY (profile_id) REFERENCES config_profiles (id) ON DELETE {fk}")
+    uq_clause = "" if not uq else (
+        f", CONSTRAINT uq_udp_exceptions_profile_match UNIQUE ({uq_cols})")
+    display_name = "display_name VARCHAR(100)" if display_name_nullable \
+        else "display_name VARCHAR(100) NOT NULL"
+    conn = sqlite3.connect(db_path)
+    with conn:
+        # 多行 DDL（逗号+换行分隔约束）：SQLite 方言对单行 DDL 的约束名
+        # 解析会把相邻约束粘连读错；Alembic 产物即多行格式
+        conn.execute(
+            "CREATE TABLE udp_exceptions (\n"
+            "\tid INTEGER PRIMARY KEY,\n"
+            "\tprofile_id INTEGER NOT NULL,\n"
+            "\tmatch_type VARCHAR(20) NOT NULL,\n"
+            "\tmatch_value VARCHAR(255) NOT NULL,\n"
+            f"\t{display_name},\n"
+            "\tenabled BOOLEAN NOT NULL DEFAULT 1,\n"
+            "\tsort_order INTEGER NOT NULL DEFAULT 0"
+            f"{uq_clause}{fk_clause},\n"
+            "\tCONSTRAINT ck_udp_exceptions_match_type "
+            "CHECK (match_type IN ('process', 'mac_address'))\n)")
+        if ix:
+            conn.execute(
+                f"CREATE {'UNIQUE ' if ix_unique else ''}INDEX "
+                f"ix_udp_exceptions_profile_enabled_sort ON udp_exceptions ({ix_cols})")
+        conn.execute("DROP TABLE alembic_version")
+    conn.close()
+
+
+def test_unversioned_0005_synthetic_complete_identified(tmp_path):
+    """基准自证：手工合成的完整 0005（列/CHECK/FK/unique/index/nullable 全对）
+    精确识别为 0005（合成 DDL 与迁移产物在 inspector 视图上等价）"""
+    db_path = tmp_path / "synth_complete.db"
+    _synth_udp_exceptions(db_path)
+    assert database_migration.identify_unversioned_schema(db_path) == \
+        "0005_udp_exceptions"
+
+
+def test_unversioned_0005_missing_fk_rejected(tmp_path):
+    """缺 FK（无外键的伪结构）：fail closed，诊断含外键名"""
+    db_path = tmp_path / "no_fk.db"
+    _synth_udp_exceptions(db_path, fk=None)
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "fk_udp_exceptions_profile_id" in details
+    assert "外键缺失或定义不符" in details
+
+
+def test_unversioned_0005_wrong_ondelete_rejected(tmp_path):
+    """FK 存在但 ondelete 不是 CASCADE（RESTRICT）：fail closed"""
+    db_path = tmp_path / "wrong_ondelete.db"
+    _synth_udp_exceptions(db_path, fk="RESTRICT")
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "fk_udp_exceptions_profile_id" in details
+
+
+def test_unversioned_0005_missing_unique_rejected(tmp_path):
+    """缺唯一约束：fail closed，诊断含约束名"""
+    db_path = tmp_path / "no_uq.db"
+    _synth_udp_exceptions(db_path, uq=False)
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "uq_udp_exceptions_profile_match" in details
+    assert "唯一约束缺失或列不符" in details
+
+
+def test_unversioned_0005_wrong_unique_column_order_rejected(tmp_path):
+    """唯一约束列序不符（match_type 提前）：fail closed"""
+    db_path = tmp_path / "wrong_uq_order.db"
+    _synth_udp_exceptions(db_path, uq_cols="match_type, profile_id, match_value")
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "uq_udp_exceptions_profile_match" in details
+
+
+@pytest.mark.parametrize(("ix", "ix_cols", "ix_unique"), [
+    (False, "profile_id, enabled, sort_order", False),   # 缺索引
+    (True, "sort_order, enabled, profile_id", False),    # 列序错
+    (True, "profile_id, enabled, sort_order", True),     # 被建成唯一索引
+])
+def test_unversioned_0005_index_defects_rejected(tmp_path, ix, ix_cols, ix_unique):
+    """索引缺失/列序错/唯一标志不符：全部 fail closed，诊断含索引名"""
+    db_path = tmp_path / "index_defect.db"
+    _synth_udp_exceptions(db_path, ix=ix, ix_cols=ix_cols, ix_unique=ix_unique)
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "ix_udp_exceptions_profile_enabled_sort" in details
+    assert "索引缺失或定义不符" in details
+
+
+def test_unversioned_0005_display_name_not_null_rejected(tmp_path):
+    """display_name 被建成 NOT NULL（伪结构，其余全对）：违反登记的
+    nullable=True 要求，fail closed；诊断含列名"""
+    db_path = tmp_path / "dn_notnull.db"
+    _synth_udp_exceptions(db_path, display_name_nullable=False)
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = "; ".join(database_migration._schema_mismatch_details(db_path))
+    assert "display_name" in details
+    assert "期望 nullable" in details
+
+
+def test_missing_udp_check_diagnosis_attributed_to_udp_table_only(tmp_path):
+    """CHECK 诊断按真实表归属：缺 udp_exceptions 的约束只报告该表，
+    绝不谎称 config_profiles 缺约束"""
+    db_path = tmp_path / "check_attribution.db"
+    _make_unversioned_0005_sans_constraints(db_path, _UNCONSTRAINED_UDP_DDL)
+    assert database_migration.identify_unversioned_schema(db_path) is None
+    details = database_migration._schema_mismatch_details(db_path)
+    joined = "; ".join(details)
+    assert "udp_exceptions 缺 CHECK 约束: ck_udp_exceptions_match_type" in joined
+    assert "config_profiles 缺 CHECK 约束" not in joined
+    assert "config_profiles CHECK 约束表达式不一致" not in joined
+
+
+def test_udp_exception_structures_match_metadata(tmp_path):
+    """三方强制器：冻结映射、ORM metadata、Alembic head 产物的 FK /
+    唯一约束 / 索引名称、列序与动作（ondelete / unique 标志）完全一致"""
+    from sqlalchemy.schema import ForeignKeyConstraint, UniqueConstraint
+
+    from app.models import UdpException
+
+    head = database_migration._head_revision()
+    frozen_fks = database_migration._accumulated_required_foreign_keys(head)["udp_exceptions"]
+    frozen_uqs = database_migration._accumulated_required_uniques(head)["udp_exceptions"]
+    frozen_ixs = database_migration._accumulated_required_indexes(head)["udp_exceptions"]
+
+    orm_fks = {
+        c.name: {
+            "local_columns": tuple(col.name for col in c.columns),
+            "referred_table": tuple(c.elements)[0].column.table.name,
+            "referred_columns": tuple(e.column.name for e in c.elements),
+            "ondelete": (tuple(c.elements)[0].ondelete or "").strip().upper() or None,
+        }
+        for c in UdpException.__table__.constraints
+        if isinstance(c, ForeignKeyConstraint)
+    }
+    assert set(orm_fks) == set(frozen_fks) == {"fk_udp_exceptions_profile_id"}
+    assert orm_fks["fk_udp_exceptions_profile_id"] == dict(frozen_fks["fk_udp_exceptions_profile_id"])
+
+    orm_uqs = {
+        c.name: tuple(col.name for col in c.columns)
+        for c in UdpException.__table__.constraints
+        if isinstance(c, UniqueConstraint)
+    }
+    assert orm_uqs == {name: tuple(cols) for name, cols in frozen_uqs.items()}
+
+    orm_ixs = {
+        ix.name: {"column_names": tuple(col.name for col in ix.columns),
+                  "unique": bool(ix.unique)}
+        for ix in UdpException.__table__.indexes
+    }
+    assert set(orm_ixs) == set(frozen_ixs) == {"ix_udp_exceptions_profile_enabled_sort"}
+    assert orm_ixs["ix_udp_exceptions_profile_enabled_sort"] == {
+        "column_names": tuple(frozen_ixs["ix_udp_exceptions_profile_enabled_sort"]["column_names"]),
+        "unique": False,
+    }
+
+    path = tmp_path / "head.db"
+    command.upgrade(database_migration._alembic_config(path), "head")
+    c = _udp_exceptions_constraints(path)
+    fk = c["fk"]["fk_udp_exceptions_profile_id"]
+    assert tuple(fk["constrained_columns"]) == ("profile_id",)
+    assert fk["referred_table"] == "config_profiles"
+    assert tuple(fk["referred_columns"]) == ("id",)
+    assert (fk.get("options") or {}).get("ondelete", "").upper() == "CASCADE"
+    assert c["unique"]["uq_udp_exceptions_profile_match"]["column_names"] == \
+        ["profile_id", "match_type", "match_value"]
+    ix = c["index"]["ix_udp_exceptions_profile_enabled_sort"]
+    assert ix["column_names"] == ["profile_id", "enabled", "sort_order"]
+    assert bool(ix["unique"]) is False

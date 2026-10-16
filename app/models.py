@@ -1,5 +1,6 @@
 from sqlalchemy import (CheckConstraint, Column, Integer, String, Boolean, Text,
-                         DateTime, JSON, ForeignKey, Index, UniqueConstraint)
+                         DateTime, JSON, ForeignKeyConstraint,
+                         Index, UniqueConstraint)
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -172,14 +173,18 @@ class UdpException(Base):
     __table_args__ = (
         CheckConstraint("match_type IN ('process', 'mac_address')",
                         name="ck_udp_exceptions_match_type"),
+        # 表级命名 FK（列级 ForeignKey 生成匿名约束，无法通过无版本识别的
+        # 名称匹配；名称/列/ondelete 与 0005 迁移及冻结映射三方一致）
+        ForeignKeyConstraint(["profile_id"], ["config_profiles.id"],
+                             name="fk_udp_exceptions_profile_id",
+                             ondelete="CASCADE"),
         UniqueConstraint("profile_id", "match_type", "match_value",
                          name="uq_udp_exceptions_profile_match"),
         Index("ix_udp_exceptions_profile_enabled_sort", "profile_id", "enabled", "sort_order"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    profile_id = Column(Integer, ForeignKey("config_profiles.id", ondelete="CASCADE"),
-                        nullable=False, comment="所属配置方案")
+    profile_id = Column(Integer, nullable=False, comment="所属配置方案")
     match_type = Column(String(20), nullable=False, comment="匹配类型: process/mac_address")
     match_value = Column(String(255), nullable=False, comment="匹配值；错误与日志不回显")
     display_name = Column(String(100), nullable=True, comment="显示名称")

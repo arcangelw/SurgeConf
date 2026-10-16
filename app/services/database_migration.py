@@ -162,7 +162,49 @@ SCHEMA_REVISION_COLUMN_NULLABILITY: dict[str, dict[tuple[str, str], bool]] = {
                             ("udp_exceptions", "match_type"): False,
                             ("udp_exceptions", "match_value"): False,
                             ("udp_exceptions", "enabled"): False,
-                            ("udp_exceptions", "sort_order"): False},
+                            ("udp_exceptions", "sort_order"): False,
+                            # display_name 登记为可空：伪结构（被建成 NOT NULL）
+                            # 同样拒绝， nullable 要求不单向收紧
+                            ("udp_exceptions", "display_name"): True},
+}
+
+# 各 revision 必需的结构化外键（revision → 表 → 约束名 → 冻结定义）。
+# **新增带 FK 的 revision 时在此登记**；与 checks/nullability 同一累积语义：
+# 后续 revision 继承更早要求，旧 revision 不被未来要求回溯误伤。
+# ondelete 比较前规范化大写（SQLite inspector 将其放在 options 子字典）。
+SCHEMA_REVISION_FOREIGN_KEYS: dict[str, dict[str, dict[str, dict[str, object]]]] = {
+    "0005_udp_exceptions": {
+        "udp_exceptions": {
+            "fk_udp_exceptions_profile_id": {
+                "local_columns": ("profile_id",),
+                "referred_table": "config_profiles",
+                "referred_columns": ("id",),
+                "ondelete": "CASCADE",
+            },
+        },
+    },
+}
+
+# 各 revision 必需的命名唯一约束（revision → 表 → 约束名 → 列顺序元组）
+SCHEMA_REVISION_UNIQUE_CONSTRAINTS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
+    "0005_udp_exceptions": {
+        "udp_exceptions": {
+            "uq_udp_exceptions_profile_match": ("profile_id", "match_type", "match_value"),
+        },
+    },
+}
+
+# 各 revision 必需的命名索引（revision → 表 → 索引名 → 冻结定义；
+# unique=False 表示普通索引，唯一索引须显式声明 unique=True）
+SCHEMA_REVISION_INDEXES: dict[str, dict[str, dict[str, dict[str, object]]]] = {
+    "0005_udp_exceptions": {
+        "udp_exceptions": {
+            "ix_udp_exceptions_profile_enabled_sort": {
+                "column_names": ("profile_id", "enabled", "sort_order"),
+                "unique": False,
+            },
+        },
+    },
 }
 
 # 识别时忽略的表：alembic_version 属版本簿记；data_migration_records 由 _sync_schema 补建
@@ -181,12 +223,28 @@ def schema_fingerprints() -> dict[str, dict[str, frozenset[str]]]:
     return fingerprints
 
 
+def _normalize_actual_fk(fk: dict) -> dict:
+    """inspector FK 原始 dict → 规范化形态（列序元组 + ondelete 大写；
+    SQLAlchemy 2.x 的 SQLite 方言把 ondelete 放在 options 子字典）"""
+    ondelete = (fk.get("options") or {}).get("ondelete")
+    return {
+        "constrained_columns": tuple(fk.get("constrained_columns") or ()),
+        "referred_table": fk.get("referred_table"),
+        "referred_columns": tuple(fk.get("referred_columns") or ()),
+        "ondelete": ondelete.strip().upper() if isinstance(ondelete, str) else None,
+    }
+
+
 def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]],
                                                   dict[str, dict[str, str]],
-                                                  dict[str, dict[str, bool]]]:
+                                                  dict[str, dict[str, bool]],
+                                                  dict[str, dict[str, dict]],
+                                                  dict[str, dict[str, tuple]],
+                                                  dict[str, dict[str, dict]]]:
     assert_sqlite_database_safe(database_path)
-    """实际库的表集合、表→列集合、表→命名 CHECK 约束集合、表→列 nullable
-    （均排除簿记表）。
+    """实际库的表集合、表→列集合、表→命名 CHECK 约束集合、表→列 nullable、
+    表→命名 FK（规范化）、表→命名唯一约束（列序元组）、表→命名索引
+    （列序 + unique 标志）（均排除簿记表）。
 
     约束与列属性经 SQLAlchemy inspector 读取，不解析 sqlite_master DDL 文本
     （避免依赖空白/顺序的脆弱正则）。
@@ -202,9 +260,20 @@ def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]],
         checks = {t: {cc["name"]: cc["sqltext"] for cc in
                       inspector.get_check_constraints(t)}
                   for t in tables}
+        foreign_keys = {t: {fk["name"]: _normalize_actual_fk(fk) for fk in
+                            inspector.get_foreign_keys(t) if fk.get("name")}
+                        for t in tables}
+        uniques = {t: {u["name"]: tuple(u.get("column_names") or ())
+                       for u in inspector.get_unique_constraints(t) if u.get("name")}
+                   for t in tables}
+        indexes = {t: {i["name"]: {"column_names": tuple(i.get("column_names") or ()),
+                                    "unique": bool(i.get("unique"))}
+                       for i in inspector.get_indexes(t) if i.get("name")}
+                   for t in tables}
     finally:
         engine.dispose()
-    return tables, columns, checks, nullability
+    return (tables, columns, checks, nullability,
+            foreign_keys, uniques, indexes)
 
 
 def _normalize_check_expression(sqltext: str) -> str:
@@ -281,14 +350,99 @@ def _accumulated_column_nullability(revision: str) -> dict[tuple[str, str], bool
     return accumulated
 
 
+def _accumulated_required_foreign_keys(revision: str) -> dict[str, dict[str, dict]]:
+    """截至该 revision（含）累积的全部必需命名 FK（同 checks 的继承语义）"""
+    revisions = list(SCHEMA_REVISION_DELTAS)
+    if revision not in revisions:
+        return {}
+    accumulated: dict[str, dict[str, dict]] = {}
+    for known in revisions:
+        for table, fks in SCHEMA_REVISION_FOREIGN_KEYS.get(known, {}).items():
+            accumulated.setdefault(table, {}).update(fks)
+        if known == revision:
+            break
+    return accumulated
+
+
+def _accumulated_required_uniques(revision: str) -> dict[str, dict[str, tuple]]:
+    """截至该 revision（含）累积的全部必需命名唯一约束（同继承语义）"""
+    revisions = list(SCHEMA_REVISION_DELTAS)
+    if revision not in revisions:
+        return {}
+    accumulated: dict[str, dict[str, tuple]] = {}
+    for known in revisions:
+        for table, uniques in SCHEMA_REVISION_UNIQUE_CONSTRAINTS.get(known, {}).items():
+            accumulated.setdefault(table, {}).update(uniques)
+        if known == revision:
+            break
+    return accumulated
+
+
+def _accumulated_required_indexes(revision: str) -> dict[str, dict[str, dict]]:
+    """截至该 revision（含）累积的全部必需命名索引（同继承语义）"""
+    revisions = list(SCHEMA_REVISION_DELTAS)
+    if revision not in revisions:
+        return {}
+    accumulated: dict[str, dict[str, dict]] = {}
+    for known in revisions:
+        for table, indexes in SCHEMA_REVISION_INDEXES.get(known, {}).items():
+            accumulated.setdefault(table, {}).update(indexes)
+        if known == revision:
+            break
+    return accumulated
+
+
+def _fk_requirement_satisfied(actual: dict | None, required: dict) -> bool:
+    """实际 FK 是否与冻结定义一致（本地/引用列序、引用表、ondelete）"""
+    if not actual:
+        return False
+    return (actual["constrained_columns"] == tuple(required["local_columns"])
+            and actual["referred_table"] == required["referred_table"]
+            and actual["referred_columns"] == tuple(required["referred_columns"])
+            and actual["ondelete"] == required["ondelete"])
+
+
+def _structure_requirements_satisfied(revision: str,
+                                      actual_foreign_keys: dict[str, dict[str, dict]],
+                                      actual_uniques: dict[str, dict[str, tuple]],
+                                      actual_indexes: dict[str, dict[str, dict]]) -> bool:
+    """revision 累积的 FK / 唯一约束 / 索引要求是否全部满足
+    （缺任一或任一字段不符 → False，识别 fail closed）"""
+    for table, required in _accumulated_required_foreign_keys(revision).items():
+        actual = actual_foreign_keys.get(table, {})
+        if not all(_fk_requirement_satisfied(actual.get(name), req)
+                   for name, req in required.items()):
+            return False
+    for table, required in _accumulated_required_uniques(revision).items():
+        actual = actual_uniques.get(table, {})
+        if any(actual.get(name) != tuple(columns) for name, columns in required.items()):
+            return False
+    for table, required in _accumulated_required_indexes(revision).items():
+        actual = actual_indexes.get(table, {})
+        for name, req in required.items():
+            entry = actual.get(name)
+            if (not entry
+                    or entry["column_names"] != tuple(req["column_names"])
+                    or entry["unique"] != bool(req["unique"])):
+                return False
+    return True
+
+
 def _required_check_problems(revision: str,
-                             actual_checks: dict[str, dict[str, str]]
+                             actual_checks: dict[str, dict[str, str]],
+                             table: str | None = None
                              ) -> tuple[set[str], set[str]]:
-    """相对 revision 必需约束（累积）返回（缺失的约束名, 表达式不一致的约束名）"""
+    """相对 revision 必需约束（累积）返回（缺失的约束名, 表达式不一致的约束名）。
+
+    table=None 汇总全部表；指定表时只检查该表（诊断按真实表归属报告，
+    不把 A 表缺失谎报到 B 表头上）。
+    """
     missing: set[str] = set()
     mismatched: set[str] = set()
-    for table, required in _accumulated_required_checks(revision).items():
-        actual = actual_checks.get(table, {})
+    for required_table, required in _accumulated_required_checks(revision).items():
+        if table is not None and required_table != table:
+            continue
+        actual = actual_checks.get(required_table, {})
         for name, expected in required.items():
             if name not in actual:
                 missing.add(name)
@@ -300,12 +454,14 @@ def _required_check_problems(revision: str,
 
 def identify_unversioned_schema(database_path: Path) -> str | None:
     """无版本库精确识别：表/列与某个 revision 指纹完全一致、且该 revision
-    必需的命名 CHECK 约束齐全，才返回该 revision。
+    必需的命名 CHECK / FK / 唯一约束 / 索引与列可空性要求全部满足，
+    才返回该 revision。
 
-    额外列、缺失列、混合多个 revision 的列或缺任一必需约束都返回 None
-    （绝不猜测性 stamp）。
+    额外列、缺失列、混合多个 revision 的列、缺任一必需约束或结构字段
+    不符都返回 None（绝不猜测性 stamp）。
     """
-    actual_tables, actual_columns, actual_checks, actual_nullability = _actual_schema(database_path)
+    (actual_tables, actual_columns, actual_checks, actual_nullability,
+     actual_foreign_keys, actual_uniques, actual_indexes) = _actual_schema(database_path)
     for revision, fingerprint in schema_fingerprints().items():
         if actual_tables != set(fingerprint):
             continue
@@ -320,6 +476,11 @@ def identify_unversioned_schema(database_path: Path) -> str | None:
                for (table, column), expected
                in _accumulated_column_nullability(revision).items()):
             continue
+        # 结构化约束（FK / 唯一约束 / 索引，累积要求）：缺任一或字段不符
+        # 同样 fail closed（如缺 CASCADE、唯一约束列序错、索引被建成唯一）
+        if not _structure_requirements_satisfied(revision, actual_foreign_keys,
+                                                 actual_uniques, actual_indexes):
+            continue
         return revision
     return None
 
@@ -328,7 +489,8 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
     """与最近 revision 指纹的差异描述：只含表/列/约束名，绝不含数据值"""
     head = _head_revision()
     fingerprint = schema_fingerprints()[head]
-    actual_tables, actual_columns, actual_checks, actual_nullability = _actual_schema(database_path)
+    (actual_tables, actual_columns, actual_checks, actual_nullability,
+     actual_foreign_keys, actual_uniques, actual_indexes) = _actual_schema(database_path)
     problems: list[str] = []
     for table in sorted(set(fingerprint) - actual_tables):
         problems.append(f"缺表 {table}")
@@ -343,13 +505,32 @@ def _schema_mismatch_details(database_path: Path) -> list[str]:
             problems.append(f"{table} 缺列: {', '.join(sorted(missing))}")
         if extra:
             problems.append(f"{table} 额外列: {', '.join(sorted(extra))}")
-    for table, required in _accumulated_required_checks(head).items():
-        missing, mismatched = _required_check_problems(head, actual_checks)
+    # 约束差异按真实表归属报告：逐表调用，缺 udp_exceptions 的约束绝不
+    # 谎报到 config_profiles 头上
+    constrained_tables = sorted({t for t in _accumulated_required_checks(head)}
+                                | set(_accumulated_required_foreign_keys(head))
+                                | set(_accumulated_required_uniques(head))
+                                | set(_accumulated_required_indexes(head)))
+    for table in constrained_tables:
+        missing, mismatched = _required_check_problems(head, actual_checks, table=table)
         if missing:
             problems.append(f"{table} 缺 CHECK 约束: {', '.join(sorted(missing))}")
         if mismatched:
             problems.append(
                 f"{table} CHECK 约束表达式不一致: {', '.join(sorted(mismatched))}")
+        for name, req in _accumulated_required_foreign_keys(head).get(table, {}).items():
+            if not _fk_requirement_satisfied(
+                    actual_foreign_keys.get(table, {}).get(name), req):
+                problems.append(f"{table} 外键缺失或定义不符: {name}")
+        for name, columns in _accumulated_required_uniques(head).get(table, {}).items():
+            if actual_uniques.get(table, {}).get(name) != tuple(columns):
+                problems.append(f"{table} 唯一约束缺失或列不符: {name}")
+        for name, req in _accumulated_required_indexes(head).get(table, {}).items():
+            entry = actual_indexes.get(table, {}).get(name)
+            if (not entry
+                    or entry["column_names"] != tuple(req["column_names"])
+                    or entry["unique"] != bool(req["unique"])):
+                problems.append(f"{table} 索引缺失或定义不符: {name}")
     for (table, column), expected in sorted(_accumulated_column_nullability(head).items()):
         actual = actual_nullability.get(table, {}).get(column)
         if actual != expected:
