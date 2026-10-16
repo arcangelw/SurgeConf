@@ -298,3 +298,46 @@ class TestDocumentCoverage:
         assert violations == [], "; ".join(
             f"{name} 触发安全规则类别 {RULE_CATEGORIES[rule_id - 1]}"
             for name, rule_id in violations)
+
+
+class TestHttpApiExampleSafety:
+    """Surge HTTP API 示例片段的静态安全约束（Fix Round 2）。
+
+    只验证结构性危险模式，不测精确措辞：
+    - curl 行不得出现 -k / --insecure（跳过证书校验）；
+    - key 不得经 curl argv 注入（-H "X-Key:…" / --header "X-Key:…"）；
+    - 仓库默认 ``http-api-tls = true``：示例端口 6171 的行不得使用
+      明文 http://（协议必须与 TLS 配置匹配）。
+    """
+
+    def _doc_lines(self, repo_text_files):
+        for name in repo_text_files:
+            if not (name.endswith(".md") or name == "README.md"):
+                continue
+            text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), start=1):
+                yield name, number, line
+
+    def test_no_insecure_curl_flags(self, repo_text_files):
+        offenders = [
+            f"{name}:{number}"
+            for name, number, line in self._doc_lines(repo_text_files)
+            if "curl" in line and ("--insecure" in line
+                                   or re.search(r"\s-k(\s|$)", line))]
+        assert offenders == [], f"curl 跳过证书校验的示例: {offenders}"
+
+    def test_no_key_in_curl_argv(self, repo_text_files):
+        offenders = [
+            f"{name}:{number}"
+            for name, number, line in self._doc_lines(repo_text_files)
+            if re.search(r"""-{2}?header\s+["']X-Key""", line)
+            or re.search(r"""-{1,2}[hH]\s+["']X-Key(\s*:)""", line)]
+        assert offenders == [], f"X-Key 经 curl argv 注入: {offenders}"
+
+    def test_http_api_port_never_plaintext_http(self, repo_text_files):
+        offenders = [
+            f"{name}:{number}"
+            for name, number, line in self._doc_lines(repo_text_files)
+            if "6171" in line and "http://" in line]
+        assert offenders == [], (
+            f"默认 http-api-tls=true 的示例端口出现明文 http://: {offenders}")

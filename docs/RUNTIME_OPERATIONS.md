@@ -86,12 +86,22 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
   请求带 `X-Key: <key>` 头认证。注意 `external-controller-access` **不会**
   启用 HTTP API 端点（两者是独立配置）：
   ```bash
-  read -sr SURGE_HTTP_KEY          # 手动输入 key（不回显、不进 shell 历史）
-  curl -sS -X POST -H "X-Key: $SURGE_HTTP_KEY" \
-    http://127.0.0.1:6171/v1/profiles/reload
-  unset SURGE_HTTP_KEY             # 用完即清
+  unset KEY                        # 先清防继承已 export 的旧值
+  read -sr KEY                     # 手动输入 key：不回显、不进 shell 历史
+  printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
+    --cacert /path/to/surge-mitm-ca.pem \
+    https://127.0.0.1:6171/v1/profiles/reload
+  unset KEY                        # 用完即清
   ```
-  禁止把真实 key 写进命令行参数、URL query、脚本或粘贴到任何工单。
+  - 仓库默认 `http-api-tls = true`：示例必须走 `https://`——先在
+    系统钥匙串信任 Surge MITM CA，或用 `--cacert <CA 文件路径>` 显式
+    指定；**严禁 `-k` / `--insecure` 跳过证书校验**。仅当你在 General
+    中显式设置 `http-api-tls = false` 时才用 `http://`，协议必须与
+    配置匹配。
+  - key 经 stdin 以 `--header @-` 注入：不出现在 curl argv、进程列表
+    与命令历史。stdin 管道与 shell 变量仍是**本机敏感数据**（不是
+    加密通道），执行后必须 `unset` 清理变量；禁止把真实 key 写进
+    命令行参数、临时文件、URL query、环境导出或粘贴到任何工单。
 
 官方文档：[HTTP API](https://manual.nssurge.com/tools/http-api.html)、[Surge CLI](https://manual.nssurge.com/tools/cli.html)。
 
