@@ -1,4 +1,4 @@
-"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键）
+"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键 / 悬空规则源引用修复）
 
 持久化验证要点：断言一律通过独立新 session（db.bind 新开）查询，
 防止 autoflush 后未 commit 的事务内可见性造成假阳性。
@@ -226,6 +226,83 @@ async def test_no_resolve_keywords_backfilled_and_persisted(db):
         v = (await fresh.execute(
             select(SystemConfig.value).where(SystemConfig.key == "no_resolve_keywords"))).scalar_one()
     assert v == "custom"
+
+
+@pytest.mark.asyncio
+async def test_dangling_rule_source_actions_fixed_to_global(db):
+    """悬空规则源 action（引用未生成组，如默认关闭的英国/韩国）迁移为 Global；幂等"""
+    from app.models import RegionGroup
+
+    # 前置条件：conftest 种子中英国/韩国地区组 auto/manual 均关 → 不生成
+    uk = (await db.execute(select(RegionGroup).where(RegionGroup.name == "英国"))).scalar_one()
+    assert uk.auto_enabled is False and uk.manual_enabled is False
+
+    db.add(RuleSource(name="Stream EU (non_ip)", url="https://ruleset.skk.moe/List/non_ip/stream_eu.conf",
+                      action="英国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    db.add(RuleSource(name="幽灵源", url="https://example.com/ghost.list",
+                      action="不存在的组", rule_type="RULE-SET", category="global",
+                      sort_order=80, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))  # 幂等
+
+    async with await _fresh_view(db) as fresh:
+        sources = {rs.name: rs.action for rs in
+                   (await fresh.execute(select(RuleSource))).scalars().all()}
+    assert sources["Stream EU (non_ip)"] == "Global"
+    assert sources["幽灵源"] == "Global"
+
+
+@pytest.mark.asyncio
+async def test_dangling_migration_keeps_explicitly_enabled_groups(db):
+    """用户已显式开启的地区组（组会生成）：引用保留，不被迁移改写"""
+    from app.models import RegionGroup
+    from sqlalchemy import update as sa_update
+
+    await db.execute(sa_update(RegionGroup).where(RegionGroup.name == "英国")
+                     .values(auto_enabled=True, manual_enabled=True))
+    db.add(RuleSource(name="Stream EU (non_ip)", url="https://ruleset.skk.moe/List/non_ip/stream_eu.conf",
+                      action="英国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        action = (await fresh.execute(
+            select(RuleSource.action).where(RuleSource.name == "Stream EU (non_ip)"))).scalar_one()
+    assert action == "英国"
+
+
+@pytest.mark.asyncio
+async def test_dangling_migration_keeps_builtin_and_valid_actions(db):
+    """内置动作与有效组引用（服务组/活跃地区组）一律不动"""
+    from app.models import RegionGroup
+
+    hk = (await db.execute(select(RegionGroup).where(RegionGroup.name == "香港"))).scalar_one()
+    assert hk.auto_enabled or hk.manual_enabled  # 前置：香港活跃
+
+    db.add(RuleSource(name="内置动作源", url="https://example.com/a.list",
+                      action="REJECT-DROP", rule_type="RULE-SET", category="adblock",
+                      sort_order=81, enabled=True))
+    db.add(RuleSource(name="服务组源", url="https://example.com/b.list",
+                      action="AI服务", rule_type="RULE-SET", category="ai",
+                      sort_order=82, enabled=True))
+    db.add(RuleSource(name="活跃地区源", url="https://example.com/c.list",
+                      action="香港", rule_type="RULE-SET", category="region_stream",
+                      sort_order=83, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        sources = {rs.name: rs.action for rs in
+                   (await fresh.execute(select(RuleSource))).scalars().all()}
+    assert sources["内置动作源"] == "REJECT-DROP"
+    assert sources["服务组源"] == "AI服务"
+    assert sources["活跃地区源"] == "香港"
 
 
 @pytest.mark.asyncio

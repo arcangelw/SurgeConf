@@ -12,6 +12,7 @@ from sqlalchemy import delete, select, update
 from app.default_config import DEFAULT_RULE_SOURCES, SECURITY_PRE_RULES
 from app.models import (ConfigProfile, CustomRule, DataMigrationRecord,
                         RuleSource, SystemConfig)
+from app.services.config_validation import BUILTIN_ACTIONS
 from app.services.generator import DEFAULT_NO_RESOLVE_KEYWORDS
 
 
@@ -141,6 +142,38 @@ async def _migrate_no_resolve_keywords(db) -> int:
     return 1
 
 
+async def _migrate_dangling_rule_source_actions(db) -> int:
+    """规则源 action 引用「按当前组表状态确定不会生成」的策略 → 修为 Global。
+
+    历史 DEFAULT_RULE_SOURCES 曾把英/韩流媒体指向默认关闭的地区组（英国/韩国
+    auto/manual 均关，组不生成），旧产物实际引用了 Surge 无法解析的策略名；
+    生成器引用校验上线后这类库将无法产出配置。本迁移只修确定悬空的引用：
+    组不存在、被禁用、地区组 auto/manual 全关均视为不会生成；用户已开启的
+    组（如显式启用英国）保留其原选择。CustomRule 的历史坏引用属用户手写
+    内容，不自动改写，由生成时校验显式报错指引修复。
+    """
+    from app.models import RegionGroup, ServiceGroup
+
+    regions = (await db.execute(select(RegionGroup))).scalars().all()
+    services = (await db.execute(select(ServiceGroup))).scalars().all()
+    generated = set(BUILTIN_ACTIONS)
+    generated.update(
+        rg.name for rg in regions if rg.enabled and (rg.auto_enabled or rg.manual_enabled))
+    generated.update(sg.name for sg in services if sg.enabled)
+    # 组合组逻辑名：生成条件依赖地区组拓扑，视为可引用；如有误留由生成校验兜底
+    generated.update({"全部节点", "自动选择", "代理", "手动选择", "其他", "其他手动"})
+
+    # 回退目标优先恒生成的 Global 服务组；用户删光服务组时退到内置 DIRECT
+    fallback = "Global" if "Global" in generated else "DIRECT"
+
+    fixed = 0
+    for rs in (await db.execute(select(RuleSource))).scalars().all():
+        if rs.action and rs.action not in generated:
+            rs.action = fallback
+            fixed += 1
+    return fixed
+
+
 # 有序注册表：新增业务迁移一律追加新 key，禁止修改已发布 key 的语义
 DATA_MIGRATIONS: dict = {
     "security_rules_v1": _migrate_security_rules,
@@ -149,6 +182,7 @@ DATA_MIGRATIONS: dict = {
     "dns_defaults_v1": _migrate_dns_defaults,
     "remove_global_quic_v1": _migrate_remove_global_quic,
     "no_resolve_keywords_v1": _migrate_no_resolve_keywords,
+    "dangling_rule_source_actions_v1": _migrate_dangling_rule_source_actions,
 }
 
 

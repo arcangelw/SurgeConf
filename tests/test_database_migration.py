@@ -18,6 +18,7 @@ from app.services.database_migration import prepare_database
 DATA_MIGRATION_KEYS = {
     "security_rules_v1", "douyin_rule_v1", "ipv6_vif_v1",
     "dns_defaults_v1", "remove_global_quic_v1", "no_resolve_keywords_v1",
+    "dangling_rule_source_actions_v1",
 }
 
 

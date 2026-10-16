@@ -12,8 +12,16 @@ from app.models import (
     RuleSource, Subscription,
     CustomRule, HostMapping, SystemConfig,
 )
-from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, locale_translate, CATEGORY_NAMES, COMMENT_NAMES
+from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES, DEFAULT_MITM, CATEGORY_NAMES, COMMENT_NAMES
 from app.profile_targets import ProfileTarget, filter_general_for_target
+from app.services.config_validation import (
+    GenerationContext,
+    RuleActionRef,
+    extract_rule_action,
+    translate_policy_name,
+    translate_rule_action,
+    validate_generated_references,
+)
 from app.services.profile_resolution import profile_scope, resolve_profile
 
 # 默认排除关键词（优先使用系统配置）
@@ -93,6 +101,20 @@ def _display_name(node: ProxyNode, sub_map: dict) -> str:
     return node.name
 
 
+class GroupNameSinks:
+    """分类登记本次实际生成的组名（供引用校验构成可用策略集合）。
+
+    名字取 t() 翻译后的输出名（未加引号）；disabled、未生成、被过滤的组
+    不进入登记。防漂移不变量由测试守卫：[Proxy Group] 输出的每个组名
+    都必须被登记到对应桶。
+    """
+
+    def __init__(self):
+        self.region: set[str] = set()
+        self.service: set[str] = set()
+        self.combined: set[str] = set()
+
+
 async def generate_surge_config(db: AsyncSession, profile_id: int | None = None, locale_override: str | None = None) -> str:
     # 唯一档案解析：显式 id（含 0/负数）不存在即 ProfileNotFound，仅省略时取默认
     profile = await resolve_profile(db, profile_id)
@@ -100,7 +122,8 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     locale = locale_override or (profile.locale or "zh")
 
     def t(name: str) -> str:
-        return locale_translate(name, locale)
+        # canonical 翻译：输出与引用校验共用 translate_policy_name，杜绝两套映射
+        return translate_policy_name(name, locale)
 
     def tc(key: str) -> str:
         """翻译分类名：zh 用中文名，en 保留英文原名"""
@@ -192,6 +215,8 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     # Proxy（排除订阅信息节点，如 Expire/Traffic，与分组过滤使用同一关键词）
     import re as _re
     info_pattern = _re.compile(exclusion_keywords)
+    # 实际输出节点名：引用校验的可用策略来源之一（被过滤的节点不算存在）
+    proxy_names: set[str] = set()
     sections.append("[Proxy]")
     if all_nodes:
         for node in all_nodes:
@@ -199,13 +224,16 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
                 continue
             display = _display_name(node, sub_map)
             config_line = node.config.replace(node.name, display, 1)
+            proxy_names.add(display)
             sections.append(config_line)
     sections.append("")
 
     # Proxy Group
+    group_names = GroupNameSinks()
     sections.append("[Proxy Group]")
     sections.extend(_build_proxy_groups(all_nodes, region_groups, service_groups, t, sub_map,
-                                        exclusion_keywords, other_auto_enabled, other_manual_enabled))
+                                        exclusion_keywords, other_auto_enabled, other_manual_enabled,
+                                        name_sinks=group_names))
     sections.append("")
 
     # Rule
@@ -229,7 +257,23 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     general_rules = general_rules_result.scalars().all()
 
     no_resolve_keywords = sys_config.get("no_resolve_keywords", DEFAULT_NO_RESOLVE_KEYWORDS)
-    sections.extend(_build_rules(rule_sources, pre_rules, general_rules, t, tc, tcomment, no_resolve_keywords))
+    # 先构建 + 记录结构化引用，再统一校验：任何无效引用聚合抛出，
+    # 绝不把部分 [Rule] 段拼进产物（sections 只在校验通过后扩展）
+    rule_refs: list[RuleActionRef] = []
+    rule_lines = _build_rules(rule_sources, pre_rules, general_rules, t, tc, tcomment,
+                              no_resolve_keywords,
+                              final_action=profile.final_action or "", record=rule_refs)
+    validate_generated_references(GenerationContext(
+        locale=locale,
+        target=profile.target,
+        node_names=frozenset(proxy_names),
+        region_group_names=frozenset(group_names.region),
+        service_group_names=frozenset(group_names.service),
+        combined_group_names=frozenset(group_names.combined),
+        rule_actions=tuple(rule_refs),
+        final_action=profile.final_action,
+    ))
+    sections.extend(rule_lines)
     sections.append("")
 
     # Host
@@ -278,11 +322,17 @@ def _build_proxy_groups(
     exclusion_keywords: str = DEFAULT_EXCLUSION_KEYWORDS,
     other_auto_enabled: bool = True,
     other_manual_enabled: bool = True,
+    name_sinks: GroupNameSinks | None = None,
 ) -> list[str]:
     lines = []
 
+    def _sink(bucket: set[str], name: str) -> None:
+        if name_sinks is not None:
+            bucket.add(name)
+
     # 全部节点组
     sub_filter = f"^((?!{exclusion_keywords}).)+$"
+    _sink(name_sinks.combined if name_sinks else set(), t("全部节点"))
     lines.append(
         f'{_quote(t("全部节点"))} = select, '
         f'policy-regex-filter={sub_filter}, '
@@ -299,6 +349,7 @@ def _build_proxy_groups(
     # ── 自动地区测速组 ──
     for rg in auto_regions:
         icon = f', icon-url={rg.icon_url}' if rg.icon_url else ""
+        _sink(name_sinks.region if name_sinks else set(), t(rg.name))
         lines.append(
             f'{_quote(t(rg.name))} = url-test, '
             f'policy-regex-filter={rg.filter_regex}, '
@@ -320,6 +371,7 @@ def _build_proxy_groups(
     # 其他地区（自动）— 仅在有自动地区时生成
     if auto_regions and other_auto_enabled:
         has_other = True
+        _sink(name_sinks.region if name_sinks else set(), t("其他"))
         lines.append(
             f'{other_region_quoted} = url-test, '
             f'policy-regex-filter={other_filter}, '
@@ -336,6 +388,7 @@ def _build_proxy_groups(
     for rg in manual_regions:
         manual_name = f"{rg.name}手动"
         icon = f', icon-url={rg.icon_url}' if rg.icon_url else ""
+        _sink(name_sinks.region if name_sinks else set(), t(manual_name))
         lines.append(
             f'{_quote(t(manual_name))} = select, '
             f'policy-regex-filter={rg.filter_regex}, '
@@ -347,6 +400,7 @@ def _build_proxy_groups(
     other_manual_names = []
     if auto_regions and other_manual_enabled:
         has_other = True
+        _sink(name_sinks.region if name_sinks else set(), t("其他手动"))
         lines.append(
             f'{other_manual_quoted} = select, '
             f'policy-regex-filter={other_filter}, '
@@ -363,6 +417,7 @@ def _build_proxy_groups(
     # 自动选择：仅包含明确分区的自动测速组（排除「其他」兜底组）
     auto_select_members = list(auto_region_names)
     if auto_select_members:
+        _sink(name_sinks.combined if name_sinks else set(), t("自动选择"))
         lines.append(
             f'{_quote(t("自动选择"))} = select, {", ".join(auto_select_members)}, '
             f'url=http://cp.cloudflare.com/generate_204, interval=300, tolerance=100, timeout=3, '
@@ -374,6 +429,7 @@ def _build_proxy_groups(
         proxy_members.append(_quote(t("自动选择")))
     proxy_members.extend(all_region_names)
     if proxy_members:
+        _sink(name_sinks.combined if name_sinks else set(), t("代理"))
         lines.append(
             f'{_quote(t("代理"))} = select, {", ".join(proxy_members)}, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/05icon/rocket(1).png'
@@ -384,6 +440,7 @@ def _build_proxy_groups(
         manual_select_members.append(_quote(t("自动选择")))
     manual_select_members.extend(manual_region_names + other_manual_names)
     if manual_region_names or other_manual_names or auto_select_members:
+        _sink(name_sinks.combined if name_sinks else set(), t("手动选择"))
         lines.append(
             f'{_quote(t("手动选择"))} = select, {", ".join(manual_select_members)}, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/05icon/lightning.png'
@@ -401,12 +458,26 @@ def _build_proxy_groups(
             _quote(e) if " " in e else e for e in all_entries
         )
         icon = f', icon-url={sg.icon_url}' if sg.icon_url else ""
+        _sink(name_sinks.service if name_sinks else set(), t(sg.name))
         lines.append(f'{_quote(t(sg.name))} = {sg.group_type}, {entries_str}{icon}')
 
     return lines
 
 
-def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, no_resolve_keywords: str | None = None) -> list[str]:
+def _emit_custom_rule(rule_text: str, label: str, t, record: list[RuleActionRef] | None) -> str:
+    """翻译自定义规则的策略段并登记引用。
+
+    无法定位策略段时原样输出并登记 action=None —— 构建器保持宽松，
+    fail closed 由校验器裁决（generate_surge_config 先校验后拼接产物）。
+    """
+    action = extract_rule_action(rule_text)
+    if record is not None:
+        record.append(RuleActionRef(label, action))
+    translated = translate_rule_action(rule_text, t)
+    return translated if translated is not None else rule_text
+
+
+def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], general_rules: list[CustomRule], t, tc, tcomment, no_resolve_keywords: str | None = None, *, final_action: str, record: list[RuleActionRef] | None = None) -> list[str]:
     lines = []
 
     # 命中关键词的规则集视为 IP 类，追加 no-resolve 防止触发本地 DNS 解析
@@ -416,13 +487,8 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
     if pre_rules:
         lines.append(f"# >> {tcomment('pre_rules')}")
         for r in pre_rules:
-            rule = r.rule_text
-            parts = rule.split(",")
-            if len(parts) >= 3:
-                parts[-1] = t(parts[-1])
-                lines.append(",".join(parts))
-            else:
-                lines.append(rule)
+            lines.append(_emit_custom_rule(
+                r.rule_text, f"前置自定义规则「{r.rule_text}」", t, record))
         lines.append("")
 
     # 规则集
@@ -433,6 +499,8 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
             lines.append(f"# >> {tc(current_category)}")
 
         translated_action = t(rs.action)
+        if record is not None:
+            record.append(RuleActionRef(f"规则源「{rs.name}」", rs.action))
         line = f"{rs.rule_type},{rs.url},{_quote(translated_action)}"
         if any(kw in rs.name or kw in rs.url for kw in ip_keywords):
             line += ",no-resolve"
@@ -443,20 +511,18 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
         lines.append("")
         lines.append(f"# >> {tcomment('general_rules')}")
         for r in general_rules:
-            rule = r.rule_text
-            parts = rule.split(",")
-            if len(parts) >= 3:
-                parts[-1] = t(parts[-1])
-                lines.append(",".join(parts))
-            else:
-                lines.append(rule)
+            lines.append(_emit_custom_rule(
+                r.rule_text, f"通用自定义规则「{r.rule_text}」", t, record))
 
     lines.append("")
     lines.append("RULE-SET,LAN,DIRECT,no-resolve")
 
     lines.append("")
     lines.append(f"# >> {tcomment('final_rule')}")
-    lines.append(f"FINAL,{_quote(t('兜底'))},dns-failed")
+    # final_action 直通：空值由校验器拒绝，此处绝不静默回退到默认策略；
+    # 其引用由 validate_generated_references 经 context.final_action 单独
+    # 校验，不在 rule_actions 重复登记（同一问题只报一次）
+    lines.append(f"FINAL,{_quote(t(final_action))},dns-failed")
 
     return lines
 

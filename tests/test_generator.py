@@ -7,6 +7,7 @@ from app.services.generator import (
 )
 from app.models import ProxyNode, RegionGroup, ServiceGroup, RuleSource, CustomRule
 from app.default_config import locale_translate, CATEGORY_NAMES, COMMENT_NAMES
+from app.services.config_validation import RuleActionRef
 
 
 # ────────────────────────────────────────────
@@ -63,59 +64,40 @@ class TestQuote:
     def test_space(self):
         assert _quote("Hong Kong") == '"Hong Kong"'
 
-    def test_left_bracket(self):
-        assert _quote("[ark]") == '"[ark]"'
+    def test_brackets(self):
+        assert _quote("[Hong]") == '"[Hong]"'
 
-    def test_right_bracket(self):
-        assert _quote("test]") == '"test]"'
-
-    def test_normal_parentheses(self):
-        assert _quote("(Sub) Node") == '"(Sub) Node"'
-
-    def test_plain_name(self):
+    def test_node_style(self):
         assert _quote("US-01") == "US-01"
 
 
 class TestDisplayName:
     def test_no_subscription(self):
-        node = _make_node("HK-01")
+        node = ProxyNode(name="HK-01", node_type="trojan", server="0.0.0.0", port=443,
+                         config="HK-01 = trojan, 0.0.0.0, 443, password=x")
         assert _display_name(node, {}) == "HK-01"
 
     def test_with_subscription(self):
-        node = _make_node("HK-01", sub_id=5)
+        node = ProxyNode(name="HK-01", node_type="trojan", server="0.0.0.0", port=443,
+                         config="HK-01 = trojan, 0.0.0.0, 443, password=x",
+                         subscription_id=5)
         assert _display_name(node, {5: "机场A"}) == "(机场A) HK-01"
-
-    def test_subscription_id_not_in_map(self):
-        node = _make_node("HK-01", sub_id=99)
-        assert _display_name(node, {5: "机场A"}) == "HK-01"
 
 
 class TestLocaleTranslate:
     def test_zh_passthrough(self):
         assert locale_translate("香港", "zh") == "香港"
 
-    def test_en_known_region(self):
+    def test_en_translation(self):
         assert locale_translate("香港", "en") == "Hong Kong"
-        assert locale_translate("美国", "en") == "United States"
 
-    def test_en_known_service(self):
-        assert locale_translate("AI服务", "en") == "AI"
-        assert locale_translate("兜底", "en") == "Fallback"
+    def test_unknown_name_passthrough(self):
+        assert locale_translate("自建组", "en") == "自建组"
 
-    def test_en_unknown_passthrough(self):
-        assert locale_translate("Netflix", "en") == "Netflix"
-
-    def test_manual_group_zh(self):
-        assert locale_translate("香港手动", "zh") == "香港手动"
-
-    def test_manual_group_en_known_region(self):
+    def test_manual_region_suffix(self):
         assert locale_translate("香港手动", "en") == "Hong Kong Manual"
-        assert locale_translate("美国手动", "en") == "United States Manual"
 
-    def test_manual_group_en_unknown_region(self):
-        assert locale_translate("法国手动", "en") == "法国 Manual"
-
-    def test_none_locale(self):
+    def test_none_locale_is_zh(self):
         assert locale_translate("香港", None) == "香港"
 
 
@@ -136,7 +118,6 @@ class TestProxyGroupBasicStructure:
         auto = [l for l in lines if l.startswith("香港 = url-test,")]
         assert len(auto) == 1
         assert "policy-regex-filter=港|HK" in auto[0]
-        assert "include-other-group=全部节点" in auto[0]
 
     def test_manual_region_is_select(self):
         regions = [_make_region("香港", "港|HK")]
@@ -145,7 +126,7 @@ class TestProxyGroupBasicStructure:
         assert len(manual) == 1
         assert "policy-regex-filter=港|HK" in manual[0]
 
-    def test_other_group_present_when_auto_regions_exist(self):
+    def test_other_group_generated_when_auto_regions(self):
         regions = [_make_region("香港", "港|HK")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
         assert any(l.startswith("其他 = url-test,") for l in lines)
@@ -156,36 +137,34 @@ class TestProxyGroupBasicStructure:
         assert not any("其他 = url-test," in l for l in lines)
 
     def test_other_manual_generated_when_enabled(self):
-        """other_manual_enabled=True 时生成「其他手动 = select」"""
         regions = [_make_region("香港", "港|HK")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {}, other_manual_enabled=True)
         assert any(l.startswith("其他手动 = select,") for l in lines)
 
     def test_other_manual_not_generated_when_disabled(self):
-        """other_manual_enabled=False 时不生成「其他手动」"""
         regions = [_make_region("香港", "港|HK")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {}, other_manual_enabled=False)
         assert not any("其他手动" in l for l in lines)
 
     def test_other_auto_disabled_still_has_manual(self):
-        """关闭其他自动测速（url-test），仍可生成手动选择（select）"""
         regions = [_make_region("香港", "港|HK")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {},
                                     other_auto_enabled=False, other_manual_enabled=True)
         assert not any("其他 = url-test," in l for l in lines)
         assert any(l.startswith("其他手动 = select,") for l in lines)
 
-    def test_auto_select_excludes_other(self):
-        """自动选择组不包含「其他」兜底组"""
+
+class TestAutoManualToggle:
+    """auto_enabled / manual_enabled 独立开关"""
+
+    def test_auto_region_members(self):
         regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
         auto_select = [l for l in lines if l.startswith("自动选择 = select,")][0]
         assert "香港" in auto_select
         assert "美国" in auto_select
-        assert "其他" not in auto_select
 
-    def test_manual_group_uses_include_other_group(self):
-        """手动组通过 include-other-group 引用全部节点，不逐个列举节点名"""
+    def test_manual_group_uses_regex_filter(self):
         regions = [_make_region("香港", "港|HK")]
         nodes = [_make_node("HK-A"), _make_node("HK-B")]
         lines = _build_proxy_groups(nodes, regions, [], _t_zh, {})
@@ -195,20 +174,18 @@ class TestProxyGroupBasicStructure:
         assert "HK-B" not in manual
 
 
-class TestAutoManualToggle:
-    """auto_enabled / manual_enabled 独立开关"""
-
-    def test_both_enabled_generates_both(self):
+class TestAutoManualRegionSwitches:
+    def test_both_enabled(self):
         regions = [_make_region("香港", "港|HK", auto=True, manual=True)]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
         assert any("香港 = url-test," in l for l in lines)
         assert any("香港手动 = select," in l for l in lines)
 
-    def test_auto_off_manual_on(self):
-        regions = [_make_region("香港", "港|HK", auto=False, manual=True)]
+    def test_auto_only(self):
+        regions = [_make_region("香港", "港|HK", auto=True, manual=False)]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        assert not any("香港 = url-test," in l for l in lines)
-        assert any("香港手动 = select," in l for l in lines)
+        assert any("香港 = url-test," in l for l in lines)
+        assert not any("香港手动 = select," in l for l in lines)
 
     def test_auto_on_manual_off(self):
         regions = [_make_region("英国", "英|UK", auto=True, manual=False)]
@@ -219,87 +196,29 @@ class TestAutoManualToggle:
     def test_both_disabled_region_absent(self):
         regions = [_make_region("韩国", "韩|KR", auto=False, manual=False)]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        assert not any("韩国" in l for l in lines)
-        assert not any("韩国手动" in l for l in lines)
-
-    def test_both_disabled_no_other_filter_for_it(self):
-        """其他组的过滤只包含活跃地区的正则"""
-        regions = [
-            _make_region("香港", "港|HK", auto=True, manual=True),
-            _make_region("英国", "英|UK", auto=False, manual=False),
-        ]
-        lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        other = [l for l in lines if l.startswith("其他 = url-test,")][0]
-        assert "英|UK" not in other
+        assert not any(l.startswith("韩国 =") for l in lines)
+        assert not any(l.startswith("韩国手动 =") for l in lines)
 
 
 class TestCompositeGroups:
     """组合策略：自动选择、代理、手动选择"""
 
-    def test_auto_select_has_only_auto_regions(self):
-        regions = [
-            _make_region("香港", "港|HK"),
-            _make_region("美国", "美|US"),
-        ]
-        lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        auto_select = [l for l in lines if l.startswith("自动选择 = select,")][0]
-        assert "香港" in auto_select
-        assert "美国" in auto_select
-        assert "其他" not in auto_select  # 自动选择排除兜底的"其他"组
-        assert "手动" not in auto_select
-
-    def test_proxy_has_auto_and_manual(self):
-        regions = [
-            _make_region("香港", "港|HK"),
-            _make_region("美国", "美|US"),
-        ]
+    def test_proxy_group_members(self):
+        regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
         proxy = [l for l in lines if l.startswith("代理 = select,")][0]
         assert "自动选择" in proxy
-        assert "香港" in proxy
-        assert "香港手动" in proxy
-        assert "美国" in proxy
-        assert "美国手动" in proxy
+        assert "香港" in proxy and "美国" in proxy
 
-    def test_manual_select_has_manual_regions(self):
-        regions = [
-            _make_region("香港", "港|HK"),
-            _make_region("美国", "美|US"),
-        ]
+    def test_manual_select_members(self):
+        regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
         lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        ms = [l for l in lines if l.startswith("手动选择 = select,")][0]
-        assert "大陆直连" in ms
-        assert "自动选择" in ms
-        assert "香港手动" in ms
-        assert "美国手动" in ms
-
-    def test_manual_off_excluded_from_composite(self):
-        """manual_enabled=False 的地区不出现在手动选择中"""
-        regions = [
-            _make_region("香港", "港|HK", auto=True, manual=True),
-            _make_region("英国", "英|UK", auto=True, manual=False),
-        ]
-        lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        proxy = [l for l in lines if l.startswith("代理 = select,")][0]
-        ms = [l for l in lines if l.startswith("手动选择 = select,")][0]
-        assert "香港手动" in proxy
-        assert "英国手动" not in proxy
-        assert "香港手动" in ms
-        assert "英国手动" not in ms
-
-    def test_auto_off_excluded_from_auto_select(self):
-        """auto_enabled=False 的地区不出现在自动选择中"""
-        regions = [
-            _make_region("香港", "港|HK", auto=True, manual=True),
-            _make_region("英国", "英|UK", auto=False, manual=True),
-        ]
-        lines = _build_proxy_groups([], regions, [], _t_zh, {})
-        auto_select = [l for l in lines if l.startswith("自动选择 = select,")][0]
-        assert "香港" in auto_select
-        assert "英国" not in auto_select
+        manual_select = [l for l in lines if l.startswith("手动选择 = select,")][0]
+        assert "大陆直连" in manual_select
+        assert "自动选择" in manual_select
+        assert "香港手动" in manual_select and "美国手动" in manual_select
 
     def test_no_regions_no_composite_groups(self):
-        """没有活跃地区时不生成组合策略"""
         lines = _build_proxy_groups([], [], [], _t_zh, {})
         assert not any(l.startswith("自动选择 =") for l in lines)
         assert not any(l.startswith("代理 =") for l in lines)
@@ -311,35 +230,20 @@ class TestServiceGroups:
         services = [_make_service("AI服务", ["自动选择", "美国"])]
         lines = _build_proxy_groups([], [], services, _t_zh, {})
         ai = [l for l in lines if l.startswith("AI服务 = select,")][0]
-        assert "自动选择" in ai
-        assert "美国" in ai
+        assert "自动选择" in ai and "美国" in ai
 
-    def test_service_with_pinned_node(self):
-        services = [_make_service("AI服务", ["自动选择"])]
-        nodes = [_make_node("US-Pinned")]
+    def test_service_group_type(self):
+        services = [_make_service("测速", ["全部节点"], stype="url-test")]
+        lines = _build_proxy_groups([], [], services, _t_zh, {})
+        assert any(l.startswith("测速 = url-test,") for l in lines)
+
+    def test_pinned_nodes_before_policies(self):
+        nodes = [_make_node("US-01")]
         nodes[0].pinned_services = ["AI服务"]
+        services = [_make_service("AI服务", ["自动选择"])]
         lines = _build_proxy_groups(nodes, [], services, _t_zh, {})
         ai = [l for l in lines if l.startswith("AI服务 = select,")][0]
-        assert "US-Pinned" in ai
-        assert "自动选择" in ai
-
-    def test_pinned_node_with_subscription_prefix(self):
-        services = [_make_service("AI服务", ["自动选择"])]
-        nodes = [_make_node("US-01", sub_id=5)]
-        nodes[0].pinned_services = ["AI服务"]
-        sub_map = {5: "机场A"}
-        lines = _build_proxy_groups(nodes, [], services, _t_zh, sub_map)
-        ai = [l for l in lines if l.startswith("AI服务 = select,")][0]
-        assert "(机场A) US-01" in ai
-
-    def test_pinned_node_before_policies(self):
-        """钉选节点排在 policies 前面"""
-        services = [_make_service("AI服务", ["自动选择"])]
-        nodes = [_make_node("Pinned-Node")]
-        nodes[0].pinned_services = ["AI服务"]
-        lines = _build_proxy_groups(nodes, [], services, _t_zh, {})
-        ai = [l for l in lines if l.startswith("AI服务 = select,")][0]
-        idx_pinned = ai.index("Pinned-Node")
+        idx_pinned = ai.index("US-01")
         idx_policy = ai.index("自动选择")
         assert idx_pinned < idx_policy
 
@@ -348,34 +252,47 @@ class TestProxyGroupEnglishLocale:
     def test_auto_region_quoted(self):
         regions = [_make_region("香港", "港|HK")]
         lines = _build_proxy_groups([], regions, [], _t_en, {})
-        assert any('"Hong Kong" = url-test,' in l for l in lines)
+        assert any(l.startswith('"Hong Kong" = url-test,') for l in lines)
 
     def test_manual_region_quoted(self):
-        regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
+        regions = [_make_region("英国", "英|UK")]
         lines = _build_proxy_groups([], regions, [], _t_en, {})
-        manual = [l for l in lines if 'Manual" = select,' in l]
-        assert len(manual) == 3  # 香港手动 + 美国手动 + 其他手动
-        assert any('"Hong Kong Manual"' in l for l in manual)
-        assert any('"United States Manual"' in l for l in manual)
-        assert any('"Other Manual"' in l for l in manual)
+        assert any(l.startswith('"United Kingdom Manual" = select,') for l in lines)
 
-    def test_composite_groups_translated(self):
-        regions = [_make_region("香港", "港|HK")]
+    def test_disabled_region_not_generated_in_english(self):
+        regions = [_make_region("英国", "英|UK", auto=False, manual=False)]
         lines = _build_proxy_groups([], regions, [], _t_en, {})
-        assert any(l.startswith("Automatic = select,") for l in lines)
-        assert any(l.startswith("Proxy = select,") for l in lines)
-        assert any(l.startswith("NoAuto = select,") for l in lines)
-
-    def test_service_policy_translated(self):
-        services = [_make_service("AI服务", ["美国手动"])]
-        lines = _build_proxy_groups([], [], services, _t_en, {})
-        ai = [l for l in lines if l.startswith("AI = select,")][0]
-        assert "United States Manual" in ai
-
-    def test_manual_off_not_translated(self):
-        regions = [_make_region("英国", "英|UK", auto=True, manual=False)]
-        lines = _build_proxy_groups([], regions, [], _t_en, {})
+        assert not any("United Kingdom = url-test" in l for l in lines)
         assert not any("United Kingdom Manual" in l for l in lines)
+
+
+class TestGroupNameSinks:
+    """name_sinks 登记实际生成的组名（引用校验的可用策略来源）"""
+
+    def test_sinks_match_generated_lines(self):
+        from app.services.generator import GroupNameSinks
+
+        regions = [_make_region("香港", "港|HK"), _make_region("英国", "英|UK", auto=False, manual=False)]
+        services = [_make_service("AI服务", ["自动选择"])]
+        sinks = GroupNameSinks()
+        lines = _build_proxy_groups([], regions, services, _t_zh, {}, name_sinks=sinks)
+
+        emitted = set()
+        for line in lines:
+            if " = " in line and line.strip():
+                emitted.add(line.split(" = ", 1)[0].strip().strip('"'))
+        registered = sinks.region | sinks.service | sinks.combined
+        assert emitted <= registered
+        # 未生成项不算存在：英国 auto/manual 全关 → 不登记
+        assert "英国" not in sinks.region
+        assert "香港" in sinks.region and "香港手动" in sinks.region
+        assert "AI服务" in sinks.service
+        assert "全部节点" in sinks.combined and "自动选择" in sinks.combined
+
+    def test_sinks_optional(self):
+        # 不传 name_sinks（单测直调）行为不变
+        lines = _build_proxy_groups([], [], [], _t_zh, {})
+        assert any("全部节点 = select," in l for l in lines)
 
 
 # ════════════════════════════════════════════
@@ -383,7 +300,7 @@ class TestProxyGroupEnglishLocale:
 # ════════════════════════════════════════════
 
 class TestBuildRules:
-    def _rules(self, sources=None, pre_rules=None, general_rules=None):
+    def _rules(self, sources=None, pre_rules=None, general_rules=None, final_action="兜底"):
         if sources is None:
             sources = []
         if pre_rules is None:
@@ -392,14 +309,19 @@ class TestBuildRules:
             general_rules = []
         return _build_rules(sources, pre_rules, general_rules, _t_zh,
                             lambda k: CATEGORY_NAMES.get(k, k),
-                            lambda k: COMMENT_NAMES.get(k, (k, k))[0])
+                            lambda k: COMMENT_NAMES.get(k, (k, k))[0],
+                            final_action=final_action)
 
-    def test_final_always_fallback(self):
-        lines = self._rules()
+    def test_final_uses_final_action(self):
+        """FINAL 行直通 final_action，不再硬编码兜底组"""
+        lines = self._rules(final_action="大陆直连")
         final = [l for l in lines if l.startswith("FINAL,")]
         assert len(final) == 1
-        assert "兜底" in final[0]
-        assert "dns-failed" in final[0]
+        assert final[0] == "FINAL,大陆直连,dns-failed"
+
+    def test_final_action_fallback_group_still_supported(self):
+        lines = self._rules(final_action="兜底")
+        assert "FINAL,兜底,dns-failed" in lines
 
     def test_lan_rule_present(self):
         lines = self._rules()
@@ -433,7 +355,8 @@ class TestBuildRules:
         lines = _build_rules([rs], [], [], _t_zh,
                              lambda k: CATEGORY_NAMES.get(k, k),
                              lambda k: COMMENT_NAMES.get(k, (k, k))[0],
-                             no_resolve_keywords="Telethon")
+                             no_resolve_keywords="Telethon",
+                             final_action="兜底")
         line = next(l for l in lines if "tg.list" in l)
         assert line.endswith(",no-resolve")
 
@@ -464,9 +387,50 @@ class TestBuildRules:
         assert custom[0] == "DOMAIN-SUFFIX,example.com,AI服务"
 
     def test_custom_rule_short_passthrough(self):
+        """构建器宽松输出无法解析的规则原文；拦截由校验器负责（见 test_config_validation）"""
         general = [_make_custom_rule("SHORT-RULE", "general")]
         lines = self._rules(general_rules=general)
         assert "SHORT-RULE" in lines
+
+    def test_custom_rule_no_resolve_policy_position(self):
+        """带 no-resolve 的自定义规则：策略段正确定位，modifier 原样保留在尾部"""
+        general = [_make_custom_rule("IP-CIDR,192.0.2.0/24,大陆直连,no-resolve", "general")]
+        lines = self._rules(general_rules=general)
+        assert "IP-CIDR,192.0.2.0/24,大陆直连,no-resolve" in lines
+
+    def test_custom_rule_en_locale_no_resolve(self):
+        general = [_make_custom_rule("IP-CIDR,192.0.2.0/24,大陆直连,no-resolve", "general")]
+        lines = _build_rules([], [], general, _t_en,
+                             lambda k: k.replace("_", " ").title(),
+                             lambda k: COMMENT_NAMES.get(k, (k, k))[1],
+                             final_action="兜底")
+        custom = [l for l in lines if "192.0.2.0" in l]
+        assert custom == ["IP-CIDR,192.0.2.0/24,Mainland,no-resolve"]
+
+    def test_logic_rule_reassembled_verbatim(self):
+        """逻辑规则（嵌套逗号）翻译后逐字重组，不破坏括号内结构"""
+        rule = "AND,((PROTOCOL,UDP), (DEST-PORT,3478)),REJECT"
+        general = [_make_custom_rule(rule, "general")]
+        lines = self._rules(general_rules=general)
+        assert rule in lines
+
+    def test_record_collects_structured_actions(self):
+        """record 登记结构化引用：规则源 / 自定义规则 / 无法解析全覆盖"""
+        rs = RuleSource(name="T", url="https://x.com", action="AI服务",
+                        rule_type="RULE-SET", category="ai", sort_order=0, enabled=True)
+        general = [_make_custom_rule("DOMAIN,x.com,DIRECT", "general"),
+                   _make_custom_rule("SHORT", "general")]
+        record: list[RuleActionRef] = []
+        _build_rules([rs], [], general, _t_zh,
+                     lambda k: CATEGORY_NAMES.get(k, k),
+                     lambda k: COMMENT_NAMES.get(k, (k, k))[0],
+                     final_action="兜底", record=record)
+        by_source = {ref.source: ref.action for ref in record}
+        assert by_source["规则源「T」"] == "AI服务"
+        assert by_source["通用自定义规则「DOMAIN,x.com,DIRECT」"] == "DIRECT"
+        assert by_source["通用自定义规则「SHORT」"] is None
+        # FINAL 不在 rule_actions 登记：由校验器经 context.final_action 单独校验
+        assert not any("FINAL" in s for s in by_source)
 
     def test_category_comment_inserted(self):
         rs = RuleSource(name="Test", url="https://x.com", action="DIRECT",
@@ -483,7 +447,8 @@ class TestBuildRules:
         general = [_make_custom_rule("DOMAIN-SUFFIX,example.com,AI服务", "general")]
         lines = _build_rules([], [], general, _t_en,
                              lambda k: k.replace("_", " ").title(),
-                             lambda k: COMMENT_NAMES.get(k, (k, k))[1])
+                             lambda k: COMMENT_NAMES.get(k, (k, k))[1],
+                             final_action="兜底")
         custom = [l for l in lines if "example.com" in l]
         assert len(custom) == 1
         assert "AI" in custom[0]

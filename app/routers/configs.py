@@ -25,6 +25,7 @@ from app.runtime_paths import (harden_private_file, refresh_runtime_permissions,
                                resolve_runtime_paths)
 from app.security import issue_profile_token, verify_profile_token
 from app.services.backups import unique_path
+from app.services.config_validation import InvalidConfiguration
 from app.services.generator import generate_surge_config
 from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
 
@@ -357,14 +358,22 @@ def _content_disposition(filename: str) -> str:
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe)}'
 
 
+def _invalid_configuration_detail(exc: InvalidConfiguration) -> dict:
+    """422 响应体：完整错误列表一次性返回，便于前端逐条呈现"""
+    return {"code": "invalid_configuration", "errors": exc.errors}
+
+
 async def _render_profile_config(db: AsyncSession, profile_id: Optional[int], locale: Optional[str]) -> str:
-    """生成入口统一错误语义：显式 id 不存在 404；省略且无默认档案 422"""
+    """生成入口统一错误语义：显式 id 不存在 404；省略且无默认档案 422；
+    引用无效聚合 422（不返回部分配置）"""
     try:
         return await generate_surge_config(db, profile_id, locale)
     except ProfileNotFound as exc:
         raise HTTPException(404, "配置方案不存在") from exc
     except DefaultProfileMissing as exc:
         raise HTTPException(422, "未指定 profile_id 且不存在默认配置方案") from exc
+    except InvalidConfiguration as exc:
+        raise HTTPException(422, _invalid_configuration_detail(exc)) from exc
 
 @router.get("/generate")
 async def generate_config(
@@ -442,6 +451,10 @@ async def subscribe_config(
         # token 验证通过后、生成阶段档案恰好被删（确定性竞态）：
         # 与一切 token 失败同口径 404，不泄露档案存在性差异
         raise HTTPException(404, "Not Found")
+    except InvalidConfiguration as exc:
+        # token 已验证：配置本身无效可如实 422（完整错误列表），
+        # 该分支位于 token 校验之后，无效 token 永远到不了这里
+        raise HTTPException(422, _invalid_configuration_detail(exc)) from exc
     # Surge 订阅需要设置合适的 Content-Type 和更新间隔提示
     return PlainTextResponse(
         content,
