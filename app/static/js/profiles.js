@@ -139,18 +139,22 @@ function renderOverviewTab(profileId) {
     </div>
     <div class="form-group">
       <label>${I18N["profile.mitm_passphrase"]}</label>
-      <input type="password" id="mitm-passphrase-${profileId}" placeholder="${I18N["profile.mitm_passphrase_placeholder"]}" style="max-width:300px;">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <input type="password" id="mitm-passphrase-${profileId}" placeholder="${I18N["profile.mitm_passphrase_placeholder"]}" style="max-width:300px;">
+        <button class="btn btn-sm btn-outline" onclick="clearMitmSecret(${profileId}, 'ca-passphrase')">${I18N["profile.mitm_clear"]}</button>
+      </div>
     </div>
     <div class="form-group">
       <label>${I18N["profile.mitm_cap12"]}</label>
       <div style="font-size:12px;color:var(--text2);margin-bottom:4px;">${I18N["profile.mitm_cap12_manual"]}</div>
       <input type="text" id="mitm-cap12-${profileId}" placeholder="${I18N["profile.mitm_cap12_placeholder"]}" style="width:100%;max-width:500px;margin-bottom:8px;">
-      <div style="display:flex;align-items:center;gap:8px;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <span style="font-size:12px;color:var(--text2);">${I18N["profile.mitm_cap12_upload"]}</span>
         <label class="btn btn-sm btn-outline" style="cursor:pointer;margin:0;">
           ${I18N["btn.upload"]}
           <input type="file" accept=".p12" style="display:none;" onchange="uploadMitmCert(${profileId}, this)">
         </label>
+        <button class="btn btn-sm btn-outline" onclick="clearMitmSecret(${profileId}, 'ca-p12')">${I18N["profile.mitm_clear"]}</button>
       </div>
     </div>
     <div class="form-group">
@@ -472,13 +476,13 @@ function renderGenerateTab(profileId) {
       <h3 class="gen-card-title">${I18N["generator.subscribe"]}</h3>
       <div class="form-group">
         <label>${I18N["generator.server_ip"]}</label>
-        <select id="ip-select-${profileId}" class="gen-ip-select" onchange="updateSubscribeUrl(${profileId})">${ipOptions}</select>
+        <select id="ip-select-${profileId}" class="gen-ip-select">${ipOptions}</select>
       </div>
-      <div class="form-group" style="margin-bottom:0;">
-        <label>${I18N["generator.subscribe_url"]}</label>
-        <div class="gen-row">
-          <input type="text" id="subscribe-url-${profileId}" readonly class="gen-sub-url">
-          <button class="btn btn-outline" onclick="copySubscribeUrl(${profileId})">${I18N["generator.copy"]}</button>
+      <div class="form-group">
+        <label>${I18N["profile.token_title"]}</label>
+        <div class="gen-row" style="flex-wrap:wrap;">
+          <span id="token-status-${profileId}" class="badge"></span>
+          <button class="btn btn-outline" id="token-btn-${profileId}" onclick="generateProfileToken(${profileId}, this)"></button>
         </div>
       </div>
       <p class="gen-hint">${I18N["generator.subscribe_hint"]}</p>
@@ -491,20 +495,77 @@ function renderGenerateTab(profileId) {
     </div>`;
   const ipSel = document.getElementById(`ip-select-${profileId}`);
   if (serverIps.length > 0) ipSel.value = serverIps[0];
-  updateSubscribeUrl(profileId);
+  renderTokenStatus(profileId);
 }
 
-function buildBaseUrl(ip) {
-  const port = SERVER_PORT === "80" || SERVER_PORT === "443" ? "" : `:${SERVER_PORT}`;
-  return `${location.protocol}//${ip}${port}`;
+// ===== 订阅 Token：明文仅存在于一次性对话框，关闭即清空 =====
+
+function renderTokenStatus(profileId) {
+  const profile = allProfiles.find(p => p.id === profileId);
+  const configured = !!profile?.token_configured;
+  const badge = document.getElementById(`token-status-${profileId}`);
+  if (badge) {
+    badge.className = `badge ${configured ? "badge-success" : "badge-warning"}`;
+    badge.textContent = configured ? I18N["profile.token_configured"] : I18N["profile.token_not_configured"];
+  }
+  const btn = document.getElementById(`token-btn-${profileId}`);
+  if (btn) btn.textContent = configured ? I18N["profile.token_rotate"] : I18N["profile.token_generate"];
 }
 
-function updateSubscribeUrl(profileId) {
-  const ip = document.getElementById(`ip-select-${profileId}`)?.value || "127.0.0.1";
-  const base = buildBaseUrl(ip);
-  const url = `${base}/api/configs/subscribe?profile_id=${profileId}`;
-  const input = document.getElementById(`subscribe-url-${profileId}`);
-  if (input) input.value = url;
+async function generateProfileToken(profileId, btn) {
+  const profile = allProfiles.find(p => p.id === profileId);
+  if (profile?.token_configured &&
+      !(await confirmDialog(I18N["profile.token_rotate_confirm"], { danger: true }))) return;
+  await withLoading(btn, async () => {
+    try {
+      const resp = await API.post(`/api/configs/profiles/${profileId}/token`);
+      if (profile) profile.token_configured = true;
+      renderTokenStatus(profileId);
+      showTokenDialog(profileId, resp.token);
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+function showTokenDialog(profileId, token) {
+  const dlg = document.getElementById("token-modal");
+  const input = document.getElementById("token-url-input");
+  input.value = buildSubscribeUrl(profileId, token);
+  // 对话框以任何方式（按钮/ESC/遮罩）离开 show 状态都立即丢弃明文
+  const observer = new MutationObserver(() => {
+    if (!dlg.classList.contains("show")) {
+      input.value = "";
+      observer.disconnect();
+    }
+  });
+  observer.observe(dlg, { attributes: true, attributeFilter: ["class"] });
+  showModal("token-modal");
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, 99999);
+}
+
+function closeTokenDialog() {
+  hideModal("token-modal"); // MutationObserver 负责清空明文
+}
+
+function copyTokenUrl() {
+  const input = document.getElementById("token-url-input");
+  if (!input.value) { toast(I18N["profile.token_copy_first"], "error"); return; }
+  // 先尝试同步 execCommand（HTTP 局域网环境可用，需在用户手势内执行）
+  try {
+    if (document.execCommand("copy")) {
+      toast(I18N["generator.copied"]);
+      return;
+    }
+  } catch (e) {}
+  // 再尝试异步 Clipboard API（HTTPS 环境）；两者都失败时诚实报错并保持选中态供手动 Cmd+C
+  navigator.clipboard.writeText(input.value).then(() => {
+    toast(I18N["generator.copied"]);
+  }).catch(() => {
+    input.select();
+    input.setSelectionRange(0, 99999);
+    toast(I18N["generator.copy_failed"], "error");
+  });
 }
 
 async function previewConfig(profileId) {
@@ -529,26 +590,6 @@ function downloadConfig(profileId) {
   window.open(`/api/configs/generate?filename=${encodeURIComponent(filename)}&profile_id=${profileId}`, "_blank");
 }
 
-function copySubscribeUrl(profileId) {
-  const input = document.getElementById(`subscribe-url-${profileId}`);
-  input.select();
-  input.setSelectionRange(0, 99999);
-  // 先尝试同步 execCommand（HTTP 局域网环境可用，需在用户手势内执行）
-  try {
-    if (document.execCommand("copy")) {
-      toast(I18N["generator.copied"]);
-      return;
-    }
-  } catch (e) {}
-  // 再尝试异步 Clipboard API（HTTPS 环境）；两者都失败时诚实报错并保持选中态供手动 Cmd+C
-  navigator.clipboard.writeText(input.value).then(() => {
-    toast(I18N["generator.copied"]);
-  }).catch(() => {
-    input.select();
-    input.setSelectionRange(0, 99999);
-    toast(I18N["generator.copy_failed"], "error");
-  });
-}
 
 function toggleFullscreen() {
   const overlay = document.getElementById("fullscreen-overlay");
@@ -718,15 +759,23 @@ async function toggleHost(mappingId, enabled, profileId) {
 // ===== MITM 配置管理 =====
 
 async function loadMitm(profileId) {
+  // 秘密字段详情端点只返回 configured 状态：已配置时输入框留空、占位提示保留语义
   try {
-    if (allProfiles.length === 0) allProfiles = await API.get("/api/configs/profiles");
-    const profile = allProfiles.find(x => x.id === profileId) || {};
-    const mitm = profile.mitm || {};
+    const detail = await API.get(`/api/configs/profiles/${profileId}`);
+    const mitm = detail.mitm || {};
     document.getElementById(`mitm-skip-${profileId}`).checked = mitm['skip-server-cert-verify'] !== false;
     document.getElementById(`mitm-tcp-${profileId}`).checked = mitm['tcp-connection'] !== false;
     document.getElementById(`mitm-h2-${profileId}`).checked = mitm['h2'] !== false;
-    document.getElementById(`mitm-passphrase-${profileId}`).value = mitm['ca-passphrase'] || '';
-    document.getElementById(`mitm-cap12-${profileId}`).value = mitm['ca-p12'] || '';
+    const passEl = document.getElementById(`mitm-passphrase-${profileId}`);
+    passEl.value = "";
+    passEl.placeholder = mitm['ca-passphrase']?.configured
+      ? I18N["profile.mitm_secret_configured"]
+      : I18N["profile.mitm_passphrase_placeholder"];
+    const p12El = document.getElementById(`mitm-cap12-${profileId}`);
+    p12El.value = "";
+    p12El.placeholder = mitm['ca-p12']?.configured
+      ? I18N["profile.mitm_secret_configured"]
+      : I18N["profile.mitm_cap12_placeholder"];
     document.getElementById(`mitm-hostname-${profileId}`).value = mitm['hostname'] || '';
   } catch (e) { toast(e.message, "error"); }
 }
@@ -736,6 +785,7 @@ async function saveMitm(profileId) {
   mitm['skip-server-cert-verify'] = document.getElementById(`mitm-skip-${profileId}`).checked;
   mitm['tcp-connection'] = document.getElementById(`mitm-tcp-${profileId}`).checked;
   mitm['h2'] = document.getElementById(`mitm-h2-${profileId}`).checked;
+  // 秘密字段留空 = 不发送该键（后端覆盖式语义：空输入保留现值）
   const passphrase = document.getElementById(`mitm-passphrase-${profileId}`).value.trim();
   if (passphrase) mitm['ca-passphrase'] = passphrase;
   const cap12 = document.getElementById(`mitm-cap12-${profileId}`).value.trim();
@@ -745,14 +795,26 @@ async function saveMitm(profileId) {
   try {
     await API.put(`/api/configs/profiles/${profileId}`, { mitm });
     toast(I18N["profile.mitm_save"]);
+    loadMitm(profileId);
   } catch (e) { toast(e.message, "error"); }
 }
 
 async function resetMitm(profileId) {
   if (!(await confirmDialog(`${I18N["profile.mitm_reset"]}?`, { danger: true }))) return;
   try {
-    await API.put(`/api/configs/profiles/${profileId}`, { mitm: {} });
+    // 显式整体重置（独立动作）：清空全部 MITM 覆盖，回到生成器默认值
+    await API.put(`/api/configs/profiles/${profileId}`, { mitm_reset: true });
     toast(I18N["profile.mitm_reset"]);
+    loadMitm(profileId);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function clearMitmSecret(profileId, key) {
+  if (!(await confirmDialog(I18N["profile.mitm_clear_confirm"].replace("{0}", key), { danger: true }))) return;
+  try {
+    // 显式清除指定秘密键（独立字段），与保存互不影响
+    await API.put(`/api/configs/profiles/${profileId}`, { mitm_clear: [key] });
+    toast(I18N["profile.mitm_cleared"].replace("{0}", key));
     loadMitm(profileId);
   } catch (e) { toast(e.message, "error"); }
 }

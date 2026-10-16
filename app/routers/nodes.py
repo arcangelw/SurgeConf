@@ -40,7 +40,8 @@ async def _get_sub_map(db: AsyncSession) -> dict:
     }
 
 
-def _node_to_dict(n: ProxyNode, sub_map: dict) -> dict:
+def _node_list_dict(n: ProxyNode, sub_map: dict) -> dict:
+    """列表最小披露：不含 server/port/config（节点详情在管理边界内）"""
     sub_info = sub_map.get(n.subscription_id, {})
     return {
         "id": n.id,
@@ -50,14 +51,18 @@ def _node_to_dict(n: ProxyNode, sub_map: dict) -> dict:
         "subscription_tag": sub_info.get("tag"),
         "subscription_color": sub_info.get("color"),
         "node_type": n.node_type,
-        "server": n.server,
-        "port": n.port,
-        "config": n.config,
         "region_auto": n.region_auto,
         "region_manual": n.region_manual,
         "pinned_services": n.pinned_services or [],
         "enabled": n.enabled,
     }
+
+
+def _node_detail_dict(n: ProxyNode, sub_map: dict) -> dict:
+    """已认证详情：全量字段（含 server/port/config）"""
+    detail = _node_list_dict(n, sub_map)
+    detail.update({"server": n.server, "port": n.port, "config": n.config})
+    return detail
 
 
 # ===== 固定路径路由（必须在 /{node_id} 前注册） =====
@@ -87,7 +92,7 @@ async def list_nodes(
     query = query.order_by(ProxyNode.name)
     result = await db.execute(query)
     nodes = result.scalars().all()
-    return [_node_to_dict(n, sub_map) for n in nodes]
+    return [_node_list_dict(n, sub_map) for n in nodes]
 
 
 @router.get("/by-region")
@@ -109,7 +114,7 @@ async def nodes_by_region(db: AsyncSession = Depends(get_db)):
     unassigned = []
     for node in nodes:
         region = node.region_manual or node.region_auto
-        nd = _node_to_dict(node, sub_map)
+        nd = _node_list_dict(node, sub_map)
         if region and region in groups:
             groups[region].append(nd)
         else:
@@ -177,7 +182,7 @@ async def get_node_detail(node_id: int, db: AsyncSession = Depends(get_db)):
     node = result.scalar_one_or_none()
     if not node:
         raise HTTPException(404, "节点不存在")
-    return _node_to_dict(node, sub_map)
+    return _node_detail_dict(node, sub_map)
 
 
 @router.put("/{node_id}")

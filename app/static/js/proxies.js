@@ -284,6 +284,12 @@ async function renderSubDetail(subId) {
     main.innerHTML = `<div class="card"><div class="empty"><p>${I18N["sub.empty"]}</p></div></div>`;
     return;
   }
+  // 列表响应不携带 URL：选中订阅时按需请求已认证详情端点
+  let subUrl = "";
+  try {
+    const detail = await API.get(`/api/subscriptions/${subId}`);
+    subUrl = detail.url || "";
+  } catch (e) { toast(e.message, "error"); }
   main.innerHTML = `
     <div class="card" style="margin-bottom:16px;">
       <div class="card-header">
@@ -293,7 +299,7 @@ async function renderSubDetail(subId) {
             ${escapeHtml(translateName(sub.name))}
             <span class="badge ${sub.enabled ? 'badge-success' : 'badge-danger'}">${sub.enabled ? I18N["btn.enable"] : I18N["btn.disable"]}</span>
           </h3>
-          <p style="font-size:12px;color:var(--text2);margin-top:4px;word-break:break-all;">${escapeHtml(sub.url)}</p>
+          <p style="font-size:12px;color:var(--text2);margin-top:4px;word-break:break-all;">${escapeHtml(subUrl)}</p>
           <p style="font-size:12px;color:var(--text2);margin-top:2px;">
             ${sub.tag ? `<span class="badge" style="background:${sub.color}22;color:${sub.color};border:1px solid ${sub.color}44;">${escapeHtml(sub.tag)}</span> ` : ""}
             ${I18N["sub.last_update"]}: ${escapeHtml(sub.last_update || I18N["sub.not_synced"])}
@@ -821,13 +827,19 @@ function showAddModal() {
   showModal("sub-modal");
 }
 
-function editSub(s) {
+async function editSub(s) {
+  // 列表响应不携带 URL：编辑前按需请求已认证详情端点
+  let subUrl = "";
+  try {
+    const detail = await API.get(`/api/subscriptions/${s.id}`);
+    subUrl = detail.url || "";
+  } catch (e) { toast(e.message, "error"); return; }
   document.getElementById("modal-title").textContent = I18N["btn.edit"];
   document.getElementById("edit-id").value = s.id;
   document.getElementById("sub-name").value = s.name;
   document.getElementById("sub-tag").value = s.tag || "";
   document.getElementById("sub-color").value = s.color || "#6c5ce7";
-  document.getElementById("sub-url").value = s.url;
+  document.getElementById("sub-url").value = subUrl;
   document.getElementById("sub-enabled").checked = s.enabled;
   showModal("sub-modal");
 }

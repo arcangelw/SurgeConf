@@ -79,6 +79,7 @@ class ConfigProfile(Base):
     url_rewrites = Column(JSON, default=list, comment="URL重写规则")
     header_rewrites = Column(JSON, default=list, comment="Header重写规则")
     mitm = Column(JSON, default=dict, comment="MITM配置")
+    subscription_token_hash = Column(String(64), nullable=True, comment="只读订阅Token的SHA-256哈希；NULL=未配置")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

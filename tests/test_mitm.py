@@ -1,9 +1,14 @@
-"""MITM 配置管理单元测试"""
+"""MITM 配置管理单元测试 + MITM API 覆盖式契约（Task 5）"""
+
+import json
 
 import pytest
 from app.models import ConfigProfile
 from app.default_config import DEFAULT_MITM
 from app.services.generator import generate_surge_config
+
+# admin_client / secure_app fixtures（回环隐式会话 + CSRF）来自 Task 5 测试模块
+from tests.test_profile_tokens import admin_client, secure_app  # noqa: F401
 
 
 # ════════════════════════════════════════════
@@ -229,3 +234,80 @@ class TestGeneratorMitm:
                     break
                 result.append(line.strip())
         return result
+
+
+# ════════════════════════════════════════════
+# 三、MITM API 契约：configured 状态 + 覆盖式写入（Task 5）
+# ════════════════════════════════════════════
+
+
+class TestMitmApiContract:
+    """PUT /profiles/{id} 的 MITM 覆盖式语义与详情 configured 投影"""
+
+    BASE = "/api/configs/profiles/1"
+
+    @pytest.mark.asyncio
+    async def test_detail_never_echoes_secrets(self, admin_client):
+        """写入秘密后详情仅返回 configured；响应文本不含明文"""
+        resp = await admin_client.put(self.BASE, json={
+            "mitm": {"ca-passphrase": "top-secret-pass", "ca-p12": "MIICfake==", "hostname": "x.com"},
+        })
+        assert resp.status_code == 200
+        detail = (await admin_client.get(self.BASE)).json()
+        assert detail["mitm"]["ca-passphrase"] == {"configured": True}
+        assert detail["mitm"]["ca-p12"] == {"configured": True}
+        assert detail["mitm"]["hostname"] == "x.com"
+        dumped = json.dumps(detail)
+        assert "top-secret-pass" not in dumped and "MIICfake==" not in dumped
+
+    @pytest.mark.asyncio
+    async def test_empty_secret_input_keeps_current_value(self, admin_client):
+        """空字符串 / null / configured 回显对象三种空输入都保留现值"""
+        await admin_client.put(self.BASE, json={
+            "mitm": {"ca-passphrase": "keep-me", "hostname": "keep.example"}})
+        for empty in ("", None, {"configured": True}):
+            resp = await admin_client.put(self.BASE, json={"mitm": {"ca-passphrase": empty}})
+            assert resp.status_code == 200
+        detail = (await admin_client.get(self.BASE)).json()
+        assert detail["mitm"]["ca-passphrase"] == {"configured": True}
+        assert detail["mitm"]["hostname"] == "keep.example"
+
+    @pytest.mark.asyncio
+    async def test_non_secret_keys_overwrite_normally(self, admin_client):
+        """非敏感键按传入值覆盖（含清除为空）"""
+        await admin_client.put(self.BASE, json={"mitm": {"hostname": "a.com"}})
+        await admin_client.put(self.BASE, json={"mitm": {"hostname": "", "h2": False}})
+        detail = (await admin_client.get(self.BASE)).json()
+        assert detail["mitm"]["hostname"] == ""
+        assert detail["mitm"]["h2"] is False
+
+    @pytest.mark.asyncio
+    async def test_mitm_clear_is_explicit_and_scoped(self, admin_client):
+        """mitm_clear 只清除指定键，其余保持"""
+        await admin_client.put(self.BASE, json={
+            "mitm": {"ca-passphrase": "p", "ca-p12": "c", "hostname": "h.com"}})
+        resp = await admin_client.put(self.BASE, json={"mitm_clear": ["ca-passphrase"]})
+        assert resp.status_code == 200
+        detail = (await admin_client.get(self.BASE)).json()
+        assert detail["mitm"]["ca-passphrase"] == {"configured": False}
+        assert detail["mitm"]["ca-p12"] == {"configured": True}
+        assert detail["mitm"]["hostname"] == "h.com"
+
+    @pytest.mark.asyncio
+    async def test_mitm_reset_clears_everything(self, admin_client):
+        """mitm_reset 独立动作：整体回到未覆盖状态（configured 全 False）"""
+        await admin_client.put(self.BASE, json={
+            "mitm": {"ca-passphrase": "p", "hostname": "h.com", "h2": True}})
+        resp = await admin_client.put(self.BASE, json={"mitm_reset": True})
+        assert resp.status_code == 200
+        detail = (await admin_client.get(self.BASE)).json()
+        assert detail["mitm"] == {"ca-passphrase": {"configured": False},
+                                  "ca-p12": {"configured": False}}
+
+    @pytest.mark.asyncio
+    async def test_cleared_mitm_still_generates_default_section(self, admin_client):
+        """秘密清除/重置后生成器仍回退 DEFAULT_MITM，不受 configured 投影影响"""
+        await admin_client.put(self.BASE, json={"mitm_reset": True})
+        resp = await admin_client.get("/api/configs/preview?profile_id=1")
+        assert resp.status_code == 200
+        assert "[MITM]" in resp.json()["content"]

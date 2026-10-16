@@ -15,7 +15,9 @@ import hashlib
 import hmac
 import ipaddress
 import os
+import re
 import secrets
+import string
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +28,6 @@ from starlette.requests import Request
 
 COOKIE_NAME = "surgeconf_session"
 SESSION_MAX_AGE = 7 * 86400
-
 DEFAULT_INSTALLATION_ROLE = "home_gateway"
 DEFAULT_ADMIN_ACCESS = "local_only"
 VALID_INSTALLATION_ROLES = {"home_gateway"}
@@ -37,6 +38,47 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # 公开路径：静态资源、登录页/登录端点与未认证 session 探测；
 # logout 不公开（需有效会话 + CSRF）。它们不读取任何管理数据。
 PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/session"}
+
+# ===== 逐档案只读订阅 Token =====
+
+# token_urlsafe(32) 的 base64url 文本恒为 43 字符（无填充）
+PROFILE_TOKEN_BYTES = 32
+PROFILE_TOKEN_LENGTH = 43
+_PROFILE_TOKEN_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
+# 唯一免管理会话的业务路径：GET /api/configs/profiles/{id}/subscribe
+PROFILE_TOKEN_SUBSCRIBE_RE = re.compile(r"^/api/configs/profiles/\d+/subscribe$")
+
+
+def issue_profile_token() -> tuple[str, str]:
+    """签发新的档案订阅 Token：返回 (明文, SHA-256 哈希)。
+
+    明文只在签发/轮换响应中出现一次；持久层仅保存哈希。
+    """
+    plain = secrets.token_urlsafe(PROFILE_TOKEN_BYTES)
+    return plain, profile_token_hash(plain)
+
+
+def profile_token_hash(plain: str) -> str:
+    return hashlib.sha256(plain.encode("ascii")).hexdigest()
+
+
+def verify_profile_token(plain: str | None, token_hash: str | None) -> bool:
+    """恒时校验：先做固定格式/长度前置检查，再 compare_digest 比较哈希。"""
+    if not plain or not token_hash:
+        return False
+    if len(plain) != PROFILE_TOKEN_LENGTH:
+        return False
+    if not _PROFILE_TOKEN_ALPHABET.issuperset(plain):
+        return False
+    return hmac.compare_digest(profile_token_hash(plain), token_hash)
+
+
+def is_profile_subscribe_request(method: str, path: str) -> bool:
+    """严格限定 GET + /api/configs/profiles/{id}/subscribe 的免会话放行。
+
+    令牌校验在路由内完成；任何失败统一 404，不泄露档案是否存在。
+    """
+    return method == "GET" and PROFILE_TOKEN_SUBSCRIBE_RE.match(path) is not None
 
 # 登录限流：每直接对端 60 秒窗口内最多 10 次失败，超限阻断 60 秒
 LOGIN_FAILURE_WINDOW = 60.0
@@ -331,6 +373,10 @@ async def require_admin_request(request: Request, settings: AccessSettings) -> s
     if is_static_path(path):
         # 静态资源在任何模式下公开（不含业务数据）
         return Decision.PUBLIC
+    if is_profile_subscribe_request(request.method, path):
+        # 唯一免管理会话的业务路径：令牌校验在路由内完成，失败统一 404；
+        # 必须先于 local_only 非回环拒绝，否则局域网设备无法订阅
+        return Decision.ALLOW
     loopback = request_peer_is_loopback(request)
     if path in PUBLIC_PATHS:
         # local_only 下登录页/登录端点仅限本机：非回环不可见

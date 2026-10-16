@@ -44,6 +44,24 @@
     </div>
   </div>
 </div>
+
+<!-- 订阅 Token 一次性对话框：关闭（按钮/ESC/遮罩）即清空明文 -->
+<div class="modal-overlay" id="token-modal">
+  <div class="modal" style="max-width:640px;">
+    <h3>{{ t["profile.token_dialog_title"] }}</h3>
+    <p style="font-size:12px;color:var(--danger,#e17055);">{{ t["profile.token_dialog_warning"] }}</p>
+    <div class="form-group">
+      <label>{{ t["generator.subscribe_url"] }}</label>
+      <div class="gen-row">
+        <input type="text" id="token-url-input" readonly class="gen-sub-url">
+        <button class="btn btn-outline" onclick="copyTokenUrl()">{{ t["generator.copy"] }}</button>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="closeTokenDialog()">{{ t["profile.token_done"] }}</button>
+    </div>
+  </div>
+</div>
 {{ m.custom_rule_modal() }}
 {{ m.host_modal() }}
 

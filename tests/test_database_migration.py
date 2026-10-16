@@ -37,6 +37,10 @@ def create_current_schema_database(path: Path) -> Path:
     engine = sqlalchemy.create_engine(f"sqlite:///{path}")
     tables = [t for t in Base.metadata.sorted_tables if t.name != "data_migration_records"]
     Base.metadata.create_all(engine, tables=tables)
+    # 合成 pre-Alembic 基线：剔除 0002 之后新增的列（真实旧库没有它们）
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "ALTER TABLE config_profiles DROP COLUMN subscription_token_hash")
     engine.dispose()
     return path
 
@@ -185,7 +189,7 @@ async def test_lifespan_prepares_database_before_binding_live_runtime(tmp_path, 
     def checked_bind(path):
         assert Path(path).exists(), "bind 前必须完成 prepare_database"
         assert sqlite_scalar(Path(path), "SELECT version_num FROM alembic_version") \
-            == "0001_current_schema"
+            == database_migration._head_revision()
         original_bind(path)
         bound["path"] = Path(path)
 

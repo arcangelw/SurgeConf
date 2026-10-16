@@ -43,7 +43,6 @@ async def list_subscriptions(db: AsyncSession = Depends(get_db)):
         {
             "id": s.id,
             "name": s.name,
-            "url": s.url,
             "tag": s.tag,
             "color": s.color or SUB_COLORS[(s.id - 1) % len(SUB_COLORS)],
             "enabled": s.enabled,
@@ -54,6 +53,27 @@ async def list_subscriptions(db: AsyncSession = Depends(get_db)):
         }
         for s in subs
     ]
+
+
+@router.get("/{sub_id}")
+async def get_subscription(sub_id: int, db: AsyncSession = Depends(get_db)):
+    """已认证订阅详情：返回 URL 供编辑（列表不携带）"""
+    result = await db.execute(select(Subscription).where(Subscription.id == sub_id))
+    sub = result.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(404, "订阅不存在")
+    return {
+        "id": sub.id,
+        "name": sub.name,
+        "url": sub.url,
+        "tag": sub.tag,
+        "color": sub.color or SUB_COLORS[(sub.id - 1) % len(SUB_COLORS)],
+        "enabled": sub.enabled,
+        "auto_update": sub.auto_update,
+        "update_interval": sub.update_interval,
+        "last_update": sub.last_update.isoformat() if sub.last_update else None,
+        "created_at": sub.created_at.isoformat() if sub.created_at else None,
+    }
 
 
 @router.post("")

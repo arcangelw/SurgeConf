@@ -249,3 +249,18 @@ async def test_generate_response_headers_are_safe(client):
     disposition = resp.headers["content-disposition"]
     assert "filename*=UTF-8''%E9%85%8D%E7%BD%AE.conf" in disposition
     assert 'filename="Surge.conf"' in disposition
+
+
+@pytest.mark.asyncio
+async def test_profiles_list_and_detail_contract(client):
+    """档案列表字段白名单（最小披露）；详情返回完整 MITM 视图但秘密仅 configured"""
+    data = (await client.get("/api/configs/profiles")).json()
+    assert data
+    assert set(data[0]) == {"id", "name", "description", "is_default", "locale",
+                            "final_action", "token_configured"}
+    assert data[0]["token_configured"] is False  # 未生成过 token 的档案
+
+    detail = (await client.get("/api/configs/profiles/1")).json()
+    assert detail["general"] and "mitm" in detail
+    assert detail["mitm"]["ca-passphrase"] == {"configured": False}
+    assert detail["mitm"]["ca-p12"] == {"configured": False}

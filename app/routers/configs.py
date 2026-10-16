@@ -18,11 +18,15 @@ from typing import Optional
 from app.database import get_db
 from app.models import ConfigProfile, RuleSource, CustomRule, HostMapping
 from app.runtime_paths import ensure_runtime_directories, resolve_runtime_paths
+from app.security import issue_profile_token, verify_profile_token
 from app.services.backups import unique_path
 from app.services.generator import generate_surge_config
 from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
 
 router = APIRouter(prefix="/api/configs", tags=["配置管理"])
+
+# MITM 秘密字段：详情仅返回 configured 状态，更新为覆盖式（空输入=保留现值）
+MITM_SECRET_KEYS = ("ca-p12", "ca-passphrase")
 
 
 class ConfigProfileCreate(BaseModel):
@@ -49,6 +53,8 @@ class ConfigProfileUpdate(BaseModel):
     url_rewrites: Optional[list] = None
     header_rewrites: Optional[list] = None
     mitm: Optional[dict] = None
+    mitm_reset: Optional[bool] = None
+    mitm_clear: Optional[list[str]] = None
 
 
 class RuleSourceCreate(BaseModel):
@@ -75,24 +81,56 @@ class RuleSourceUpdate(BaseModel):
 
 @router.get("/profiles")
 async def list_profiles(db: AsyncSession = Depends(get_db)):
+    """最小披露：仅列表展示所需字段；MITM/General 走已认证单档案详情"""
     result = await db.execute(select(ConfigProfile).order_by(ConfigProfile.id))
     profiles = result.scalars().all()
-    resp = []
-    for p in profiles:
-        resp.append({
+    return [
+        {
             "id": p.id,
             "name": p.name,
             "description": p.description,
             "is_default": p.is_default,
             "locale": p.locale,
             "final_action": p.final_action,
-            "general": p.general,
-            "dns": p.dns,
-            "url_rewrites": p.url_rewrites,
-            "header_rewrites": p.header_rewrites,
-            "mitm": p.mitm,
-        })
-    return resp
+            "token_configured": bool(p.subscription_token_hash),
+        }
+        for p in profiles
+    ]
+
+
+def _mitm_public_view(mitm: dict | None) -> dict:
+    """MITM 秘密字段仅返回 configured 状态，绝不回显明文"""
+    view = dict(mitm or {})
+    for key in MITM_SECRET_KEYS:
+        view[key] = {"configured": bool(view.get(key))}
+    return view
+
+
+def _profile_detail(p: ConfigProfile) -> dict:
+    return {
+        "id": p.id,
+        "name": p.name,
+        "description": p.description,
+        "is_default": p.is_default,
+        "locale": p.locale,
+        "final_action": p.final_action,
+        "general": p.general,
+        "dns": p.dns,
+        "url_rewrites": p.url_rewrites,
+        "header_rewrites": p.header_rewrites,
+        "mitm": _mitm_public_view(p.mitm),
+        "token_configured": bool(p.subscription_token_hash),
+    }
+
+
+@router.get("/profiles/{profile_id}")
+async def get_profile(profile_id: int, db: AsyncSession = Depends(get_db)):
+    """已认证单档案详情：UI 编辑用完整数据；MITM 秘密仅 configured 状态"""
+    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
+    profile = result.scalar_one_or_none()
+    if not profile:
+        raise HTTPException(404, "配置方案不存在")
+    return _profile_detail(profile)
 
 
 @router.post("/profiles")
@@ -122,6 +160,28 @@ async def update_profile(profile_id: int, data: ConfigProfileUpdate, db: AsyncSe
         raise HTTPException(404, "配置方案不存在")
 
     update_data = data.model_dump(exclude_unset=True)
+    mitm_reset = update_data.pop("mitm_reset", None)
+    mitm_clear = update_data.pop("mitm_clear", None)
+    mitm_incoming = update_data.pop("mitm", None)
+
+    if mitm_reset:
+        # 显式整体重置（独立动作）：清空全部 MITM 覆盖，回到生成器默认值
+        profile.mitm = {}
+    else:
+        current = dict(profile.mitm or {})
+        if mitm_clear:
+            # 显式清除指定秘密键（独立字段）；清除不存在的键是无害幂等操作
+            for key in mitm_clear:
+                current.pop(key, None)
+        if mitm_incoming is not None:
+            for key, value in mitm_incoming.items():
+                if key in MITM_SECRET_KEYS and not (isinstance(value, str) and value):
+                    # 秘密键空输入（空串/null/configured 回显对象）= 保留现值；
+                    # 只接受非空字符串作为新值
+                    continue
+                current[key] = value
+        profile.mitm = current
+
     for key, value in update_data.items():
         setattr(profile, key, value)
     await db.commit()
@@ -155,6 +215,23 @@ async def set_default_profile(profile_id: int, db: AsyncSession = Depends(get_db
     profile.is_default = True
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/profiles/{profile_id}/token")
+async def issue_profile_subscription_token(profile_id: int, db: AsyncSession = Depends(get_db)):
+    """生成（或轮换）该档案的只读订阅 Token。
+
+    管理会话 + CSRF 边界内；明文只在本次响应出现一次，库中仅存 SHA-256
+    哈希。再次调用即轮换，旧订阅 URL 立即失效。
+    """
+    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
+    profile = result.scalar_one_or_none()
+    if not profile:
+        raise HTTPException(404, "配置方案不存在")
+    plain, token_hash = issue_profile_token()
+    profile.subscription_token_hash = token_hash
+    await db.commit()
+    return {"profile_id": profile.id, "token": plain}
 
 
 # ===== 规则源 =====
@@ -302,16 +379,23 @@ async def export_config(profile_id: int, data: ExportRequest,
     return {"name": target.name, "size": target.stat().st_size}
 
 
-@router.get("/subscribe")
+@router.get("/profiles/{profile_id}/subscribe")
 async def subscribe_config(
-    profile_id: Optional[int] = None,
+    profile_id: int,
     token: Optional[str] = None,
     locale: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """供 Surge 通过 URL 订阅的端点。Surge 中填入：
-    http://<ip>:61830/api/configs/subscribe?profile_id=1
+    """供 Surge 通过 URL 订阅的只读端点（唯一免管理会话路径）。
+
+    Surge 中填入：http://<ip>:<port>/api/configs/profiles/1/subscribe?token=<token>。
+    令牌任何失败（缺失/格式错/不匹配/未配置）与档案不存在统一 404，
+    不泄露档案是否存在。
     """
+    result = await db.execute(select(ConfigProfile).where(ConfigProfile.id == profile_id))
+    profile = result.scalar_one_or_none()
+    if profile is None or not verify_profile_token(token, profile.subscription_token_hash):
+        raise HTTPException(404, "Not Found")
     content = await generate_surge_config(db, profile_id, locale)
     # Surge 订阅需要设置合适的 Content-Type 和更新间隔提示
     return PlainTextResponse(

@@ -82,13 +82,21 @@ def pending_data_migration_keys(database_path: Path) -> list:
         return [key for key in DATA_MIGRATIONS if key not in recorded]
 
 
+# 0001 基线之后新增的列：无版本旧库缺少它们属正常，由 alembic upgrade 补齐，
+# 不得作为"schema 不在已知基线"的中止理由
+POST_BASELINE_COLUMNS = {("config_profiles", "subscription_token_hash")}
+
+
 def _expected_columns() -> dict:
-    """当前基线期望的表→列（data_migration_records 属 0001 新表，缺失时补建）"""
-    return {
+    """0001 基线期望的表→列（data_migration_records 属 0001 新表，缺失时补建）"""
+    columns = {
         table.name: {column.name for column in table.columns}
         for table in Base.metadata.sorted_tables
         if table.name != "data_migration_records"
     }
+    for table, column in POST_BASELINE_COLUMNS:
+        columns[table].discard(column)
+    return columns
 
 
 def _validate_current_schema(database_path: Path) -> None:
