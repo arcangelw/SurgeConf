@@ -6,10 +6,11 @@ from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.bootstrap import seed_defaults
-from app.database import database, get_db, init_db
+from app.database import database, get_db
 from app.i18n import DEFAULT_LOCALE
 from app.models import SystemConfig
+from app.runtime_paths import resolve_runtime_paths
+from app.services.database_migration import PROJECT_ROOT, prepare_database
 
 router = APIRouter(prefix="/api/settings", tags=["系统设置"])
 
@@ -25,15 +26,16 @@ async def set_locale(request: Request):
 
 @router.post("/reset")
 async def reset_data():
-    """重置所有数据：删除数据库文件并重新初始化"""
+    """重置所有数据：删除数据库文件后走完整 staging 准备流程重建并重绑运行时"""
     # WAL 引入后需连同伴生文件一并删除，否则残留 -wal/-shm 会污染重建的新库
     for suffix in ("", "-wal", "-shm"):
         candidate = Path(f"{database.path}{suffix}")
         if candidate.exists():
             candidate.unlink()
-    await init_db()
-    await seed_defaults()
-    return {"reset": True}
+    paths = resolve_runtime_paths()
+    result = await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
+    database.bind(paths.database)
+    return {"reset": True, "source": result.source}
 
 
 # ===== 系统级配置（排除关键词、其他分组等） =====

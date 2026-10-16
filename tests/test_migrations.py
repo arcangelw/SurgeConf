@@ -6,9 +6,9 @@
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.bootstrap import apply_data_migrations
+from app.services.data_migrations import apply_data_migrations
 from app.models import CustomRule, ConfigProfile, SystemConfig, RuleSource
 from app.default_config import SECURITY_PRE_RULES
 
@@ -19,13 +19,18 @@ async def _fresh_view(db) -> AsyncSession:
     return new_session
 
 
+
+def _factory(db):
+    """apply_data_migrations 以 session_factory 为参数：基于同一 engine 构造"""
+    return async_sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+
 @pytest.mark.asyncio
 async def test_security_rules_backfilled_on_legacy_db(db):
     """老库（无内置安全规则）迁移后补齐 STUN 阻断三条，且已持久化"""
     before = (await db.execute(select(CustomRule.rule_text))).scalars().all()
     assert not any("stun" in r.lower() for r in before), "前置条件：老库无 STUN 规则"
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         texts = set((await fresh.execute(select(CustomRule.rule_text))).scalars().all())
@@ -36,8 +41,8 @@ async def test_security_rules_backfilled_on_legacy_db(db):
 @pytest.mark.asyncio
 async def test_migration_idempotent(db):
     """重复执行不产生重复规则（跨 session 验证）"""
-    await apply_data_migrations(db)
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         texts = list((await fresh.execute(select(CustomRule.rule_text))).scalars().all())
@@ -60,8 +65,8 @@ async def test_douyin_direct_source_backfilled_before_tiktok_and_idempotent(db):
     db.add(legacy_tiktok)
     await db.commit()
 
-    await apply_data_migrations(db)
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         sources = (await fresh.execute(select(RuleSource))).scalars().all()
@@ -81,7 +86,7 @@ async def test_user_deleted_default_rules_not_revived(db):
     await db.delete(first)
     await db.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         texts = (await fresh.execute(select(CustomRule.rule_text))).scalars().all()
@@ -96,14 +101,14 @@ async def test_ipv6_vif_normalized_to_disabled(db, legacy):
     p.general = dict(p.general, **{"ipv6-vif": legacy})
     await db.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         g = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
     assert g["ipv6-vif"] == "disabled"
 
     # 已是 disabled 时再迁移无变化（幂等）
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
     async with await _fresh_view(db) as fresh:
         g2 = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
     assert g2["ipv6-vif"] == "disabled"
@@ -119,7 +124,7 @@ async def test_dns_defaults_upgraded_from_legacy(db):
     })
     await db.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         g = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
@@ -128,7 +133,7 @@ async def test_dns_defaults_upgraded_from_legacy(db):
     assert g["hijack-dns"] == "*:53"
 
     # 幂等：再迁移无变化
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
     async with await _fresh_view(db) as fresh:
         g2 = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
     assert g2["hijack-dns"] == "*:53"
@@ -146,7 +151,7 @@ async def test_dns_custom_values_not_touched(db):
     })
     await db.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         g = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
@@ -172,7 +177,7 @@ async def test_global_quic_block_removed_and_per_policy_default_added(db):
     profile.general = general
     await db.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         rules = (await fresh.execute(select(CustomRule.rule_text))).scalars().all()
@@ -188,7 +193,7 @@ async def test_custom_block_quic_value_not_touched(db):
     profile.general = dict(profile.general, **{"block-quic": "always-allow"})
     await db.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     async with await _fresh_view(db) as fresh:
         general = (await fresh.execute(select(ConfigProfile.general))).scalars().first()
@@ -201,7 +206,7 @@ async def test_no_resolve_keywords_backfilled_and_persisted(db):
     keys = (await db.execute(select(SystemConfig.key))).scalars().all()
     assert "no_resolve_keywords" not in keys, "前置条件：老库无该键"
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
 
     # 跨 session 验证持久化（回归：autoflush 后跳过 commit 导致回滚丢失）
     async with await _fresh_view(db) as fresh:
@@ -216,7 +221,7 @@ async def test_no_resolve_keywords_backfilled_and_persisted(db):
         obj.value = "custom"
         await fresh.commit()
 
-    await apply_data_migrations(db)
+    await apply_data_migrations(_factory(db))
     async with await _fresh_view(db) as fresh:
         v = (await fresh.execute(
             select(SystemConfig.value).where(SystemConfig.key == "no_resolve_keywords"))).scalar_one()
@@ -226,6 +231,6 @@ async def test_no_resolve_keywords_backfilled_and_persisted(db):
 @pytest.mark.asyncio
 async def test_no_change_run_leaves_no_pending(db):
     """无任何变更时迁移仍安全（无条件 commit 空事务，不产生副作用）"""
-    await apply_data_migrations(db)  # 先补齐
-    await apply_data_migrations(db)  # 再跑一次：无变更路径
+    await apply_data_migrations(_factory(db))  # 先补齐
+    await apply_data_migrations(_factory(db))  # 再跑一次：无变更路径
     # 不抛异常即通过；数据完整性由其他测试的跨 session 断言保证

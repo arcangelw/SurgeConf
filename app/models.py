@@ -127,3 +127,11 @@ class SystemConfig(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     key = Column(String(100), unique=True, nullable=False, comment="配置键")
     value = Column(Text, nullable=True, comment="配置值")
+
+
+class DataMigrationRecord(Base):
+    """业务数据迁移记账：已应用的 key 不再重复执行（用户删除默认数据后不复活）"""
+    __tablename__ = "data_migration_records"
+
+    key = Column(String(100), primary_key=True, comment="业务迁移标识，见 app/services/data_migrations.py")
+    applied_at = Column(DateTime, server_default=func.now(), nullable=False, comment="应用时间")
