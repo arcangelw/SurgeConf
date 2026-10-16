@@ -89,19 +89,31 @@ SurgeConf 生成/更新产物文件后，Surge 不会自动感知，需手动重
   unset KEY                        # 先清防继承已 export 的旧值
   read -sr KEY                     # 手动输入 key：不回显、不进 shell 历史
   printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
-    --cacert /path/to/surge-mitm-ca.pem \
     https://127.0.0.1:6171/v1/profiles/reload
   unset KEY                        # 用完即清
   ```
-  - 仓库默认 `http-api-tls = true`：示例必须走 `https://`——先在
-    系统钥匙串信任 Surge MITM CA，或用 `--cacert <CA 文件路径>` 显式
-    指定；**严禁 `-k` / `--insecure` 跳过证书校验**。仅当你在 General
-    中显式设置 `http-api-tls = false` 时才用 `http://`，协议必须与
-    配置匹配。
+  - 仓库默认 `http-api-tls = true`：示例必须走 `https://`，默认前提是
+    **已将 Surge MITM CA 加入系统钥匙串并信任**（Surge 导出 CA 后双击
+    安装、在钥匙串访问中信任）。**严禁 `-k` / `--insecure` 跳过证书
+    校验**。仅当你在 General 中显式设置 `http-api-tls = false` 时才用
+    `http://`，协议必须与配置匹配。
   - key 经 stdin 以 `--header @-` 注入：不出现在 curl argv、进程列表
     与命令历史。stdin 管道与 shell 变量仍是**本机敏感数据**（不是
     加密通道），执行后必须 `unset` 清理变量；禁止把真实 key 写进
     命令行参数、临时文件、URL query、环境导出或粘贴到任何工单。
+  - 若 Surge MITM CA **尚未**装入系统信任，用下面的可执行分支显式
+    指定 CA 文件（交互输入真实路径，验证为普通文件；结束后同样
+    `unset` 清理；不得用占位路径充当实际参数）：
+  ```bash
+  unset CA_FILE                    # 先清防继承已 export 的旧值
+  read -r CA_FILE                  # 输入本机真实的 CA 文件路径
+  [ -f "$CA_FILE" ] || { echo "CA 文件不存在或不是普通文件" >&2; exit 1; }
+  printf 'X-Key: %s\n' "$KEY" | curl -sS -X POST --header @- \
+    --cacert "$CA_FILE" \
+    https://127.0.0.1:6171/v1/profiles/reload
+  unset CA_FILE
+  ```
+  （分支沿用上一块已读入的 `$KEY`；用完记得再 `unset KEY`。）
 
 官方文档：[HTTP API](https://manual.nssurge.com/tools/http-api.html)、[Surge CLI](https://manual.nssurge.com/tools/cli.html)。
 

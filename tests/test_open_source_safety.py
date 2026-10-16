@@ -19,6 +19,7 @@
 
 import hashlib
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -301,43 +302,97 @@ class TestDocumentCoverage:
 
 
 class TestHttpApiExampleSafety:
-    """Surge HTTP API 示例片段的静态安全约束（Fix Round 2）。
+    """Surge HTTP API / curl 示例片段的结构性安全约束（Fix Round 3）。
 
-    只验证结构性危险模式，不测精确措辞：
-    - curl 行不得出现 -k / --insecure（跳过证书校验）；
-    - key 不得经 curl argv 注入（-H "X-Key:…" / --header "X-Key:…"）；
-    - 仓库默认 ``http-api-tls = true``：示例端口 6171 的行不得使用
-      明文 http://（协议必须与 TLS 配置匹配）。
+    解析 markdown 的 bash 代码块，先把反斜杠续行拼成完整逻辑命令，
+    再 ``shlex`` 分词检测 curl argv：``--insecure``、独立 ``-k``、含
+    k 的组合短选项（如 ``-sk`` / ``-fsSk``）、X-Key 头值进 argv；
+    另按逻辑命令（含续行拼接结果）检查示例端口 6171 不得出现明文
+    ``http://``。检测的是结构行为，不绑定具体措辞。
     """
 
-    def _doc_lines(self, repo_text_files):
-        for name in repo_text_files:
+    @staticmethod
+    def _bash_logical_lines(files):
+        """全部 md 文档 ```bash 代码块内续行拼接后的逻辑命令。"""
+        for name in files:
             if not (name.endswith(".md") or name == "README.md"):
                 continue
             text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
-            for number, line in enumerate(text.splitlines(), start=1):
-                yield name, number, line
+            in_block = False
+            buffer: list[str] = []
+            for raw in text.splitlines():
+                stripped = raw.strip()
+                if not in_block:
+                    if stripped.startswith("```bash"):
+                        in_block = True
+                        buffer = []
+                    continue
+                if stripped.startswith("```"):
+                    in_block = False
+                    for line in TestHttpApiExampleSafety._joined(buffer):
+                        yield name, line
+                    buffer = []
+                    continue
+                buffer.append(raw)
+
+    @staticmethod
+    def _joined(lines):
+        """把行尾反斜杠续行拼接为单条逻辑命令。"""
+        current = ""
+        for line in lines:
+            candidate = f"{current} {line}".strip() if current else line
+            if candidate.rstrip().endswith("\\"):
+                current = candidate.rstrip()[:-1].rstrip()
+            else:
+                yield candidate
+                current = ""
+        if current:
+            yield current
+
+    @staticmethod
+    def _curl_argv(logical_line):
+        """逻辑命令中 curl 的 argv 段（到下一个管道边界）；无 curl 为 None。"""
+        try:
+            tokens = shlex.split(logical_line)
+        except ValueError:
+            tokens = logical_line.split()
+        if "curl" not in tokens:
+            return None
+        argv = []
+        for token in tokens[tokens.index("curl") + 1:]:
+            if token == "|":
+                break
+            argv.append(token)
+        return argv
+
+    @staticmethod
+    def _is_insecure_flag(token: str) -> bool:
+        if token in ("--insecure", "-k"):
+            return True
+        # 组合短选项：单 - 后纯字母且含 k（-sk / -fsSk 等）；
+        # --header/--cacert 等长选项以 -- 开头，天然不匹配
+        return bool(re.fullmatch(r"-[a-zA-Z]*k[a-zA-Z]*", token))
 
     def test_no_insecure_curl_flags(self, repo_text_files):
-        offenders = [
-            f"{name}:{number}"
-            for name, number, line in self._doc_lines(repo_text_files)
-            if "curl" in line and ("--insecure" in line
-                                   or re.search(r"\s-k(\s|$)", line))]
+        offenders = []
+        for name, line in self._bash_logical_lines(repo_text_files):
+            argv = self._curl_argv(line)
+            if argv and any(self._is_insecure_flag(t) for t in argv):
+                offenders.append(f"{name}: {line[:90]}")
         assert offenders == [], f"curl 跳过证书校验的示例: {offenders}"
 
     def test_no_key_in_curl_argv(self, repo_text_files):
-        offenders = [
-            f"{name}:{number}"
-            for name, number, line in self._doc_lines(repo_text_files)
-            if re.search(r"""-{2}?header\s+["']X-Key""", line)
-            or re.search(r"""-{1,2}[hH]\s+["']X-Key(\s*:)""", line)]
+        offenders = []
+        for name, line in self._bash_logical_lines(repo_text_files):
+            argv = self._curl_argv(line)
+            if argv and any(t.startswith("X-Key") for t in argv):
+                offenders.append(f"{name}: {line[:90]}")
         assert offenders == [], f"X-Key 经 curl argv 注入: {offenders}"
 
     def test_http_api_port_never_plaintext_http(self, repo_text_files):
         offenders = [
-            f"{name}:{number}"
-            for name, number, line in self._doc_lines(repo_text_files)
+            f"{name}: {line[:90]}"
+            for name, line in self._bash_logical_lines(repo_text_files)
             if "6171" in line and "http://" in line]
         assert offenders == [], (
             f"默认 http-api-tls=true 的示例端口出现明文 http://: {offenders}")
