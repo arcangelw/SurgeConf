@@ -27,7 +27,9 @@ LOG="$HOME/Library/Logs/SurgeConf/surgeconf.log"
 6. **抖音优先直连**：补齐 `DouYin` 规则源并放在 `TikTok` 之前。两者都覆盖 `snssdk.com`，优先直连可避免抖音评论、视频和直播误走 TikTok 海外出口。
 
    验证：`SELECT name,action,sort_order FROM rule_sources WHERE name IN ('DouYin','TikTok') ORDER BY sort_order;` 中 `DouYin / 大陆直连` 位于 `TikTok` 之前。
-7. **恢复媒体 QUIC 性能**：删除项目托管的旧全局 `UDP/443 → REJECT` 内置行（`remove_global_quic_v1`，精确文本匹配），并补 `block-quic = per-policy`。DIRECT 保留 QUIC/HTTP3，代理按 UDP 能力自适应处理；STUN 防泄漏改为按档案模式注入（见第 9 条）。用户自建的类似规则不被该迁移识别为托管行，照常保留——如已不需要可自行删除，不判迁移失败。
+7. **恢复媒体 QUIC 性能**：删除旧全局 `UDP/443 → REJECT`（`remove_global_quic_v1`），并补 `block-quic = per-policy`。DIRECT 保留 QUIC/HTTP3，代理按 UDP 能力自适应处理；STUN 防泄漏改为按档案模式注入（见第 9 条）。
+
+   **删除边界**（该迁移无所有权元数据，按条件而非按来源匹配）：`profile_id IS NULL` + `position='pre'` + `rule_text` **精确等于** `AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT`（注意括号内 `, ` 逗号+空格形态）的所有记录——**即使是你自建的也会在首次升级时被一次性删除**，且不校验 `comment`/`sort_order`。文本有任何差异（多一个空格也算）或其他作用域（档案级 / 非 pre 位置）的变体一律保留。迁移记账后不再重复执行；若你确需全局阻断 UDP/443，可在升级后显式重建该规则——生成器将其作为用户自建规则保留并照常输出。
 8. **`no_resolve_keywords` 系统键退役**：IP 类规则集的 no-resolve 判定已结构化（`rule_sources.ip_rules` 布尔列），关键词系统键不再被生成器读取，迁移删除该键避免面板残留失效配置。
 9. **UDP 安全改为按档案动态生成**（`udp_security_modes_v1`）：
    - **v1 清理只删除冻结签名的旧全局托管行**：`profile_id IS NULL` + `position='pre'` + `sort_order` 精确相等 + `comment` 精确相等 + `rule_text` 匹配时**仅忽略逗号两侧的 ASCII 空格/Tab**（行首尾空白、token 内部空白、Unicode 空白与大小写一律保留；含 CR/LF 的行直接判不匹配）（签名见 `app/default_config.py::LEGACY_MANAGED_STUN_SIGNATURES`，即历史四条全局 STUN 阻断）。曾手改过 `comment` 或 `sort_order` 的 lookalike 一律视为用户规则保留——既不误删，也不复活。
@@ -113,7 +115,7 @@ RULE-SET,<URL 含 /ip/ 的规则集>,<任意策略>,no-resolve  ← 至少一行
 | `scoped` | 例外 DIRECT 行在前（示例：`AND,((MAC-ADDRESS,02:00:00:00:00:01),(PROTOCOL,UDP)),DIRECT`，规范占位值），四条 REJECT 按上表顺序殿后；无启用例外时与 strict 相同 |
 | `compatible` | 无 `# >> 托管 UDP 安全规则` 段、无任何托管 STUN 行；`ios_mobile` 产物恒无 `PROCESS-*` / `MAC-ADDRESS` 规则 |
 
-产物断言口径：**项目托管的全局 `UDP/443 → REJECT` 不再生成**；你自建的类似规则（如历史手工添加）照常保留在产物中，属正常不算迁移失败——如已不需要，在管理界面删除即可。说明：RULE-SET 行的策略随设备配置而异，判定依据是「URL 含 /ip/ 且以 ,no-resolve 结尾」而非具体策略名。
+产物断言口径：**项目托管的全局 `UDP/443 → REJECT` 不再生成**；若产物中仍出现该行，只可能是升级后你（重新）自建的——属正常、不算迁移失败，如不需要可在管理界面删除。升级前与托管行**逐字相同**的全局自建规则已被 `remove_global_quic_v1` 一次性删除（边界见迁移内容第 7 条），文本变体不受影响。说明：RULE-SET 行的策略随设备配置而异，判定依据是「URL 含 /ip/ 且以 ,no-resolve 结尾」而非具体策略名。
 
 ### 6. 运行时实测（Surge 已重载新配置后）
 
@@ -167,7 +169,7 @@ echo "日志 $L_BEFORE -> $L_AFTER；记录 $R_BEFORE -> $R_AFTER"
 | 项 | 手段 |
 |---|---|
 | 三模式托管行数量与顺序（strict 四条 / scoped 例外后四条 / compatible 零托管） | `tests/test_udp_policy.py`、`tests/test_generator.py` |
-| 产物无项目托管的全局 UDP/443 拒绝（用户自建除外）、General 强制键（`block-quic = per-policy`、`udp-policy-not-supported-behaviour = REJECT`） | `tests/test_generator.py` |
+| 产物无项目托管的全局 UDP/443 拒绝、General 强制键（`block-quic = per-policy`、`udp-policy-not-supported-behaviour = REJECT`） | `tests/test_generator.py` |
 | iOS 产物无 `PROCESS-*` / `MAC-ADDRESS` 规则 | `tests/test_target_rule_capabilities.py` |
 | Mac 两目标产物通过 Surge Mac 6.6.0 `surge-cli --check` | 开发机 CLI 校验（本计划 Task 6 执行） |
 | 仓库文档无真实 MAC / 私网地址 / 用户目录 / 凭据 | `tests/test_open_source_safety.py` |
@@ -181,7 +183,7 @@ echo "日志 $L_BEFORE -> $L_AFTER；记录 $R_BEFORE -> $R_AFTER"
    '/Applications/Surge.app/Contents/Applications/surge-cli' --raw dump rule
    ```
 
-   预期：例外进程 DIRECT 规则位于四条 STUN REJECT 之前；无**项目托管的**全局 UDP/443 拒绝行（你自建的历史规则照常保留——若已不需要，可自行删除，不判迁移失败）。
+   预期：例外进程 DIRECT 规则位于四条 STUN REJECT 之前；无项目托管的全局 UDP/443 拒绝行（若仍见该行为你升级后自建——不需要可自行删除；升级前与托管行逐字相同的自建全局规则已被迁移一次性删除，属预期）。
 3. 启动配置为例外的实时视频/通话应用，确认画面与声音正常（UDP 放行生效）。
 4. 浏览器 WebRTC 检测页：不出现公开直连 STUN 候选（例外进程之外的防护仍生效）。
 
