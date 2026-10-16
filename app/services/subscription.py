@@ -317,6 +317,22 @@ class _StaleSnapshotError(Exception):
     """写事务重查发现 URL 已被并发修改：拒绝把旧拉取结果写入"""
 
 
+class _ScheduledSkip:
+    """调度守卫未满足的跳过信号（非失败：不拉取、不记状态）"""
+
+    def __repr__(self) -> str:
+        return "SCHEDULE_SKIPPED"
+
+
+SCHEDULE_SKIPPED = _ScheduledSkip()
+
+
+def _scheduled_guard_ok(enabled, auto_update, next_at, expected, now) -> bool:
+    """调度守卫：仍 enabled+auto、next 与选择时快照一致且仍到期"""
+    return bool(enabled and auto_update and next_at is not None
+                and next_at == expected and next_at <= now)
+
+
 class _FailureRecord(NamedTuple):
     """失败状态短事务结果：订阅是否存在 + 记录事务读到的最新节点数
 
@@ -481,10 +497,17 @@ async def _record_failed_attempt(db: AsyncSession, sub_id: int,
 
 
 async def sync_subscription(db: AsyncSession, sub_id: int,
-                            now: datetime | None = None) -> SyncResult | None:
+                            now: datetime | None = None,
+                            scheduled_next: datetime | None = None
+                            ) -> "SyncResult | None | _ScheduledSkip":
     """同步单个订阅：拉取/解析/去重在事务外，成功后单事务 upsert。
 
     订阅不存在（含同步期间被并发删除）返回 None，由调用方决定 404。
+
+    scheduled_next（naive UTC，库内口径）：调度器传入的排期快照守卫，
+    拉取前与成功写事务内均校验订阅仍 enabled+auto、next 未被并发改动
+    且仍到期；任一不满足返回 SCHEDULE_SKIPPED（跳过本轮：不拉取、不
+    记失败状态、不覆盖新排期）。手动调用（默认 None）完全无守卫。
 
     成功写事务：重查订阅与现有节点并校验 URL 未被并发修改（快照过期
     则拒绝写入旧结果），按 stable_key 匹配——匹配项只更新 provider 字段
@@ -502,11 +525,26 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
 
     # 阶段 1：短只读事务取订阅快照（普通值，不携带 ORM 对象跨事务）
     try:
-        row = (await db.execute(
-            select(Subscription.url, Subscription.last_node_count)
-            .where(Subscription.id == sub_id)
-        )).first()
-        await db.commit()
+        if scheduled_next is not None:
+            # 调度守卫（拉取前）：排期快照过期/不再 eligible → 跳过本轮
+            row = (await db.execute(
+                select(Subscription.url, Subscription.last_node_count,
+                       Subscription.enabled, Subscription.auto_update,
+                       Subscription.next_update_at)
+                .where(Subscription.id == sub_id)
+            )).first()
+            await db.commit()
+            if row is not None:
+                if not _scheduled_guard_ok(row[2], row[3], row[4],
+                                           scheduled_next, now):
+                    return SCHEDULE_SKIPPED
+                row = (row[0], row[1])  # 下游按两列快照解包
+        else:
+            row = (await db.execute(
+                select(Subscription.url, Subscription.last_node_count)
+                .where(Subscription.id == sub_id)
+            )).first()
+            await db.commit()
     except Exception as exc:
         await _safe_rollback(db)
         code, message = safe_sync_error(exc)
@@ -551,6 +589,12 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
         if sub.url != url:
             # 快照过期：URL 已被并发修改，绝不把旧拉取结果写入
             raise _StaleSnapshotError()
+        if scheduled_next is not None and not _scheduled_guard_ok(
+                sub.enabled, sub.auto_update, sub.next_update_at,
+                scheduled_next, now):
+            # 排期在拉取期间被并发改动：拒写旧结果与新排期（跳过非失败）
+            await _safe_rollback(db)
+            return SCHEDULE_SKIPPED
         existing = {
             node.stable_key: node
             for node in (await db.execute(

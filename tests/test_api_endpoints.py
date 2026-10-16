@@ -1134,3 +1134,115 @@ async def test_lifespan_stops_scheduler_before_db_dispose(tmp_path, monkeypatch)
     finally:
         fastapi_app.dependency_overrides.pop(get_db, None)
         await test_runtime.dispose()
+
+
+# ===== lifespan 启动失败清理：bind 后任一步骤失败都停调度器并释放 DB =====
+from app.database import DatabaseRuntime
+
+
+class _DisposalRecordingRuntime(DatabaseRuntime):
+    """记录 dispose 是否执行（lifespan finally 无条件释放）"""
+
+    disposed = False
+
+    async def dispose(self):
+        self.disposed = True
+        await super().dispose()
+
+
+async def _drive_lifespan_expecting_failure(tmp_path, monkeypatch, sabotager):
+    """公共脚手架：占位 sabotage → lifespan 应传播异常且 finally 清理"""
+    from app.main import app as fastapi_app
+    from app.database import get_db
+    from app.runtime_paths import resolve_runtime_paths
+
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    test_runtime = _DisposalRecordingRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+
+    async def override_get_db():
+        async with test_runtime.session_factory() as session:
+            yield session
+
+    fastapi_app.dependency_overrides[get_db] = override_get_db
+    sabotager(paths)
+    try:
+        from unittest.mock import patch
+        with pytest.raises(Exception), \
+                patch("app.database.database", test_runtime), \
+                patch("app.bootstrap.database", test_runtime):
+            async with fastapi_app.router.lifespan_context(fastapi_app):
+                pass
+        scheduler = getattr(fastapi_app.state, "subscription_scheduler", None)
+        if scheduler is not None:
+            assert scheduler._task is None, "失败后不得残留循环任务"
+            assert scheduler._lock_fd is None, "失败后不得残留锁描述符"
+        assert test_runtime.disposed is True, "finally 必须无条件 dispose 数据库"
+    finally:
+        fastapi_app.dependency_overrides.pop(get_db, None)
+        await test_runtime.dispose()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cleanup_when_scheduler_start_fails(tmp_path, monkeypatch):
+    """scheduler.start 安全错误（锁路径为 symlink → OSError）：无 fd/task 且 DB disposed"""
+    def sabotage(paths):
+        target = paths.root / "real.lock"
+        target.write_text("")
+        (paths.root / "scheduler.lock").symlink_to(target)
+
+    await _drive_lifespan_expecting_failure(tmp_path, monkeypatch, sabotage)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cleanup_when_create_task_fails(tmp_path, monkeypatch):
+    """scheduler 已拿锁但 create_task 失败：start 内部已释放 fd，finally stop 幂等 + DB disposed"""
+    import asyncio as asyncio_mod
+
+    def sabotage(paths):
+        # 只拦截调度循环协程：prepare_database 等更早阶段（清理边界之外）
+        # 的 create_task 不受影响，确保失败点落在 scheduler.start 内部
+        real_create_task = asyncio_mod.create_task
+
+        def broken_create_task(coro, **kw):
+            if getattr(coro, "__name__", "") == "_loop":
+                coro.close()
+                raise RuntimeError("no task")
+            return real_create_task(coro, **kw)
+
+        monkeypatch.setattr(asyncio_mod, "create_task", broken_create_task)
+
+    await _drive_lifespan_expecting_failure(tmp_path, monkeypatch, sabotage)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cleanup_when_maintenance_fails(tmp_path, monkeypatch):
+    """孤儿节点维护异常（scheduler 未构造）：finally 无 dispose 前置即释放 DB"""
+    async def broken_cleanup(db):
+        raise RuntimeError("maintenance boom")
+
+    def sabotage(paths):
+        import app.services.subscription as subscription_service
+        monkeypatch.setattr(subscription_service, "cleanup_orphan_nodes",
+                            broken_cleanup)
+
+    await _drive_lifespan_expecting_failure(tmp_path, monkeypatch, sabotage)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cleanup_when_startup_log_fails(tmp_path, monkeypatch):
+    """启动日志输出异常（数据库就绪 print 抛错）：同一清理边界内 DB disposed"""
+    import builtins
+
+    real_print = print
+
+    def selective_print(*args, **kw):
+        if any("数据库就绪" in str(a) for a in args):
+            raise OSError("log device gone")
+        real_print(*args, **kw)
+
+    def sabotage(paths):
+        monkeypatch.setattr(builtins, "print", selective_print)
+
+    await _drive_lifespan_expecting_failure(tmp_path, monkeypatch, sabotage)

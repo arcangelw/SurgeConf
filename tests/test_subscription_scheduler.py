@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete as sa_delete
+from sqlalchemy import delete as sa_delete, select as sa_select
 
 import app.services.subscription as subscription_service
 from app.database import Base, DatabaseRuntime
@@ -439,6 +439,115 @@ async def test_loop_cancelled_error_propagates_and_stop_releases(sched_db, tmp_p
     taker = make_scheduler(sched_db, tmp_path / "l.lock")
     assert await taker.start() is True
     await taker.stop()
+
+
+# ===== 调度守卫：选择后排期竞态 =====
+
+
+@pytest.mark.asyncio
+async def test_due_skips_items_mutated_after_selection(sched_db, tmp_path, monkeypatch):
+    """前项慢拉取期间后项被禁用/auto-off/推迟：后项拉取前守卫拒绝，
+    不 fetch、不记任何状态、不覆盖新排期"""
+    from sqlalchemy import update as sa_update
+
+    first = await add_subscription(sched_db, name="slow", url=f"{URL}?slow",
+                                   next_update_at=UTC_NOW_NAIVE - timedelta(seconds=3))
+    off_id = await add_subscription(sched_db, name="off", url=f"{URL}?off",
+                                    next_update_at=UTC_NOW_NAIVE - timedelta(seconds=2))
+    autooff_id = await add_subscription(sched_db, name="autooff", url=f"{URL}?autooff",
+                                        next_update_at=UTC_NOW_NAIVE - timedelta(seconds=2))
+    future_id = await add_subscription(sched_db, name="future", url=f"{URL}?future",
+                                       next_update_at=UTC_NOW_NAIVE - timedelta(seconds=2))
+    far = UTC_NOW_NAIVE + timedelta(days=30)
+
+    async def mutating_fetch(url):
+        if url.endswith("?slow"):
+            # 前项网络往返窗口：后项被并发修改（禁用/auto-off/推迟）
+            async with sched_db.session_factory() as db:
+                await db.execute(sa_update(Subscription)
+                                  .where(Subscription.id == off_id)
+                                  .values(enabled=False, next_update_at=None))
+                await db.execute(sa_update(Subscription)
+                                  .where(Subscription.id == autooff_id)
+                                  .values(auto_update=False, next_update_at=None))
+                await db.execute(sa_update(Subscription)
+                                  .where(Subscription.id == future_id)
+                                  .values(next_update_at=far))
+                await db.commit()
+            await asyncio.sleep(0.05)
+            return [NODE_PAYLOAD]
+        raise AssertionError(f"排期已变化的订阅不得拉取: {url}")
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", mutating_fetch)
+    scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                               clock=lambda: UTC_NOW)
+    results = await scheduler.run_due_once()
+    assert [r.subscription_id for r in results] == [first]
+
+    async with sched_db.session_factory() as db:
+        subs = {s.id: s for s in (await db.execute(
+            sa_select(Subscription))).scalars()}
+    for sid in (off_id, autooff_id, future_id):
+        sub = subs[sid]
+        assert sub.last_attempt_at is None and sub.last_error_code is None
+    assert subs[off_id].next_update_at is None
+    assert subs[autooff_id].next_update_at is None
+    assert subs[future_id].next_update_at == far  # 新排期未被覆盖
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["reschedule", "disable", "auto_off"])
+async def test_scheduled_final_guard_rejects_write_after_mutation(
+        sched_db, tmp_path, monkeypatch, mutation):
+    """当前项拉取期间自身排期/开关被改：写事务守卫拒写（不落节点、
+    不记失败、新排期保留）；manual 同步无守卫仍可正常执行"""
+    from sqlalchemy import update as sa_update
+
+    from app.models import ProxyNode
+    from app.services.subscription import sync_subscription
+
+    sub_id = await add_subscription(sched_db, next_update_at=UTC_NOW_NAIVE)
+    rescheduled = UTC_NOW_NAIVE + timedelta(seconds=7200)
+
+    async def mutating_fetch(url):
+        # 本项拉取窗口内并发修改（模拟用户 update / 另一成功同步）
+        async with sched_db.session_factory() as db:
+            if mutation == "reschedule":  # interval 改变 → now+新 interval
+                values = {"update_interval": 7200, "next_update_at": rescheduled}
+            elif mutation == "disable":  # 禁用 → NULL（update 路由语义）
+                values = {"enabled": False, "next_update_at": None}
+            else:  # auto off → NULL
+                values = {"auto_update": False, "next_update_at": None}
+            await db.execute(sa_update(Subscription)
+                              .where(Subscription.id == sub_id).values(**values))
+            await db.commit()
+        return [{"name": "Fresh", "node_type": "trojan", "server": "8.8.8.8",
+                 "port": 443,
+                 "config": "Fresh = trojan, 8.8.8.8, 443, password=z"}]
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", mutating_fetch)
+    scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
+                               clock=lambda: UTC_NOW)
+    assert await scheduler.run_due_once() == []  # 守卫跳过不出现在结果
+
+    async with sched_db.session_factory() as db:
+        nodes = (await db.execute(sa_select(ProxyNode))).scalars().all()
+        sub = await db.get(Subscription, sub_id)
+    assert nodes == [], "守卫拒绝后不得写入任何节点"
+    assert sub.last_attempt_at is None and sub.last_error_code is None
+    assert sub.last_success_at is None and sub.last_node_count is None
+    assert sub.next_update_at == (None if mutation != "reschedule" else rescheduled)
+
+    # manual 同步（无守卫）：仍可正常拉取写入
+    async def plain_fetch(url):
+        return [{"name": "Manual", "node_type": "trojan", "server": "9.9.9.9",
+                 "port": 443,
+                 "config": "Manual = trojan, 9.9.9.9, 443, password=m"}]
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", plain_fetch)
+    async with sched_db.session_factory() as db:
+        result = await sync_subscription(db, sub_id, now=UTC_NOW_NAIVE)
+    assert result.success is True and result.node_count == 1
 
 
 # ===== ORM interval 赋值校验 =====

@@ -28,8 +28,8 @@ from typing import Callable
 from sqlalchemy import select
 
 from app.models import Subscription
-from app.services.subscription import (SyncResult, _utc_naive,
-                                       sync_subscription)
+from app.services.subscription import (SCHEDULE_SKIPPED, SyncResult,
+                                       _utc_naive, sync_subscription)
 
 logger = logging.getLogger(__name__)
 
@@ -102,39 +102,44 @@ class SubscriptionScheduler:
     async def run_due_once(self, now: datetime | None = None) -> list[SyncResult]:
         """同步全部到期订阅（enabled+auto 且 next<=now）。
 
-        选择查询使用独立短会话并立即结束事务；随后逐个订阅开独立
-        会话调用同步服务——网络拉取不持有选择查询的事务。单项异常
-        不阻断后续（记录类型名，不泄内容）；订阅不存在（None）跳过。
+        选择查询使用独立短会话并立即结束事务，并保留每项的
+        next_update_at 快照；随后逐个订阅开独立会话调用同步服务
+        （传入排期守卫：拉取前/写事务内排期被并发改动即跳过，不
+        拉取、不记失败、不覆盖新排期）——网络拉取不持有选择查询的
+        事务。单项异常不阻断后续（记录类型名，不泄内容）；订阅不
+        存在（None）与守卫跳过（SCHEDULE_SKIPPED）均不出现在结果中。
         返回实际执行的同步结果列表。
         """
         now_naive = _utc_naive(now if now is not None else self._clock())
         session_factory = self._database.session_factory
 
         async with session_factory() as db:
-            due_ids = list((await db.execute(
-                select(Subscription.id)
+            due = list((await db.execute(
+                select(Subscription.id, Subscription.next_update_at)
                 .where(Subscription.enabled == True,  # noqa: E712
                        Subscription.auto_update == True,  # noqa: E712
                        Subscription.next_update_at.is_not(None),
                        Subscription.next_update_at <= now_naive)
                 .order_by(Subscription.next_update_at.asc(),
                           Subscription.id.asc())
-            )).scalars())
+            )).all())
             await db.commit()
 
         results: list[SyncResult] = []
-        for sub_id in due_ids:
+        for sub_id, expected_next in due:
             try:
                 async with session_factory() as db:
-                    result = await sync_subscription(db, sub_id, now=now_naive)
+                    result = await sync_subscription(db, sub_id, now=now_naive,
+                                                     scheduled_next=expected_next)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error("scheduled sync failed: subscription_id=%s error=%s",
                              sub_id, type(exc).__name__)
                 continue
-            if result is not None:
-                results.append(result)
+            if result is None or result is SCHEDULE_SKIPPED:
+                continue
+            results.append(result)
         return results
 
     # ===== 内部实现 =====

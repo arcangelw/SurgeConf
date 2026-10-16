@@ -124,29 +124,36 @@ async def lifespan(app: FastAPI):
     result = await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
     harden_runtime_permissions(paths)
     database.bind(paths.database)
-    print(f"[启动] 数据库就绪（来源 {result.source}，"
-          f"已应用业务迁移 {len(result.applied_migrations)} 项）", file=sys.stderr)
 
-    # 数据维护：清理孤儿节点（修复旧版本删除订阅时未级联删除节点导致的残留）
-    from app.services.subscription import cleanup_orphan_nodes
-    async with database.session_factory() as db:
-        removed = await cleanup_orphan_nodes(db)
-    if removed:
-        print(f"[数据维护] 已清理 {removed} 个孤儿节点（归属订阅已删除的残留节点）", file=sys.stderr)
-
-    # 单实例自动更新调度器：数据库准备/维护完成后启动；锁竞争进入
-    # standby（本实例正常服务，不运行更新循环）
-    from app.services.subscription_scheduler import SubscriptionScheduler
-    scheduler = SubscriptionScheduler(database, paths.root / "scheduler.lock")
-    app.state.subscription_scheduler = scheduler
-    app.state.subscription_scheduler_active = await scheduler.start()
-    if app.state.subscription_scheduler_active:
-        print("[启动] 订阅自动更新调度器已启动", file=sys.stderr)
-    else:
-        print("[启动] 检测到另一实例正在运行，本实例调度器进入 standby", file=sys.stderr)
+    # bind 成功后的一切（维护、调度器、服务、关闭日志）都在同一清理
+    # 边界内：任一步骤失败/取消都先停调度器（如有实例）再无条件释放
+    # 数据库连接，不留锁、不留循环任务
+    scheduler = None
     try:
+        print(f"[启动] 数据库就绪（来源 {result.source}，"
+              f"已应用业务迁移 {len(result.applied_migrations)} 项）", file=sys.stderr)
+
+        # 数据维护：清理孤儿节点（修复旧版本删除订阅时未级联删除节点导致的残留）
+        from app.services.subscription import cleanup_orphan_nodes
+        async with database.session_factory() as db:
+            removed = await cleanup_orphan_nodes(db)
+        if removed:
+            print(f"[数据维护] 已清理 {removed} 个孤儿节点（归属订阅已删除的残留节点）", file=sys.stderr)
+
+        # 单实例自动更新调度器：数据库准备/维护完成后启动；锁竞争进入
+        # standby（本实例正常服务，不运行更新循环）
+        from app.services.subscription_scheduler import SubscriptionScheduler
+        scheduler = SubscriptionScheduler(database, paths.root / "scheduler.lock")
+        app.state.subscription_scheduler = scheduler
+        app.state.subscription_scheduler_active = await scheduler.start()
+        if app.state.subscription_scheduler_active:
+            print("[启动] 订阅自动更新调度器已启动", file=sys.stderr)
+        else:
+            print("[启动] 检测到另一实例正在运行，本实例调度器进入 standby", file=sys.stderr)
         yield
     finally:
-        # 先停调度器（等待在途同步轮次退出并释放锁），再释放数据库连接
-        await scheduler.stop()
+        # 先停调度器（等待在途同步轮次退出并释放锁；start 中途失败时
+        # fd 已被其内部清理，stop 幂等），再释放数据库连接
+        if scheduler is not None:
+            await scheduler.stop()
         await database.dispose()
