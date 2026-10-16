@@ -128,6 +128,18 @@ def _frozen_port(raw):
     return str(port)
 
 
+def _frozen_strip_dot(host):
+    """移除单一 FQDN 尾点；空域与多重尾点 fail closed"""
+    if not host:
+        raise _FrozenIdentityError("节点主机名格式非法")
+    if not host.endswith("."):
+        return host
+    stripped = host[:-1]
+    if not stripped or stripped.endswith("."):
+        raise _FrozenIdentityError("节点主机名格式非法")
+    return stripped
+
+
 def _frozen_host(raw):
     """IP 文本标准压缩（去 IPv6 方括号）；非 ASCII 域名 NFC→IDNA→lower；
     单一尾点去除"""
@@ -145,15 +157,13 @@ def _frozen_host(raw):
         return str(ipaddress.IPv4Address(host))
     except ValueError:
         pass
-    if host.endswith("."):
-        host = host[:-1]
-    if not host:
-        raise _FrozenIdentityError("节点主机名格式非法")
     if host.isascii():
-        return host.lower()
+        return _frozen_strip_dot(host).lower()
     normalized = unicodedata.normalize("NFC", host)
     try:
-        return normalized.encode("idna").decode("ascii").lower()
+        # IDNA 把 U+3002/U+FF0E/U+FF61 统一为 ASCII "."，尾点剥除必须
+        # 在 ASCII 结果上进行，否则 Unicode 尾点与 ASCII 尾点身份分裂
+        return _frozen_strip_dot(normalized.encode("idna").decode("ascii").lower())
     except (UnicodeError, ValueError):
         raise _FrozenIdentityError("节点主机名格式非法") from None
 
@@ -222,6 +232,9 @@ _GOLDEN_VECTORS = (
     ("v6", "v6 = trojan, [2001:0DB8:0000::0001], 443, password=p # backup node",
      "v6b", "v6b = trojan, 2001:db8::1, 443, password=p",
      "6489872da8054837f3b501ee9e29b8cc8a7b42734476b361bdcae8cc8c797f28"),
+    ("dot", "dot = trojan, example.com。, 443, password=p",
+     "dot2", "dot2 = TROJAN, EXAMPLE.com., 443, password=p",
+     "bad6ef2acb893974c8c9897c770344f0380083496e2bfd8c9048f2c48d66e1b5"),
 )
 
 

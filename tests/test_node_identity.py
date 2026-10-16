@@ -322,3 +322,48 @@ def test_host_with_whitespace_fails_closed():
         stable_node_key({"name": "n", "config": "n = ss, bad host.example, 443, password=x"})
     with pytest.raises(NodeIdentityError):
         stable_node_key({"name": "n", "config": "n = ss, ☃.example\tcom, 443, password=x"})
+
+
+# ===== Fix Round 2：IDNA 根分隔符（U+3002/U+FF0E/U+FF61）统一 =====
+
+def test_unicode_root_separators_equivalent_to_ascii_dot():
+    """U+3002/U+FF0E/U+FF61 尾点经 IDNA 归一后与 ASCII 尾点/无尾点同身份"""
+    forms = [
+        "x = trojan, example.com, 443, password=p",
+        "x = trojan, example.com., 443, password=p",
+        "x = trojan, example.com\u3002, 443, password=p",
+        "x = trojan, example.com\uff0e, 443, password=p",
+        "x = trojan, example.com\uff61, 443, password=p",
+    ]
+    keys = {stable_node_key(parsed_node(name="x", config=f)) for f in forms}
+    assert len(keys) == 1
+
+
+def test_unicode_inner_separators_equivalent():
+    forms = [
+        "x = trojan, example.com, 443, password=p",
+        "x = trojan, example\u3002com, 443, password=p",
+        "x = trojan, example\uff0ecom, 443, password=p",
+        "x = trojan, example\uff61com, 443, password=p",
+    ]
+    keys = {stable_node_key(parsed_node(name="x", config=f)) for f in forms}
+    assert len(keys) == 1
+
+
+@pytest.mark.parametrize("config", [
+    "n = trojan, a.com.., 443, p=q",
+    "n = trojan, a.com\u3002\u3002, 443, p=q",
+    "n = trojan, a.com.\u3002, 443, p=q",
+    "n = trojan, ., 443, p=q",
+    "n = trojan, \u3002, 443, p=q",
+], ids=["ascii-double", "unicode-double", "mixed-double", "bare-dot", "unicode-bare"])
+def test_empty_or_multiple_trailing_dots_fail_closed(config):
+    with pytest.raises(NodeIdentityError):
+        stable_node_key({"name": "n", "config": config})
+
+
+def test_root_separator_failure_does_not_echo_host():
+    secret = "s3cret-host.example.com"
+    with pytest.raises(NodeIdentityError) as excinfo:
+        stable_node_key({"name": "n", "config": f"n = trojan, {secret}\u3002\u3002, 443, p=q"})
+    assert secret not in str(excinfo.value)

@@ -1396,6 +1396,9 @@ def test_0006_frozen_canonicalizer_matches_runtime(tmp_path):
         ("v6", "v6 = trojan, [2001:0DB8:0000::0001], 443, password=p # backup node",
          "v6b", "v6b = trojan, 2001:db8::1, 443, password=p",
          "6489872da8054837f3b501ee9e29b8cc8a7b42734476b361bdcae8cc8c797f28"),
+        ("dot", "dot = trojan, example.com\u3002, 443, password=p",
+         "dot2", "dot2 = TROJAN, EXAMPLE.com., 443, password=p",
+         "bad6ef2acb893974c8c9897c770344f0380083496e2bfd8c9048f2c48d66e1b5"),
     )
     for name_a, first, name_b, second, expected in vectors:
         assert stable_node_key({"name": name_a, "config": first}) == expected

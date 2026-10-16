@@ -125,9 +125,21 @@ def _normalize_token(raw: str) -> str:
     return token
 
 
+def _strip_fqdn_dot(host: str) -> str:
+    """移除单一 FQDN 尾点；空域与多重尾点 fail closed"""
+    if not host:
+        raise NodeIdentityError("节点主机名格式非法")
+    if not host.endswith("."):
+        return host
+    stripped = host[:-1]
+    if not stripped or stripped.endswith("."):
+        raise NodeIdentityError("节点主机名格式非法")
+    return stripped
+
+
 def _normalize_host(raw: str) -> str:
     """主机规范化：IP 文本标准压缩；非 ASCII 域名 NFC→IDNA→小写；
-    单一尾点视为绝对名标记去除"""
+    单一尾点（含 IDNA 归一出的 U+3002/U+FF0E/U+FF61 根分隔符）去除"""
     host = raw
     if any(ch.isspace() for ch in host):
         raise NodeIdentityError("节点主机名格式非法")
@@ -142,15 +154,13 @@ def _normalize_host(raw: str) -> str:
         return str(ipaddress.IPv4Address(host))
     except ValueError:
         pass  # 非点分十进制 IPv4，按域名处理
-    if host.endswith("."):
-        host = host[:-1]  # DNS 绝对名尾点：去除后等价
-    if not host:
-        raise NodeIdentityError("节点主机名格式非法")
     if host.isascii():
-        return host.lower()
+        return _strip_fqdn_dot(host).lower()
     normalized = unicodedata.normalize("NFC", host)
     try:
-        return normalized.encode("idna").decode("ascii").lower()
+        # IDNA 把 U+3002/U+FF0E/U+FF61 统一为 ASCII "."，尾点剥除必须
+        # 在 ASCII 结果上进行，否则 Unicode 尾点与 ASCII 尾点身份分裂
+        return _strip_fqdn_dot(normalized.encode("idna").decode("ascii").lower())
     except (UnicodeError, ValueError):
         raise NodeIdentityError("节点主机名格式非法") from None
 
