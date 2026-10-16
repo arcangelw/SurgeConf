@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# console 回退日志文件名（launchd/nohup 的 stdout/stderr 重定向目标）：
+# 与结构化事件日志 surgeconf.log 同目录但不同文件，杜绝轮转 rename 后
+# 旧 FD 继续写已轮换 inode 的双 writer 问题
+CONSOLE_LOG_FILENAME = "surgeconf-console.log"
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     root: Path
@@ -259,7 +265,8 @@ def harden_runtime_permissions(paths: RuntimePaths) -> None:
     """运行产物权限统一收敛（幂等，bind/连接前调用）。
 
     - root/backups/exports/log_dir：fd no-follow 验证后 fchmod 0700；
-    - live DB 及 -wal/-shm、会话密钥、日志：fd + fstat 验证后 fchmod 0600；
+    - live DB 及 -wal/-shm、会话密钥、事件日志与 console 回退日志：
+      fd + fstat 验证后 fchmod 0600；
     - backups/exports 下的普通文件 fchmod 0600，子目录按目录规则收敛，
       其余类型（socket/fifo/设备/symlink）一律拒绝 —— fail closed。
     """
@@ -267,7 +274,8 @@ def harden_runtime_permissions(paths: RuntimePaths) -> None:
         _harden_directory(directory)
     for file in (paths.database,
                  Path(f"{paths.database}-wal"), Path(f"{paths.database}-shm"),
-                 paths.session_secret, paths.log_file):
+                 paths.session_secret, paths.log_file,
+                 paths.log_dir / CONSOLE_LOG_FILENAME):
         harden_private_file(file)
     for directory in (paths.backups, paths.exports):
         if not os.path.lexists(directory):

@@ -84,7 +84,7 @@ cd SurgeConf
 | `enable` | 注册开机自启 |
 | `disable` | 取消开机自启 |
 | `status` | 查看运行状态 |
-| `log` | 实时查看日志 |
+| `log` | 实时查看结构化事件日志（console 回退日志见运维指南） |
 
 ### 开机自启
 
@@ -94,6 +94,8 @@ cd SurgeConf
 ./surgeconf.sh enable   # 注册开机自启
 ./surgeconf.sh disable  # 取消开机自启
 ```
+
+双实例（工作机/网关）启停、数据备份与日志目录、Surge UI 重载、Logbook / Dashboard 排查、Fast Path 边界与人工验收清单见 [docs/RUNTIME_OPERATIONS.md](docs/RUNTIME_OPERATIONS.md)。
 
 ## 环境变量
 
@@ -105,7 +107,7 @@ cd SurgeConf
 | `SURGE_CONTROLLER_ACCESS` | —（不输出该键） | Surge 外部控制器访问凭据，非空时注入生成的 `[General]`；示例：`example-access-key@127.0.0.1:6160` |
 | `SURGE_HTTP_API` | —（不输出该键） | Surge HTTP API 访问凭据，非空时注入生成的 `[General]`；示例：`example-access-key@127.0.0.1:6166` |
 
-> 凭据键不再内置静态默认值：未设置环境变量且未在配置方案 General 表单中填写时，生成产物不含 `external-controller-access` / `http-api` 行。日志统一写入 `~/Library/Logs/SurgeConf/surgeconf.log`，仓库目录不再产生任何运行数据。
+> 凭据键不再内置静态默认值：未设置环境变量且未在配置方案 General 表单中填写时，生成产物不含 `external-controller-access` / `http-api` 行。日志写入 `~/Library/Logs/SurgeConf/`：结构化事件日志 `surgeconf.log`（应用内私有轮转 handler 独占，5 MB × 3 备份，0600）与 console 回退日志 `surgeconf-console.log`（launchd/nohup 的 stdout/stderr，禁止重定向到前者）。仓库目录不再产生任何运行数据。
 
 ## API 文档
 

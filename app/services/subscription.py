@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, text as sa_text
 
 from app.models import Subscription, ProxyNode
+from app.logging_config import log_event
 from app.services.node_identity import stable_node_key, NodeIdentityError
 
 logger = logging.getLogger(__name__)
@@ -427,6 +428,37 @@ class SyncResult:
         }
 
 
+def emit_sync_log(result: SyncResult, *, subscription_id=None,
+                  url=None, node_config=None) -> None:
+    """SyncResult → 结构化事件日志（唯一记录入口）。
+
+    ``subscription_id``/``url``/``node_config`` 仅为兼容计划期 fixture
+    签名而接受，值在本函数内立即丢弃，绝不进入日志；真实字段全部
+    取自 ``result``（subscription_id/success/counts/error_code）。
+    日志侧任何异常都被吞掉并只向框架 logger 记类型名——已提交的
+    业务事务绝不因日志失败而回滚。
+    """
+    del subscription_id, url, node_config
+    try:
+        counts = {"inserted": result.inserted, "updated": result.updated,
+                  "removed": result.removed}
+        if result.node_count is not None:
+            counts["node_count"] = result.node_count
+        log_event("subscription_sync",
+                  subscription_id=result.subscription_id,
+                  success=result.success,
+                  counts=counts,
+                  error_code=result.error_code)
+    except Exception as exc:  # 日志失败不影响业务事务
+        logger.error("sync event log failed: %s", type(exc).__name__)
+
+
+def _emit_and_return(result: SyncResult) -> SyncResult:
+    """sync_subscription 内部统一收口：每个 SyncResult 完成记录一次。"""
+    emit_sync_log(result)
+    return result
+
+
 _SYNC_INTERVAL_MIN = 300
 _SYNC_INTERVAL_MAX = 604800
 _SYNC_INTERVAL_DEFAULT = 86400
@@ -591,8 +623,8 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
             return SCHEDULE_SKIPPED
         if not record.exists:
             return None
-        return SyncResult(sub_id, False, record.last_node_count, 0, 0, 0,
-                          code, message)
+        return _emit_and_return(SyncResult(
+            sub_id, False, record.last_node_count, 0, 0, 0, code, message))
     except BaseException:
         await _safe_rollback(db)
         raise
@@ -616,7 +648,8 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
             return None
         count = (record.last_node_count if record.last_node_count is not None
                  else last_node_count)
-        return SyncResult(sub_id, False, count, 0, 0, 0, code, message)
+        return _emit_and_return(SyncResult(
+            sub_id, False, count, 0, 0, 0, code, message))
 
     # 阶段 3：单一写事务 upsert（先取 SQLite 写锁，guard/URL 校验与
     # 节点 DML 在同一串行化写事务内，杜绝校验-写入间隙的排期穿透）
@@ -689,8 +722,9 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
         else:
             sub.next_update_at = None
         await db.commit()
-        return SyncResult(sub_id, True, len(prepared), inserted, updated,
-                          removed, None, "同步成功")
+        return _emit_and_return(SyncResult(
+            sub_id, True, len(prepared), inserted, updated,
+            removed, None, "同步成功"))
     except Exception as exc:
         await _safe_rollback(db)
         code, message = safe_sync_error(exc)
@@ -703,7 +737,8 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
             return None
         count = (record.last_node_count if record.last_node_count is not None
                  else last_node_count)
-        return SyncResult(sub_id, False, count, 0, 0, 0, code, message)
+        return _emit_and_return(SyncResult(
+            sub_id, False, count, 0, 0, 0, code, message))
     except BaseException:
         await _safe_rollback(db)
         raise

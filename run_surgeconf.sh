@@ -1,7 +1,10 @@
 #!/bin/bash
 # SurgeConf launchd 包装脚本
 # 由 com.surgeconf.plist 调用（plist 由统一 install 流程生成）。
-# 日志由 launchd StandardOut/ErrorPath 捕获到 ~/Library/Logs/SurgeConf/surgeconf.log。
+# launchd 的 stdout/stderr 由 plist StandardOut/ErrorPath 捕获到
+# ~/Library/Logs/SurgeConf/surgeconf-console.log（console 回退日志）；
+# 结构化事件日志 surgeconf.log 由应用内私有轮转 handler 独占写入，
+# 任何外部重定向都不得指向它（避免轮转 rename 后旧 FD 写错 inode）。
 
 set -euo pipefail
 
@@ -33,8 +36,9 @@ LOG_DIR="$HOME/Library/Logs/SurgeConf"
 sc_ensure_directory "$DATA_DIR"
 sc_ensure_directory "$LOG_DIR"
 
-# launchd 捕获日志前预建 0600（拒绝 symlink/FIFO/socket）
-sc_ensure_log_file "$LOG_DIR/surgeconf.log"
+# launchd 捕获 console 日志前预建 0600（拒绝 symlink/FIFO/socket）；
+# surgeconf.log 是应用内私有轮转 handler 的专属文件，不在此预建/重定向
+sc_ensure_log_file "$LOG_DIR/surgeconf-console.log"
 
 exec "$PROJECT_DIR/venv/bin/python" -m uvicorn app.main:app \
   --host "${SURGE_HOST:-127.0.0.1}" \

@@ -10,14 +10,17 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$PROJECT_DIR/launchd_lib.sh"
 
 PLIST="$HOME/Library/LaunchAgents/com.surgeconf.plist"
-LOG_FILE="$HOME/Library/Logs/SurgeConf/surgeconf.log"
+# launchd 的 StandardOut/ErrorPath 只指向 console 回退日志；结构化事件
+# 日志 surgeconf.log 由应用内私有轮转 handler 独占写入，禁止外部重定向
+CONSOLE_LOG_FILE="$HOME/Library/Logs/SurgeConf/surgeconf-console.log"
+EVENT_LOG_FILE="$HOME/Library/Logs/SurgeConf/surgeconf.log"
 
 # 收紧新建文件权限：数据库/WAL/会话密钥默认仅属主可读写
 umask 077
 
 case "${1:-help}" in
   start)
-    sc_install_launchd "$PLIST" "$PROJECT_DIR" "$LOG_FILE"
+    sc_install_launchd "$PLIST" "$PROJECT_DIR" "$CONSOLE_LOG_FILE"
     echo "SurgeConf 已启动 (launchd 守护模式)"
     ;;
   stop)
@@ -25,7 +28,7 @@ case "${1:-help}" in
     echo "SurgeConf 已停止"
     ;;
   restart)
-    sc_install_launchd "$PLIST" "$PROJECT_DIR" "$LOG_FILE"
+    sc_install_launchd "$PLIST" "$PROJECT_DIR" "$CONSOLE_LOG_FILE"
     echo "SurgeConf 已重启"
     ;;
   run)
@@ -48,8 +51,8 @@ case "${1:-help}" in
     echo "SurgeConf 独立启动中 (前台模式)..."
     echo "访问地址: http://${HOST}:${PORT}/"
     sc_ensure_directory "$DATA_DIR"
-    sc_ensure_directory "$(dirname "$LOG_FILE")"
-    sc_ensure_log_file "$LOG_FILE"
+    sc_ensure_directory "$(dirname "$CONSOLE_LOG_FILE")"
+    sc_ensure_log_file "$CONSOLE_LOG_FILE"
     cd "$PROJECT_DIR" && exec "$PROJECT_DIR/venv/bin/python" -m uvicorn app.main:app \
       --host "$HOST" --port "$PORT" --no-access-log
     ;;
@@ -58,9 +61,9 @@ case "${1:-help}" in
     # 均未设置时按安全默认 127.0.0.1 安装。需要局域网管理：
     #   SURGE_HOST=0.0.0.0 ./surgeconf.sh enable
     # （并先在设置页切换 lan_authenticated 访问模式）
-    sc_install_launchd "$PLIST" "$PROJECT_DIR" "$LOG_FILE"
+    sc_install_launchd "$PLIST" "$PROJECT_DIR" "$CONSOLE_LOG_FILE"
     echo "SurgeConf 已注册开机自启 ($PROJECT_DIR)"
-    echo "日志: ${LOG_FILE}"
+    echo "日志: ${CONSOLE_LOG_FILE}（结构化事件日志: ${EVENT_LOG_FILE}）"
     ;;
   disable)
     launchctl unload "$PLIST" 2>/dev/null || true
@@ -84,7 +87,7 @@ case "${1:-help}" in
     fi
     ;;
   log)
-    tail -f "${LOG_FILE}"
+    tail -F "${EVENT_LOG_FILE}"
     ;;
   help|*)
     echo "用法: ./surgeconf.sh {start|stop|restart|run|enable|disable|status|log}"
@@ -96,7 +99,8 @@ case "${1:-help}" in
     echo "  enable   注册开机自启 (SURGE_HOST=0.0.0.0 开启局域网并持久化)"
     echo "  disable  取消开机自启"
     echo "  status   查看运行状态 (精确 label 判定)"
-    echo "  log      实时查看日志 (~/Library/Logs/SurgeConf/surgeconf.log)"
+    echo "  log      实时查看结构化事件日志 (~/Library/Logs/SurgeConf/surgeconf.log)"
+    echo "           (console 回退日志: ~/Library/Logs/SurgeConf/surgeconf-console.log)"
     echo ""
     echo "控制文件 (~/Library/Application Support/SurgeConf/launchd.env, 0600):"
     echo "持久化 SURGE_HOST/SURGE_PORT/SURGECONF_DATA_DIR/SURGE_CONTROLLER_ACCESS/"

@@ -9,8 +9,9 @@
 
 调度循环：拿到锁后立即执行一轮到期同步，之后每 ``interval`` 秒
 （默认 30）一轮；``stop`` 通过 Event 唤醒后等待任务退出并释放锁。
-单轮意外异常只记录异常类型名（不携带订阅/URL/配置内容）并继续下一
-轮；CancelledError 原样传播，由 ``stop`` 统一收尾。
+单轮/单项意外异常只发结构化安全事件（``scheduler_cycle_error`` /
+``scheduler_item_error``，固定错误码），不记录异常消息或类型名；
+CancelledError 原样传播，由 ``stop`` 统一收尾。
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import Callable
 
 from sqlalchemy import select
 
+from app.logging_config import log_event
 from app.models import Subscription
 from app.services.subscription import (SCHEDULE_SKIPPED, SyncResult,
                                        _utc_naive, sync_subscription)
@@ -93,9 +95,10 @@ class SubscriptionScheduler:
                     if not task.cancelled():
                         task.cancel()
                     # 循环任务被取消（或 stop 自身被取消）：锁必须释放
-                except Exception as exc:
-                    logger.error("scheduler loop stopped with error: %s",
-                                 type(exc).__name__)
+                except Exception:
+                    # 安全事件：固定错误码，不带异常消息或类型名
+                    log_event("scheduler_stop_error",
+                              error_code="internal_error")
         finally:
             self._release_lock()
 
@@ -133,9 +136,10 @@ class SubscriptionScheduler:
                                                      scheduled_next=expected_next)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.error("scheduled sync failed: subscription_id=%s error=%s",
-                             sub_id, type(exc).__name__)
+            except Exception:
+                # 安全事件：固定错误码，不带异常消息或类型名
+                log_event("scheduler_item_error", subscription_id=sub_id,
+                          error_code="internal_error")
                 continue
             if result is None or result is SCHEDULE_SKIPPED:
                 continue
@@ -151,8 +155,10 @@ class SubscriptionScheduler:
                 await self.run_due_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.error("scheduler cycle failed: %s", type(exc).__name__)
+            except Exception:
+                # 安全事件：固定错误码，不带异常消息或类型名
+                log_event("scheduler_cycle_error",
+                          error_code="internal_error")
             try:
                 await asyncio.wait_for(self._wake.wait(),
                                        timeout=self._interval)

@@ -401,7 +401,8 @@ async def test_loop_runs_immediately_and_repeats(sched_db, tmp_path, monkeypatch
 @pytest.mark.asyncio
 async def test_loop_survives_cycle_exception_without_leaking(sched_db, tmp_path,
                                                              monkeypatch, caplog):
-    """单轮意外异常：仅记类型名（不含异常消息/URL），循环继续下一轮"""
+    """单轮意外异常：只发结构化安全事件（固定错误码，不含异常
+    消息/类型名/URL），循环继续下一轮"""
     calls = 0
     failed = asyncio.Event()
     recovered = asyncio.Event()
@@ -417,15 +418,16 @@ async def test_loop_survives_cycle_exception_without_leaking(sched_db, tmp_path,
 
     scheduler = make_scheduler(sched_db, tmp_path / "l.lock", interval=0.05)
     monkeypatch.setattr(scheduler, "run_due_once", flaky_run_due_once)
-    with caplog.at_level(logging.ERROR,
-                         logger="app.services.subscription_scheduler"):
+    with caplog.at_level(logging.INFO, logger="surgeconf.events"):
         assert await scheduler.start() is True
         await asyncio.wait_for(failed.wait(), timeout=2)
         await asyncio.wait_for(recovered.wait(), timeout=2)
         await scheduler.stop()
-    assert "RuntimeError" in caplog.text
+    assert "event=scheduler_cycle_error" in caplog.text
+    assert "error_code=internal_error" in caplog.text
     assert "secret" not in caplog.text
     assert "boom" not in caplog.text
+    assert "RuntimeError" not in caplog.text
 
 
 @pytest.mark.asyncio

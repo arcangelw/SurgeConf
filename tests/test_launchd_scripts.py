@@ -100,7 +100,9 @@ def _paths(tmp_path: Path):
     control_dir = home / "Library" / "Application Support" / "SurgeConf"
     control_env = control_dir / "launchd.env"
     plist = home / "Library" / "LaunchAgents" / "com.surgeconf.plist"
-    log_file = home / "Library" / "Logs" / "SurgeConf" / "surgeconf.log"
+    # launchd 的 StandardOut/ErrorPath 指向 console 回退日志；
+    # 结构化事件日志 surgeconf.log 由应用内私有轮转 handler 独占
+    log_file = home / "Library" / "Logs" / "SurgeConf" / "surgeconf-console.log"
     return home, control_dir, control_env, plist, log_file
 
 
@@ -273,7 +275,7 @@ def test_plist_structure_and_defaults(tmp_path):
     r = run_bash(f"""
         source "$LIB"
         sc_generate_plist "$HOME/p/com.surgeconf.plist" "/proj&dir" \\
-            "$HOME/Library/Logs/SurgeConf/surgeconf.log" 127.0.0.1 61830 \\
+            "$HOME/Library/Logs/SurgeConf/surgeconf-console.log" 127.0.0.1 61830 \\
             "$HOME/Library/Application Support/SurgeConf"
         stat -f '%Lp' "$HOME/p/com.surgeconf.plist"
     """, tmp_path)
@@ -285,7 +287,7 @@ def test_plist_structure_and_defaults(tmp_path):
     assert data["RunAtLoad"] is True
     assert data["KeepAlive"] is True
     assert data["ProgramArguments"] == ["/proj&dir/run_surgeconf.sh"]
-    assert data["StandardOutPath"] == str(home / "Library/Logs/SurgeConf/surgeconf.log")
+    assert data["StandardOutPath"] == str(home / "Library/Logs/SurgeConf/surgeconf-console.log")
     assert data["StandardErrorPath"] == data["StandardOutPath"]
     assert data["EnvironmentVariables"] == {
         "SURGE_HOST": "127.0.0.1",
@@ -311,13 +313,13 @@ def test_plist_escapes_xml_and_rewrites_legacy_fields(tmp_path):
     weird.mkdir()
     r = run_bash(f"""
         source "$LIB"
-        sc_generate_plist "{legacy}" "{weird}" "$HOME/Library/Logs/SurgeConf/surgeconf.log" \\
+        sc_generate_plist "{legacy}" "{weird}" "$HOME/Library/Logs/SurgeConf/surgeconf-console.log" \\
             127.0.0.1 61830 "$HOME/Library/Application Support/SurgeConf"
     """, tmp_path)
     assert r.returncode == 0, r.stderr
     data = plistlib.loads(legacy.read_bytes())
     assert data["EnvironmentVariables"]["SURGE_HOST"] == "127.0.0.1"
-    assert "SurgeConf/surgeconf.log" in data["StandardOutPath"]
+    assert "SurgeConf/surgeconf-console.log" in data["StandardOutPath"]
     assert data["ProgramArguments"] == [f"{weird}/run_surgeconf.sh"]
 
 
@@ -368,7 +370,7 @@ def _install_script():
     return r"""
         source "$LIB"
         sc_install_launchd "$HOME/Library/LaunchAgents/com.surgeconf.plist" "/proj" \
-            "$HOME/Library/Logs/SurgeConf/surgeconf.log"
+            "$HOME/Library/Logs/SurgeConf/surgeconf-console.log"
     """
 
 
@@ -494,7 +496,7 @@ def test_real_start_with_all_unset_replaces_legacy_job(tmp_path, fake_launchctl)
     data = plistlib.loads(plist.read_bytes())
     assert data["EnvironmentVariables"]["SURGE_HOST"] == "127.0.0.1"   # 首次无持久配置→安全默认
     assert data["Umask"] == 63
-    assert "SurgeConf/surgeconf.log" in data["StandardOutPath"]
+    assert "SurgeConf/surgeconf-console.log" in data["StandardOutPath"]
     assert state.exists()                        # load 成功后仍加载
     assert control_env.exists()                  # 控制文件创建于固定路径
     assert control_env.stat().st_mode & 0o777 == 0o600
@@ -745,3 +747,38 @@ def test_ensure_directory_rejects_dotdot_escape(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "REJECTED" in r.stdout
     assert not (tmp_path / "escape").exists()
+
+
+# ===== console 回退日志与结构化事件日志的分离（Task 5）=====
+
+
+def test_console_and_structured_log_paths_are_distinct(tmp_path):
+    """stdout/stderr 只指向 surgeconf-console.log；surgeconf.log 由应用内
+    私有轮转 handler 独占，任何 shell 重定向/预建都不得指向它。"""
+    start = (PROJECT_ROOT / "start.sh").read_text()
+    run_wrapper = (PROJECT_ROOT / "run_surgeconf.sh").read_text()
+    manager = (PROJECT_ROOT / "surgeconf.sh").read_text()
+    for text in (start, run_wrapper, manager):
+        assert "surgeconf-console.log" in text
+    # daemon 重定向与 launchd/包装脚本预建目标一律是 console 文件
+    assert '>> "$LOG_DIR/surgeconf.log"' not in start
+    assert 'sc_ensure_log_file "$LOG_DIR/surgeconf.log"' not in start
+    assert 'sc_ensure_log_file "$LOG_DIR/surgeconf.log"' not in run_wrapper
+    # 管理脚本：launchd 安装传 console；log 子命令跟踪结构化事件日志
+    assert 'sc_install_launchd "$PLIST" "$PROJECT_DIR" "$CONSOLE_LOG_FILE"' in manager
+    assert 'tail -F "${EVENT_LOG_FILE}"' in manager
+    assert 'EVENT_LOG_FILE="$HOME/Library/Logs/SurgeConf/surgeconf.log"' in manager
+
+    # plist 的 StandardOut/ErrPath 指向 console 且不是结构化事件日志
+    home, *_ = _paths(tmp_path)
+    r = run_bash(r"""
+        source "$LIB"
+        sc_generate_plist "$HOME/p/com.surgeconf.plist" "/proj" \
+            "$HOME/Library/Logs/SurgeConf/surgeconf-console.log" \
+            127.0.0.1 61830 "$HOME/Library/Application Support/SurgeConf"
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    data = plistlib.loads((home / "p" / "com.surgeconf.plist").read_bytes())
+    assert data["StandardOutPath"].endswith("surgeconf-console.log")
+    assert data["StandardErrorPath"] == data["StandardOutPath"]
+    assert not data["StandardOutPath"].endswith("/surgeconf.log")
