@@ -3,12 +3,14 @@
 import os
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.bootstrap import lifespan
 from app.pages import router as pages_router
-from app.routers import auth, subscriptions, nodes, groups, configs, general
+from app.routers import (auth, subscriptions, nodes, groups, configs, general,
+                         udp)
 from app.routers import settings as settings_router
 from app.security import (COOKIE_NAME, SESSION_MAX_AGE, Decision,
                           load_access_settings, require_admin_request)
@@ -22,6 +24,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """校验错误最小披露：只保留字段路径/消息/类型，不回显任何输入值。
+
+    Pydantic v2 默认错误结构携带原始 ``input``（如超长 match_value 的
+    完整原值）与 ``ctx``，任何端点的 422 都不得回显请求体内容。
+    """
+    errors = [
+        {"loc": list(err.get("loc", ())), "msg": err.get("msg", ""),
+         "type": err.get("type", "")}
+        for err in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 @app.middleware("http")
 async def admin_boundary_middleware(request: Request, call_next):
@@ -66,6 +82,7 @@ app.include_router(subscriptions.router)
 app.include_router(nodes.router)
 app.include_router(groups.router)
 app.include_router(configs.router)
+app.include_router(udp.router)
 app.include_router(general.router)
 app.include_router(settings_router.router)
 app.include_router(auth.router)
