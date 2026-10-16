@@ -3,7 +3,9 @@
 覆盖：到期选择矩阵与排序边界、逐项独立会话同步与失败隔离、选择
 查询事务不跨网络拉取、时钟 UTC 规范、flock 进程互斥与释放接管、
 锁文件权限/普通文件/symlink 拒绝、start/stop 幂等、循环立即执行
-与可注入短间隔、轮次异常继续、取消传播、无 pending task。
+与可注入短间隔、轮次异常继续、取消传播、无 pending task、写锁
+串行化窗口（用户先锁→sync 排队 skip；sync 先锁→用户等待最终
+胜出）与取消路径写锁释放（barrier 确定性，无耗时碰运气）。
 """
 
 import asyncio
@@ -773,65 +775,196 @@ async def test_failure_record_waits_for_held_write_lock_then_skips(
     assert sub.next_update_at == far
 
 
+# ===== 确定性写锁窗口：barrier 事件取代耗时碰运气（Fix Round 4） =====
+
+
+class _WriteLockGate:
+    """确定性写锁闸门：拦住首个 BEGIN IMMEDIATE 语句。
+
+    mode="after_begin"：语句真实执行返回后 acquired.set()，协程停在
+    release.wait()——此刻 SQLite 写锁确已持有（BEGIN 之后的
+    SELECT/flush/commit 途中被取消的窗口即此处）。
+    mode="before_begin"：acquired.set() 后先停在 release.wait()，语句
+    尚未发出（BEGIN 自身被取消的路径，锁从未持有）。
+    """
+
+    def __init__(self, mode="after_begin"):
+        self.mode = mode
+        self.acquired = asyncio.Event()
+        self.release = asyncio.Event()
+        self.armed = True
+
+
+class _GatedSession:
+    """AsyncSession 包装：仅拦截闸门关注的 BEGIN IMMEDIATE，其余转发"""
+
+    def __init__(self, inner, gate):
+        self._inner = inner
+        self._gate = gate
+
+    async def execute(self, statement, *args, **kwargs):
+        if (self._gate.armed
+                and str(statement).strip().upper() == "BEGIN IMMEDIATE"):
+            self._gate.armed = False
+            if self._gate.mode == "before_begin":
+                self._gate.acquired.set()
+                await self._gate.release.wait()
+            result = await self._inner.execute(statement, *args, **kwargs)
+            if self._gate.mode == "after_begin":
+                self._gate.acquired.set()
+                await self._gate.release.wait()
+            return result
+        return await self._inner.execute(statement, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _GatedSessionContext:
+    def __init__(self, cm, gate):
+        self._cm = cm
+        self._gate = gate
+
+    async def __aenter__(self):
+        return _GatedSession(await self._cm.__aenter__(), self._gate)
+
+    async def __aexit__(self, *exc):
+        return await self._cm.__aexit__(*exc)
+
+
+class _GatedDatabase:
+    """duck-typed DatabaseRuntime：session_factory 产出的 session 过闸门"""
+
+    def __init__(self, inner, gate):
+        self._inner = inner
+        self.gate = gate
+
+    @property
+    def session_factory(self):
+        inner, gate = self._inner.session_factory, self.gate
+
+        def factory():
+            return _GatedSessionContext(inner(), gate)
+
+        return factory
+
+
 @pytest.mark.asyncio
-async def test_success_phase3_write_lock_blocks_concurrent_reschedule(
-        sched_db, tmp_path, monkeypatch):
-    """成功 phase3 窗口：sync BEGIN IMMEDIATE 持锁后发起的并发排期更新
-    被写锁挡住（不穿透、guard 不误判），sync 正常提交 500 节点；随后
-    用户更新获锁提交，最终排期为用户值（用户更新最终胜出）"""
-    from sqlalchemy import event as sa_event, text as sa_text
+@pytest.mark.parametrize("gate_mode", ["after_begin", "before_begin"])
+async def test_cancelled_failure_record_releases_write_lock(
+        sched_db, monkeypatch, gate_mode, caplog):
+    """取消释放写锁：失败记录事务已成功执行 BEGIN IMMEDIATE（或尚未
+    发出）并停在后续 await 时取消任务——CancelledError 原样传播不被
+    吞；被测 session 保持打开（不靠连接回收兜底），第二独立 session
+    在 2s 内成功 BEGIN IMMEDIATE + 写入，证明写锁已由 best-effort
+    rollback 释放；取消不记失败状态、不打 error 日志（不泄异常文本）"""
+    import httpx as httpx_mod
+    from sqlalchemy import text as sa_text
 
-    from app.models import ProxyNode
+    from app.services.subscription import sync_subscription
     sub_id = await add_subscription(sched_db, next_update_at=UTC_NOW_NAIVE)
-    user_value = UTC_NOW_NAIVE + timedelta(seconds=7200)
-    user_done = asyncio.Event()
-    fired = {"lock_seen": False}
+    probe = UTC_NOW_NAIVE + timedelta(days=3)
 
-    # 500 个全新连接身份：拉长 phase3 持锁窗口（500 次 INSERT 往返）
-    bulk = [{"name": f"Bulk{i}", "node_type": "trojan", "server": f"10.0.{i // 250}.{i % 250}",
-             "port": 443,
-             "config": f"Bulk{i} = trojan, 10.0.{i // 250}.{i % 250}, 443, password=p"}
-            for i in range(500)]
+    async def timeout_fetch(url):
+        raise httpx_mod.TimeoutException("synthetic timeout")
 
-    async def user_update():
-        async with sched_db.session_factory() as db:
-            await db.execute(sa_update(Subscription)
-                             .where(Subscription.id == sub_id)
-                             .values(update_interval=7200, next_update_at=user_value))
-            await db.commit()
-        user_done.set()
-
-    def on_before_cursor(conn, cursor, statement, params, context, executemany):
-        # sync 的写事务首条语句：此刻发起用户更新——它只能在本语句
-        # （已在 db 线程队列头）获锁之后到达 SQLite，必然排队等待
-        if (not fired["lock_seen"]
-                and statement.strip().upper().startswith("BEGIN IMMEDIATE")):
-            fired["lock_seen"] = True
-            asyncio.get_running_loop().create_task(user_update())
-
-    sa_event.listen(sched_db.engine.sync_engine, "before_cursor_execute",
-                    on_before_cursor)
-
-    async def bulk_fetch(url):
-        return bulk
-
+    monkeypatch.setattr(subscription_service, "fetch_subscription", timeout_fetch)
+    gate = _WriteLockGate(mode=gate_mode)
+    # 裸 session（不经调度器生命周期）：锁释放只能归因于
+    # _record_failed_attempt 自身的 BaseException rollback，
+    # 而非 session 关闭 / 连接池回收的兜底行为
+    real = sched_db.session_factory()
     try:
-        monkeypatch.setattr(subscription_service, "fetch_subscription", bulk_fetch)
-        scheduler = make_scheduler(sched_db, tmp_path / "l.lock",
-                                   clock=lambda: UTC_NOW)
-        results = await asyncio.wait_for(scheduler.run_due_once(), timeout=30)
-    finally:
-        sa_event.remove(sched_db.engine.sync_engine, "before_cursor_execute",
-                        on_before_cursor)
+        task = asyncio.create_task(
+            sync_subscription(_GatedSession(real, gate), sub_id,
+                              now=UTC_NOW_NAIVE, scheduled_next=UTC_NOW_NAIVE))
+        await asyncio.wait_for(gate.acquired.wait(), timeout=5)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    assert fired["lock_seen"], "测试未观察到写锁获取点"
-    # sync 持锁完成全部 upsert：若用户更新曾穿透提交，guard 会转 skip
-    assert [(r.success, r.node_count) for r in results] == [(True, 500)]
-    await asyncio.wait_for(user_done.wait(), timeout=10)
+        async def takeover():
+            async with sched_db.session_factory() as db:
+                await db.execute(sa_text("BEGIN IMMEDIATE"))
+                await db.execute(sa_update(Subscription)
+                                 .where(Subscription.id == sub_id)
+                                 .values(next_update_at=probe))
+                await db.commit()
+
+        # 锁若遗留：BEGIN IMMEDIATE 将等满 busy_timeout（5s）后失败
+        await asyncio.wait_for(takeover(), timeout=2.0)
+    finally:
+        await real.close()
+
     async with sched_db.session_factory() as db:
         sub = await db.get(Subscription, sub_id)
-        count = (await db.execute(
-            sa_select(ProxyNode).where(ProxyNode.subscription_id == sub_id))
-        ).scalars().all()
-    assert len(count) == 500
-    assert sub.next_update_at == user_value, "用户更新最终胜出（未被 sync 覆盖）"
+    assert sub.last_attempt_at is None, "取消不记失败状态"
+    assert sub.last_error_code is None
+    assert sub.next_update_at == probe
+    assert "failure state write failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sync_first_write_lock_holds_user_update_waits_user_wins(
+        sched_db, tmp_path, monkeypatch):
+    """sync 先获锁（确定性 barrier）：被测 sync session 的
+    execute(BEGIN IMMEDIATE) 真实返回后才 set acquired 并暂停；第二
+    session 的用户更新已进入写操作（started 事件）却 pending 等锁、
+    未 commit（独立读仍为旧值）；放行后 sync 提交、用户更新随后获锁
+    写入——最终排期为用户值。不依赖 before_cursor_execute 钩子、
+    500 节点耗时或 sleep 碰运气"""
+    from app.models import ProxyNode
+
+    sub_id = await add_subscription(sched_db, next_update_at=UTC_NOW_NAIVE)
+    user_value = UTC_NOW_NAIVE + timedelta(seconds=7200)
+    gate = _WriteLockGate(mode="after_begin")
+    user_write_started = asyncio.Event()
+    user_done = asyncio.Event()
+
+    async def ok_fetch(url):
+        return [NODE_PAYLOAD]
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription", ok_fetch)
+
+    async def user_update():
+        async with sched_db.session_factory() as udb:
+            user_write_started.set()  # 已进入写操作：UPDATE 即将发出
+            await udb.execute(sa_update(Subscription)
+                              .where(Subscription.id == sub_id)
+                              .values(update_interval=7200,
+                                      next_update_at=user_value))
+            await udb.commit()
+        user_done.set()
+
+    scheduler = make_scheduler(_GatedDatabase(sched_db, gate),
+                               tmp_path / "l.lock", clock=lambda: UTC_NOW)
+    sync_task = asyncio.create_task(scheduler.run_due_once())
+    await asyncio.wait_for(gate.acquired.wait(), timeout=5)
+
+    # sync 持锁暂停期间发起用户更新，确认其已进入写操作且被锁挡住：
+    user_task = asyncio.create_task(user_update())
+    await asyncio.wait_for(user_write_started.wait(), timeout=5)
+    assert not sync_task.done(), "sync 仍被 barrier 暂停（持锁未提交）"
+    assert not user_task.done(), "用户更新应等待写锁（不得穿透）"
+    async with sched_db.session_factory() as rd:
+        current = (await rd.execute(
+            sa_select(Subscription.next_update_at)
+            .where(Subscription.id == sub_id))).scalar_one()
+    assert current == UTC_NOW_NAIVE, "用户更新尚未 commit（无脏读）"
+
+    gate.release.set()  # 放行：guard/URL 校验、upsert、提交
+    results = await asyncio.wait_for(sync_task, timeout=10)
+    # 若用户更新曾穿透提交，guard 会转 skip 使 success 断言失败
+    assert [(r.success, r.node_count) for r in results] == [(True, 1)]
+    await asyncio.wait_for(user_done.wait(), timeout=10)
+    await user_task
+
+    async with sched_db.session_factory() as db:
+        sub = await db.get(Subscription, sub_id)
+        nodes = (await db.execute(sa_select(ProxyNode)
+                                  .where(ProxyNode.subscription_id == sub_id))
+                 ).scalars().all()
+    assert len(nodes) == 1, "sync 结果已落库"
+    assert sub.next_update_at == user_value, "最终用户排期胜出（未被 sync 覆盖）"
+    assert sub.update_interval == 7200

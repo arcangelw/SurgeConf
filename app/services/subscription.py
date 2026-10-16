@@ -480,6 +480,10 @@ async def _record_failed_attempt(db: AsyncSession, sub_id: int,
     仍 enabled+auto、next==expected 且对 now 仍到期；不满足返回
     skipped=True（绝不改 attempt/error/next，调用方转 SCHEDULE_SKIPPED）。
     校验与写入在同一写锁事务内串行化（无先查后另事务写）。
+
+    取消类异常（CancelledError/SystemExit 等 BaseException，含 BEGIN
+    自身、SELECT/flush/commit 途中被取消）：尽力回滚释放写锁后原样
+    传播——不吞取消、不记失败状态、不泄漏异常文本。
     """
     try:
         # 显式写事务：guard SELECT 与状态 DML 之间不允许并发排期写入
@@ -514,6 +518,12 @@ async def _record_failed_attempt(db: AsyncSession, sub_id: int,
         await db.rollback()
         logger.error("subscription %s failure state write failed: code=%s", sub_id, code)
         return _FailureRecord(exists=True, last_node_count=None)
+    except BaseException:
+        # CancelledError 等取消类：BEGIN IMMEDIATE 可能已持 SQLite 写锁
+        # （含语句已交由驱动线程执行、响应未回的取消），best-effort
+        # rollback 释放后原样传播；_safe_rollback 吞二次异常防覆盖
+        await _safe_rollback(db)
+        raise
 
 
 async def sync_subscription(db: AsyncSession, sub_id: int,
