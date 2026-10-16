@@ -143,34 +143,54 @@ async def _migrate_no_resolve_keywords(db) -> int:
 
 
 async def _migrate_dangling_rule_source_actions(db) -> int:
-    """规则源 action 引用「按当前组表状态确定不会生成」的策略 → 修为 Global。
+    """历史默认 Stream EU/KR 四条规则源的悬空 action 修复 → Global。
 
-    历史 DEFAULT_RULE_SOURCES 曾把英/韩流媒体指向默认关闭的地区组（英国/韩国
-    auto/manual 均关，组不生成），旧产物实际引用了 Surge 无法解析的策略名；
-    生成器引用校验上线后这类库将无法产出配置。本迁移只修确定悬空的引用：
-    组不存在、被禁用、地区组 auto/manual 全关均视为不会生成；用户已开启的
-    组（如显式启用英国）保留其原选择。CustomRule 的历史坏引用属用户手写
-    内容，不自动改写，由生成时校验显式报错指引修复。
+    旧版 DEFAULT_RULE_SOURCES 曾把英/韩流媒体指向默认关闭的地区组（英国/
+    韩国 auto/manual 均关，组不生成），旧产物实际引用了 Surge 无法解析的
+    策略名；生成器引用校验上线后这类库将无法产出配置。
+
+    严格限定修复范围，绝不波及用户数据：
+    - 仅限四条历史内置记录，且须同时匹配稳定内置签名（name + source URL +
+      rule_type）足以与用户自定义同名记录区分；
+    - action 仍是旧值（英国/韩国）——用户改过 action 即视为有意，不动；
+    - 用户禁用的规则源不动（enabled=False）；
+    - 对应地区组当前确实不会生成（组不存在/被禁用/auto+manual 全关）才修；
+      用户已显式开启英韩组则保留原选择。
+    其余任何规则源（有效节点 action、自定义 action 等）一律不改写；
+    CustomRule 的坏引用属用户手写内容，由生成时校验显式报错指引修复。
     """
     from app.models import RegionGroup, ServiceGroup
 
-    regions = (await db.execute(select(RegionGroup))).scalars().all()
-    services = (await db.execute(select(ServiceGroup))).scalars().all()
-    generated = set(BUILTIN_ACTIONS)
-    generated.update(
-        rg.name for rg in regions if rg.enabled and (rg.auto_enabled or rg.manual_enabled))
-    generated.update(sg.name for sg in services if sg.enabled)
-    # 组合组逻辑名：生成条件依赖地区组拓扑，视为可引用；如有误留由生成校验兜底
-    generated.update({"全部节点", "自动选择", "代理", "手动选择", "其他", "其他手动"})
+    # 历史内置悬空签名：(name, source URL, rule_type, legacy_action, group)
+    legacy_stream = (
+        ("Stream EU (non_ip)", "https://ruleset.skk.moe/List/non_ip/stream_eu.conf", "RULE-SET", "英国"),
+        ("Stream EU (ip)", "https://ruleset.skk.moe/List/ip/stream_eu.conf", "RULE-SET", "英国"),
+        ("Stream KR (non_ip)", "https://ruleset.skk.moe/List/non_ip/stream_kr.conf", "RULE-SET", "韩国"),
+        ("Stream KR (ip)", "https://ruleset.skk.moe/List/ip/stream_kr.conf", "RULE-SET", "韩国"),
+    )
+    by_name = {item[0]: item for item in legacy_stream}
 
+    regions = {rg.name: rg for rg in (await db.execute(select(RegionGroup))).scalars().all()}
+    services = (await db.execute(select(ServiceGroup))).scalars().all()
     # 回退目标优先恒生成的 Global 服务组；用户删光服务组时退到内置 DIRECT
-    fallback = "Global" if "Global" in generated else "DIRECT"
+    fallback = "Global" if any(sg.name == "Global" and sg.enabled for sg in services) else "DIRECT"
 
     fixed = 0
-    for rs in (await db.execute(select(RuleSource))).scalars().all():
-        if rs.action and rs.action not in generated:
-            rs.action = fallback
-            fixed += 1
+    candidates = (await db.execute(
+        select(RuleSource).where(RuleSource.name.in_(by_name))
+    )).scalars().all()
+    for rs in candidates:
+        _, url, rule_type, legacy_action = by_name[rs.name]
+        if not rs.enabled:
+            continue  # 用户禁用的记录不动
+        if rs.url != url or rs.rule_type != rule_type or rs.action != legacy_action:
+            continue  # 签名不完全匹配（用户自定义同名记录 / 已改过 action）
+        rg = regions.get(legacy_action)
+        group_generated = rg is not None and rg.enabled and (rg.auto_enabled or rg.manual_enabled)
+        if group_generated:
+            continue  # 组会生成：引用有效，保留用户选择
+        rs.action = fallback
+        fixed += 1
     return fixed
 
 

@@ -289,6 +289,40 @@ class TestGroupNameSinks:
         assert "AI服务" in sinks.service
         assert "全部节点" in sinks.combined and "自动选择" in sinks.combined
 
+    def test_member_refs_structured_per_group(self):
+        """成员引用按组结构化登记：include-other-group、组合组成员、服务组成员"""
+        from app.services.generator import GroupNameSinks
+
+        regions = [_make_region("香港", "港|HK"), _make_region("美国", "美|US")]
+        nodes = [_make_node("US-01")]
+        nodes[0].pinned_services = ["AI服务"]
+        services = [_make_service("AI服务", ["自动选择", "美国"])]
+        sinks = GroupNameSinks()
+        _build_proxy_groups(nodes, regions, services, _t_zh, {}, name_sinks=sinks)
+
+        pairs = {(ref.group, ref.member) for ref in sinks.member_refs}
+        # include-other-group 引用「全部节点」
+        assert ("香港", "全部节点") in pairs and ("香港手动", "全部节点") in pairs
+        # 组合组成员（输出名形态）
+        assert ("自动选择", "香港") in pairs and ("自动选择", "美国") in pairs
+        assert ("代理", "自动选择") in pairs and ("代理", "香港手动") in pairs
+        assert ("手动选择", "大陆直连") in pairs and ("手动选择", "自动选择") in pairs
+        # 服务组成员：pinned 节点显示名 + 策略显示名
+        assert ("AI服务", "US-01") in pairs
+        assert ("AI服务", "自动选择") in pairs and ("AI服务", "美国") in pairs
+        # 组行选项（url/interval/regex-filter 等）不是成员，不得出现
+        assert not any(ref.member.startswith(("http", "policy-regex", "include-all"))
+                       for ref in sinks.member_refs)
+
+    def test_member_refs_include_builtin_direct(self):
+        from app.services.generator import GroupNameSinks
+
+        services = [_make_service("大陆直连", ["DIRECT"])]
+        sinks = GroupNameSinks()
+        _build_proxy_groups([], [], services, _t_zh, {}, name_sinks=sinks)
+        assert any(ref.group == "大陆直连" and ref.member == "DIRECT"
+                   for ref in sinks.member_refs)
+
     def test_sinks_optional(self):
         # 不传 name_sinks（单测直调）行为不变
         lines = _build_proxy_groups([], [], [], _t_zh, {})

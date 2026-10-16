@@ -2,8 +2,12 @@
 
 覆盖：
 - 规则文本策略段提取（含 no-resolve / 逻辑规则嵌套逗号 / FINAL 位置差异 / fail closed）
-- final_action 直通 FINAL 行（zh/en 翻译、空值与未知值拒绝）
+- final_action 直通 FINAL 行（zh/en 翻译、空值/纯空白与未知值拒绝、trim 恰一次共享）
 - 规则源 / 前置与通用自定义规则引用校验（disabled 服务组不可引用）
+- 策略组成员引用校验（disabled 依赖、pinned 节点被信息关键词过滤、
+  合法 DIRECT 与组行选项不误判）
+- canonical 对照：内置动作/节点名原样（不翻译）、组逻辑名翻译、
+  同名节点与组的冲突取节点优先
 - 多错误聚合一次抛出；生成路由 422 且不产出部分配置 / 部分文件
 - 订阅边界：无效 token 永远 404，配置错误只在 token 验证后 422
 """
@@ -18,10 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from unittest.mock import patch
 
 from app.default_config import locale_translate
-from app.models import ConfigProfile, CustomRule, RuleSource, ServiceGroup
+from app.models import ConfigProfile, CustomRule, ProxyNode, RuleSource, ServiceGroup
 from app.services.config_validation import (
     BUILTIN_ACTIONS,
     GenerationContext,
+    GroupMemberRef,
     InvalidConfiguration,
     RuleActionRef,
     extract_rule_action,
@@ -108,6 +113,13 @@ class TestTranslateRuleAction:
                                      lambda n: locale_translate(n, "en"))
         assert line == "DOMAIN-SUFFIX,example.com,AI"
 
+    def test_resolve_translator_keeps_node_name_verbatim(self):
+        # 输出流与校验同源：t 传 resolve 版翻译时，精确命中节点名的策略原样
+        nodes = frozenset({"香港"})
+        resolver = lambda n: n if n in BUILTIN_ACTIONS or n in nodes else locale_translate(n, "en")
+        line = translate_rule_action("DOMAIN,hk-node.example,香港", resolver)
+        assert line == "DOMAIN,hk-node.example,香港"
+
     def test_logic_rule_translated_and_reassembled(self):
         rule = "AND,((PROTOCOL,UDP), (DEST-PORT,3478)),REJECT"
         assert translate_rule_action(rule, lambda n: locale_translate(n, "zh")) == rule
@@ -122,7 +134,8 @@ class TestTranslateRuleAction:
 
 
 def _ctx(locale="zh", nodes=(), regions=(), services=(), combined=(),
-         actions=(), final_action="手动选择", target="mac_workstation"):
+         actions=(), members=(), final_action="手动选择", target="mac_workstation"):
+    # 名字集合语义 = 本次实际输出名（节点显示名 / t() 翻译后的组名）
     return GenerationContext(
         locale=locale,
         target=target,
@@ -131,6 +144,7 @@ def _ctx(locale="zh", nodes=(), regions=(), services=(), combined=(),
         service_group_names=frozenset(services),
         combined_group_names=frozenset(combined),
         rule_actions=tuple(actions),
+        group_members=tuple(members),
         final_action=final_action,
     )
 
@@ -138,24 +152,29 @@ def _ctx(locale="zh", nodes=(), regions=(), services=(), combined=(),
 class TestValidateGeneratedReferences:
     def test_valid_context_passes(self):
         ctx = _ctx(
-            services=("AI服务", "兜底"),
+            services=("AI服务", "兜底", "大陆直连"),
             regions=("美国",),
             combined=("手动选择", "自动选择"),
             actions=(RuleActionRef("规则源「OpenAI」", "AI服务"),
                      RuleActionRef("前置规则", "REJECT-NO-DROP"),
                      RuleActionRef("通用规则", "美国")),
+            members=(GroupMemberRef("兜底", "大陆直连"),
+                     GroupMemberRef("自动选择", "美国"),
+                     GroupMemberRef("手动选择", "大陆直连")),
             final_action="兜底",
         )
         validate_generated_references(ctx)  # 不抛即通过
 
     def test_builtin_actions_always_available(self):
         for action in BUILTIN_ACTIONS:
-            ctx = _ctx(actions=(RuleActionRef("r", action),), final_action="手动选择")
+            ctx = _ctx(actions=(RuleActionRef("r", action),),
+                       combined=("手动选择",), members=(GroupMemberRef("g", action),),
+                       final_action="手动选择")
             validate_generated_references(ctx)
 
-    def test_english_locale_compares_translated_names(self):
-        # zh 数据库逻辑名 + en 输出：校验与输出共用同一翻译
-        ctx = _ctx(locale="en", services=("AI服务",), combined=("手动选择",),
+    def test_english_locale_compares_output_names(self):
+        # 集合是 en 输出名（AI / NoAuto）；逻辑引用经同一解析流翻译后命中
+        ctx = _ctx(locale="en", services=("AI",), combined=("NoAuto",),
                    actions=(RuleActionRef("规则源「OpenAI」", "AI服务"),),
                    final_action="手动选择")
         validate_generated_references(ctx)
@@ -167,6 +186,21 @@ class TestValidateGeneratedReferences:
         with pytest.raises(InvalidConfiguration) as ei:
             validate_generated_references(ctx)
         assert any("AI" in e for e in ei.value.errors)
+
+    def test_node_reference_not_translated_in_english(self):
+        # 节点名「香港」在 en 档案不翻译：引用原样命中实际节点输出名
+        ctx = _ctx(locale="en", nodes=("香港",), regions=("Hong Kong",),
+                   combined=("NoAuto",),
+                   actions=(RuleActionRef("自定义规则", "香港"),),
+                   final_action="手动选择")
+        validate_generated_references(ctx)
+
+    def test_node_name_wins_over_same_named_group(self):
+        # 同名冲突取节点优先（既有产品预期）：节点「香港」与地区组「香港」
+        # 并存时，规则引用解析为节点名而不是翻译后的组名
+        from app.services.config_validation import resolve_policy_reference
+        resolved = resolve_policy_reference("香港", "en", frozenset({"香港"}))
+        assert resolved == "香港"
 
     def test_missing_group_reported_with_source(self):
         ctx = _ctx(combined=("手动选择",),
@@ -189,17 +223,11 @@ class TestValidateGeneratedReferences:
                 validate_generated_references(ctx)
             assert any("final_action" in e for e in ei.value.errors)
 
-    def test_builtin_actions_always_available(self):
-        for action in BUILTIN_ACTIONS:
-            ctx = _ctx(actions=(RuleActionRef("r", action),),
-                       combined=("手动选择",), final_action="手动选择")
-            validate_generated_references(ctx)
     def test_unknown_final_action_rejected(self):
         ctx = _ctx(final_action="幽灵组")
         with pytest.raises(InvalidConfiguration) as ei:
             validate_generated_references(ctx)
         assert any("幽灵组" in e and "final_action" in e for e in ei.value.errors)
-
 
     def test_disabled_group_name_not_in_available(self):
         # 被禁用的服务组：context 不含该名字 → 引用即错
@@ -219,16 +247,47 @@ class TestValidateGeneratedReferences:
             actions=(RuleActionRef("规则源「A」", "幽灵组A"),
                      RuleActionRef("前置规则「B」", "幽灵组B"),
                      RuleActionRef("通用规则「C」", None)),
+            members=(GroupMemberRef("苹果服务", "香港"),),
             final_action="幽灵组F",
         )
         with pytest.raises(InvalidConfiguration) as ei:
             validate_generated_references(ctx)
         errors = ei.value.errors
-        assert len(errors) == 4
+        assert len(errors) == 5
         assert any("幽灵组A" in e for e in errors)
         assert any("幽灵组B" in e for e in errors)
         assert any("规则「C」" in e or "C" in e for e in errors)
+        assert any("苹果服务" in e and "香港" in e for e in errors)
         assert any("final_action" in e for e in errors)
+
+
+class TestGroupMemberValidation:
+    def test_dangling_member_reported_with_group(self):
+        ctx = _ctx(combined=("手动选择",),
+                   members=(GroupMemberRef("苹果服务", "香港"),))
+        with pytest.raises(InvalidConfiguration) as ei:
+            validate_generated_references(ctx)
+        assert any("苹果服务" in e and "香港" in e for e in ei.value.errors)
+
+    def test_direct_member_is_valid(self):
+        ctx = _ctx(services=("大陆直连",), combined=("手动选择",),
+                   members=(GroupMemberRef("大陆直连", "DIRECT"),),
+                   final_action="手动选择")
+        validate_generated_references(ctx)
+
+    def test_node_member_matches_output_name(self):
+        ctx = _ctx(nodes=("(机场A) HK-01",), combined=("手动选择",),
+                   members=(GroupMemberRef("AI服务", "(机场A) HK-01"),),
+                   final_action="手动选择")
+        validate_generated_references(ctx)
+
+    def test_english_group_output_name_member(self):
+        # 成员登记的是输出名（en 翻译后），直接对照不再翻译
+        ctx = _ctx(locale="en", regions=("United States Manual",), combined=("NoAuto",),
+                   members=(GroupMemberRef("兜底", "United States Manual"),
+                            GroupMemberRef("手动选择", "NoAuto")),
+                   final_action="手动选择")
+        validate_generated_references(ctx)
 
 
 class TestTranslatePolicyName:
@@ -256,6 +315,23 @@ class TestFinalActionIntegration:
         await _set_final_action(db, default_profile, "手动选择")
         config = await generate_surge_config(db, default_profile.id, locale_override="en")
         assert "FINAL,NoAuto,dns-failed" in config
+
+    @pytest.mark.asyncio
+    async def test_final_action_whitespace_trimmed_once_and_shared(self, db, default_profile):
+        """前后空白只 trim 一次，校验与 FINAL 输出共享同一值（逐字一致）"""
+        await _set_final_action(db, default_profile, "  手动选择  ")
+        config = await generate_surge_config(db, default_profile.id)
+        assert "FINAL,手动选择,dns-failed" in config
+        # FINAL 行与校验名逐字一致：策略段不得残留前后空白
+        final_lines = [l for l in config.splitlines() if l.startswith("FINAL,")]
+        assert final_lines == ["FINAL,手动选择,dns-failed"]
+
+    @pytest.mark.asyncio
+    async def test_final_action_whitespace_only_aborts(self, db, default_profile):
+        await _set_final_action(db, default_profile, "   ")
+        with pytest.raises(InvalidConfiguration) as ei:
+            await generate_surge_config(db, default_profile.id)
+        assert any("final_action" in e for e in ei.value.errors)
 
     @pytest.mark.asyncio
     async def test_empty_final_action_aborts(self, db, default_profile):
@@ -352,6 +428,35 @@ class TestReferenceValidationIntegration:
         assert any("SHORT-RULE" in e for e in ei.value.errors)
 
     @pytest.mark.asyncio
+    async def test_rule_reference_to_node_name_english_locale(self, db):
+        """规则 action 引用节点名：en 档案下原样保留（节点名不翻译）"""
+        db.add(ProxyNode(name="HK-Premium", node_type="trojan", server="203.0.113.20",
+                         port=443, config="HK-Premium = trojan, 203.0.113.20, 443, password=x",
+                         enabled=True))
+        db.add(CustomRule(rule_text="DOMAIN,node-route.example,HK-Premium",
+                          position="general", sort_order=50, enabled=True))
+        await db.commit()
+        config = await generate_surge_config(db, locale_override="en")
+        assert "DOMAIN,node-route.example,HK-Premium" in config
+
+    @pytest.mark.asyncio
+    async def test_node_named_as_region_resolves_to_node(self, db):
+        """冲突锁定：节点名与地区组同名（香港）时，规则引用解析为节点名。
+
+        en 档案下输出保留「香港」（[Proxy] 段的实际节点名），不误翻为
+        组显示名 Hong Kong；地区组行本身仍正常翻译。
+        """
+        db.add(ProxyNode(name="香港", node_type="trojan", server="203.0.113.99",
+                         port=443, config="香港 = trojan, 203.0.113.99, 443, password=x",
+                         enabled=True))
+        db.add(CustomRule(rule_text="DOMAIN,hk-node.example,香港",
+                          position="general", sort_order=60, enabled=True))
+        await db.commit()
+        config = await generate_surge_config(db, locale_override="en")
+        assert "DOMAIN,hk-node.example,香港" in config
+        assert '"Hong Kong" = url-test,' in config  # 地区组照常翻译
+
+    @pytest.mark.asyncio
     async def test_multiple_errors_reported_together(self, db, default_profile):
         await _set_final_action(db, default_profile, "幽灵组F")
         db.add(RuleSource(name="坏源一", url="https://example.com/a.list",
@@ -383,6 +488,53 @@ class TestReferenceValidationIntegration:
             config = await generate_surge_config(db, profile.id)
             assert "FINAL,手动选择,dns-failed" in config
 
+
+class TestGroupGraphValidationIntegration:
+    @pytest.mark.asyncio
+    async def test_disabled_region_referenced_by_service_group_aborts(self, db):
+        """禁用的地区组仍被服务组 policies 引用 → 组图悬空，生成中止"""
+        from app.models import RegionGroup
+        await db.execute(update(RegionGroup).where(RegionGroup.name == "香港")
+                         .values(enabled=False))
+        await db.commit()
+        with pytest.raises(InvalidConfiguration) as ei:
+            await generate_surge_config(db)
+        errors = "\n".join(ei.value.errors)
+        assert "苹果服务" in errors and "香港" in errors
+
+    @pytest.mark.asyncio
+    async def test_disabled_service_group_breaks_dependent_groups_aborts(self, db):
+        """禁用「大陆直连」服务组：引用它的组合组（手动选择）与服务组悬空"""
+        await db.execute(
+            update(ServiceGroup).where(ServiceGroup.name == "大陆直连").values(enabled=False))
+        await db.commit()
+        with pytest.raises(InvalidConfiguration) as ei:
+            await generate_surge_config(db)
+        errors = "\n".join(ei.value.errors)
+        assert "手动选择" in errors  # 组合组成员悬空
+        assert "大陆直连" in errors
+
+    @pytest.mark.asyncio
+    async def test_pinned_node_filtered_by_info_keywords_aborts(self, db):
+        """pinned 节点名命中信息排除关键词：[Proxy] 段无此节点，服务组引用悬空"""
+        db.add(ProxyNode(name="剩余流量提示", node_type="trojan", server="203.0.113.7",
+                         port=443, config="剩余流量提示 = trojan, 203.0.113.7, 443, password=x",
+                         enabled=True, pinned_services=["AI服务"]))
+        await db.commit()
+        with pytest.raises(InvalidConfiguration) as ei:
+            await generate_surge_config(db)
+        errors = "\n".join(ei.value.errors)
+        assert "AI服务" in errors and "剩余流量提示" in errors
+        assert "剩余流量提示 = trojan" not in errors  # 被过滤的节点本身不输出
+
+    @pytest.mark.asyncio
+    async def test_default_graph_passes_and_options_not_mistaken_as_members(self, db_with_nodes):
+        """默认组图全通过：组行选项（url/interval/regex-filter）不是成员，不误报"""
+        config = await generate_surge_config(db_with_nodes)
+        assert "手动选择 = select, 大陆直连" in config
+        assert "大陆直连 = select, DIRECT" in config  # 合法内置动作成员
+        assert "RULE-SET,LAN,DIRECT,no-resolve" in config
+
     @pytest.mark.asyncio
     async def test_every_proxy_group_line_is_referenceable(self, db_with_nodes):
         """防漂移不变量：[Proxy Group] 实际输出的每个组名都在校验可用集合内。
@@ -390,9 +542,9 @@ class TestReferenceValidationIntegration:
         若 _build_proxy_groups 新增组行但未登记到 GroupNameSinks，
         该组名将无法被规则引用，此测试守卫登记完整性。
         """
+        from app.services.generator import GroupNameSinks, _build_proxy_groups
         from sqlalchemy import select as _select
         from app.models import RegionGroup, ProxyNode
-        from app.services.generator import GroupNameSinks, _build_proxy_groups
 
         db = db_with_nodes
         regions = (await db.execute(_select(RegionGroup).where(RegionGroup.enabled == True)
@@ -411,6 +563,10 @@ class TestReferenceValidationIntegration:
                 emitted.add(line.split(" = ", 1)[0].strip().strip('"'))
         registered = sinks.region | sinks.service | sinks.combined | {"全部节点"}
         assert emitted <= registered, emitted - registered
+        # 成员登记完备：每条成员引用的 group 本身也是被登记的组
+        assert sinks.member_refs
+        member_groups = {ref.group for ref in sinks.member_refs}
+        assert member_groups <= registered | sinks.region | sinks.service | sinks.combined
 
 
 # ════════════════════════════════════════════
@@ -449,12 +605,12 @@ async def client(tmp_path, monkeypatch):
     await test_runtime.dispose()
 
 
-async def _break_default_config(client):
+async def _break_default_config(client, value="幽灵组"):
     """直插数据库：把默认档案 final_action 改成无效策略"""
     async with client._test_factory() as db:
         await db.execute(update(ConfigProfile)
                          .where(ConfigProfile.is_default == True)
-                         .values(final_action="幽灵组"))
+                         .values(final_action=value))
         await db.commit()
 
 
@@ -486,6 +642,18 @@ class TestRouteMapping:
         paths = resolve_runtime_paths()
         assert not paths.exports.exists() or list(paths.exports.iterdir()) == [], \
             "无效配置不得产出任何部分导出文件"
+
+    @pytest.mark.asyncio
+    async def test_whitespace_final_action_export_no_partial_file(self, client):
+        """final_action 纯空白：export 422 且零文件（trim 归一的无效路径同样闭环）"""
+        from app.runtime_paths import resolve_runtime_paths
+
+        await _break_default_config(client, value="   ")
+        resp = await client.post("/api/configs/1/exports", json={"confirm": True})
+        assert resp.status_code == 422
+        assert any("final_action" in e for e in resp.json()["detail"]["errors"])
+        paths = resolve_runtime_paths()
+        assert not paths.exports.exists() or list(paths.exports.iterdir()) == []
 
     @pytest.mark.asyncio
     async def test_normal_domain_errors_still_propagate(self, client, monkeypatch):

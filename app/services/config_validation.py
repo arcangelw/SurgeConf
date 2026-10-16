@@ -1,18 +1,23 @@
 """生成配置引用完整性校验。
 
-生成器输出任何字节前，校验全部规则 action 与 ``final_action`` 引用的策略
-确实存在于本次输出（节点 / 地区组 / 服务组 / 组合组 / Surge 内置动作）。
-任何无效引用聚合为 :class:`InvalidConfiguration` 一次抛出，绝不产出部分配置。
+生成器输出任何字节前，校验全部规则 action、策略组成员引用与
+``final_action`` 引用的策略确实存在于本次输出（节点 / 地区组 / 服务组 /
+组合组 / Surge 内置动作）。任何无效引用聚合为
+:class:`InvalidConfiguration` 一次抛出，绝不产出部分配置。
 
-canonical 命名流：数据库存逻辑名（中文），输出与校验共用
-:func:`translate_policy_name` 翻译到目标 locale 后比较——校验的名字
-就是输出的名字，不做任何模糊或反向映射回退。
+canonical 命名流：数据库存逻辑名（中文）。GenerationContext 的名字集合
+全部是**本次实际输出名**（节点显示名、t() 翻译后的组名），校验时不再
+二次翻译；规则里的逻辑引用经 :func:`resolve_policy_reference` 解析为
+输出名后对照——内置动作与精确命中节点名的引用原样保留（节点名不翻译，
+避免名为「香港」的节点在 en 档案被误翻为 Hong Kong），生成组按逻辑名
+翻译。输出与校验共用同一条解析路径，不做任何模糊或反向映射回退。
 """
 
 from dataclasses import dataclass
 
 from app.default_config import locale_translate
 
+# Surge 内置终结动作：无需在 [Proxy] / [Proxy Group] 中定义即可被规则引用
 BUILTIN_ACTIONS = frozenset({"DIRECT", "REJECT", "REJECT-NO-DROP", "REJECT-DROP", "DNS"})
 
 # 规则尾部的修饰符：不属于策略段，定位策略时需跳过
@@ -34,7 +39,7 @@ def translate_policy_name(name: str, locale: str = "zh") -> str:
 
 @dataclass
 class RuleActionRef:
-    """一条已输出规则的终结策略引用。
+    """一条已输出规则的终结策略引用（逻辑形态，校验时再解析）。
 
     action 为 None 表示无法从规则文本解析出策略段（fail closed：
     校验器将其按无效引用处理，而不是猜测或跳过）。
@@ -45,11 +50,26 @@ class RuleActionRef:
 
 
 @dataclass
+class GroupMemberRef:
+    """一条策略组成员引用（构建组行时结构化登记，不从最终行字符串解析）。
+
+    group/member 均为本次输出的实际显示名（已翻译、未加引号）；
+    member 直接对照 available_policies()，无需再翻译。组行的非策略
+    选项（url-test/select 类型、policy-regex-filter、url、interval、
+    icon-url 等）不是成员引用，不进入登记。
+    """
+
+    group: str
+    member: str
+
+
+@dataclass
 class GenerationContext:
     """一次生成的完整引用视图。
 
     名字集合全部来自本次实际输出：节点显示名（未被信息关键词过滤）、
-    实际生成的地区/服务/组合组名。disabled、被过滤、未生成的项不算存在。
+    实际生成的地区/服务/组合组名（t() 翻译后的输出名）。disabled、
+    被过滤、未生成的项不算存在。集合已是输出名，校验不再二次翻译。
     """
 
     locale: str
@@ -59,19 +79,38 @@ class GenerationContext:
     service_group_names: frozenset[str] = frozenset()
     combined_group_names: frozenset[str] = frozenset()
     rule_actions: tuple[RuleActionRef, ...] = ()
+    group_members: tuple[GroupMemberRef, ...] = ()
     final_action: str | None = None
 
     def available_policies(self) -> frozenset[str]:
-        """规则可引用的完整策略集合（已翻译到目标 locale）+ 内置动作"""
+        """规则与组成员可引用的完整策略集合（实际输出名 + 内置动作）"""
         names = set(BUILTIN_ACTIONS)
-        for group in (self.node_names, self.region_group_names,
-                      self.service_group_names, self.combined_group_names):
-            names.update(translate_policy_name(n, self.locale) for n in group)
+        names.update(self.node_names)
+        names.update(self.region_group_names)
+        names.update(self.service_group_names)
+        names.update(self.combined_group_names)
         return frozenset(names)
 
 
+def resolve_policy_reference(name: str, locale: str, node_names: frozenset[str]) -> str:
+    """把规则里的策略引用（数据库逻辑形态）解析为实际输出名。
+
+    与生成器输出流完全一致：
+    1. 内置动作原样；
+    2. 精确命中实际节点名 → 原样（节点名不翻译，防止名为「香港」的
+       节点在 en 档案被误翻为 Hong Kong 而与 [Proxy] 段脱节）；
+    3. 其余按 canonical 逻辑名翻译到目标 locale（生成组显示名）。
+
+    同一名字既是节点又是组时节点优先（更精确的既有产品预期，
+    有冲突测试锁定）。
+    """
+    if name in BUILTIN_ACTIONS or name in node_names:
+        return name
+    return translate_policy_name(name, locale)
+
+
 def validate_generated_references(context: GenerationContext) -> None:
-    """聚合校验全部规则引用；任一无效抛 InvalidConfiguration（错误一次全给）"""
+    """聚合校验规则 action、策略组成员与 final_action；一次抛出全部错误"""
     errors: list[str] = []
     available = context.available_policies()
 
@@ -81,16 +120,25 @@ def validate_generated_references(context: GenerationContext) -> None:
                 f"{ref.source}: 无法解析出策略段（仅支持 TYPE,payload,policy[,modifier] "
                 f"与 FINAL,policy[,modifier] 形态），拒绝生成")
             continue
-        if translate_policy_name(ref.action, context.locale) not in available:
+        resolved = resolve_policy_reference(ref.action, context.locale, context.node_names)
+        if resolved not in available:
             errors.append(
                 f"{ref.source}: 策略「{ref.action}」未被本次生成（不存在或已禁用），不能被引用")
+
+    for ref in context.group_members:
+        if ref.member not in available:
+            errors.append(
+                f"策略组「{ref.group}」的成员「{ref.member}」未被本次生成"
+                f"（不存在或已禁用），不能被引用")
 
     final = (context.final_action or "").strip() or None
     if final is None:
         errors.append("final_action: 档案未设置最终策略（FINAL），拒绝生成")
-    elif translate_policy_name(final, context.locale) not in available:
-        errors.append(
-            f"final_action: 最终策略「{final}」未被本次生成（不存在或已禁用），不能被 FINAL 引用")
+    else:
+        resolved = resolve_policy_reference(final, context.locale, context.node_names)
+        if resolved not in available:
+            errors.append(
+                f"final_action: 最终策略「{final}」未被本次生成（不存在或已禁用），不能被 FINAL 引用")
 
     if errors:
         raise InvalidConfiguration(errors)
@@ -147,6 +195,8 @@ def extract_rule_action(rule_text: str) -> str | None:
 def translate_rule_action(rule_text: str, t) -> str | None:
     """把规则文本中的策略段替换为 ``t(policy)``，其余段（含 modifier）原样保留。
 
+    ``t`` 必须与校验同一条解析流（生成器传入 resolve 版翻译：内置动作与
+    节点名原样、组名翻译），保证输出的策略名就是被校验的名字。
     返回 None 表示无法定位策略段（与 :func:`extract_rule_action` 同一判定）。
     """
     text = rule_text.strip()

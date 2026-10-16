@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.services.data_migrations import apply_data_migrations
-from app.models import CustomRule, ConfigProfile, SystemConfig, RuleSource
+from app.models import CustomRule, ConfigProfile, ProxyNode, SystemConfig, RuleSource
 from app.default_config import SECURITY_PRE_RULES
 
 
@@ -230,7 +230,7 @@ async def test_no_resolve_keywords_backfilled_and_persisted(db):
 
 @pytest.mark.asyncio
 async def test_dangling_rule_source_actions_fixed_to_global(db):
-    """悬空规则源 action（引用未生成组，如默认关闭的英国/韩国）迁移为 Global；幂等"""
+    """历史默认 Stream EU/KR 悬空 action 迁移为 Global；范围外记录一律不动；幂等"""
     from app.models import RegionGroup
 
     # 前置条件：conftest 种子中英国/韩国地区组 auto/manual 均关 → 不生成
@@ -240,9 +240,13 @@ async def test_dangling_rule_source_actions_fixed_to_global(db):
     db.add(RuleSource(name="Stream EU (non_ip)", url="https://ruleset.skk.moe/List/non_ip/stream_eu.conf",
                       action="英国", rule_type="RULE-SET", category="region_stream",
                       sort_order=32, enabled=True))
+    # 范围外：未知引用的普通规则源、被用户禁用的同名内置记录
     db.add(RuleSource(name="幽灵源", url="https://example.com/ghost.list",
                       action="不存在的组", rule_type="RULE-SET", category="global",
                       sort_order=80, enabled=True))
+    db.add(RuleSource(name="Stream KR (ip)", url="https://ruleset.skk.moe/List/ip/stream_kr.conf",
+                      action="韩国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=37, enabled=False))
     await db.commit()
 
     await apply_data_migrations(_factory(db))
@@ -252,7 +256,33 @@ async def test_dangling_rule_source_actions_fixed_to_global(db):
         sources = {rs.name: rs.action for rs in
                    (await fresh.execute(select(RuleSource))).scalars().all()}
     assert sources["Stream EU (non_ip)"] == "Global"
-    assert sources["幽灵源"] == "Global"
+    # 严格限定历史签名：范围外悬空引用与用户禁用的记录一律保留原值
+    assert sources["幽灵源"] == "不存在的组"
+    assert sources["Stream KR (ip)"] == "韩国"
+
+
+@pytest.mark.asyncio
+async def test_dangling_migration_scoped_to_legacy_signature(db):
+    """签名不完全匹配（用户自定义同名不同 URL）与有效节点 action 均不改写"""
+    db.add(ProxyNode(name="US-01", node_type="ss", server="203.0.113.1", port=443,
+                     config="US-01 = ss, 203.0.113.1, 443, password=x", enabled=True))
+    # 同名但 URL 不同：用户自定义记录，不是历史内置
+    db.add(RuleSource(name="Stream EU (non_ip)", url="https://user.example/my-stream.list",
+                      action="英国", rule_type="RULE-SET", category="region_stream",
+                      sort_order=32, enabled=True))
+    # action 指向真实节点：有效引用，不属于历史悬空签名
+    db.add(RuleSource(name="节点源", url="https://example.com/node.list",
+                      action="US-01", rule_type="RULE-SET", category="global",
+                      sort_order=81, enabled=True))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        sources = {rs.name: rs.action for rs in
+                   (await fresh.execute(select(RuleSource))).scalars().all()}
+    assert sources["Stream EU (non_ip)"] == "英国"  # 签名不匹配：不动
+    assert sources["节点源"] == "US-01"              # 有效节点 action：不动
 
 
 @pytest.mark.asyncio

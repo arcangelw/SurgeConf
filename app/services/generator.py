@@ -16,8 +16,10 @@ from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY, DEFAULT_URL_
 from app.profile_targets import ProfileTarget, filter_general_for_target
 from app.services.config_validation import (
     GenerationContext,
+    GroupMemberRef,
     RuleActionRef,
     extract_rule_action,
+    resolve_policy_reference,
     translate_policy_name,
     translate_rule_action,
     validate_generated_references,
@@ -102,17 +104,19 @@ def _display_name(node: ProxyNode, sub_map: dict) -> str:
 
 
 class GroupNameSinks:
-    """分类登记本次实际生成的组名（供引用校验构成可用策略集合）。
+    """结构化登记本次实际生成的组名与组成员引用（供引用校验）。
 
-    名字取 t() 翻译后的输出名（未加引号）；disabled、未生成、被过滤的组
-    不进入登记。防漂移不变量由测试守卫：[Proxy Group] 输出的每个组名
-    都必须被登记到对应桶。
+    组名取 t() 翻译后的输出名（未加引号）；成员引用在每条组行拼接处
+    同步登记（输出名形态，直接对照可用策略集合）。disabled、未生成、
+    被过滤的组/节点不进入登记。防漂移不变量由测试守卫：[Proxy Group]
+    输出的每个组名都被登记到对应桶。
     """
 
     def __init__(self):
         self.region: set[str] = set()
         self.service: set[str] = set()
         self.combined: set[str] = set()
+        self.member_refs: list[GroupMemberRef] = []
 
 
 async def generate_surge_config(db: AsyncSession, profile_id: int | None = None, locale_override: str | None = None) -> str:
@@ -138,6 +142,10 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
         """翻译固定注释"""
         zh, en = COMMENT_NAMES.get(key, (key, key))
         return zh if locale == "zh" or not locale else en
+
+    # final_action 规范化恰好一次（trim）：校验与 FINAL 输出共享同一值，
+    # 杜绝「校验 strip 后的名字、输出带空白的原值」
+    final_action = (profile.final_action or "").strip()
 
     nodes_result = await db.execute(
         select(ProxyNode).where(ProxyNode.enabled == True).order_by(ProxyNode.name)
@@ -228,6 +236,13 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
             sections.append(config_line)
     sections.append("")
 
+    # 规则策略引用的输出翻译（与校验 resolve_policy_reference 同一条流）：
+    # 内置动作与精确命中节点名的引用原样（节点名不翻译），生成组按逻辑名翻译
+    proxy_name_set = frozenset(proxy_names)
+
+    def tr(name: str) -> str:
+        return resolve_policy_reference(name, locale, proxy_name_set)
+
     # Proxy Group
     group_names = GroupNameSinks()
     sections.append("[Proxy Group]")
@@ -260,18 +275,19 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
     # 先构建 + 记录结构化引用，再统一校验：任何无效引用聚合抛出，
     # 绝不把部分 [Rule] 段拼进产物（sections 只在校验通过后扩展）
     rule_refs: list[RuleActionRef] = []
-    rule_lines = _build_rules(rule_sources, pre_rules, general_rules, t, tc, tcomment,
+    rule_lines = _build_rules(rule_sources, pre_rules, general_rules, tr, tc, tcomment,
                               no_resolve_keywords,
-                              final_action=profile.final_action or "", record=rule_refs)
+                              final_action=final_action, record=rule_refs)
     validate_generated_references(GenerationContext(
         locale=locale,
         target=profile.target,
-        node_names=frozenset(proxy_names),
+        node_names=proxy_name_set,
         region_group_names=frozenset(group_names.region),
         service_group_names=frozenset(group_names.service),
         combined_group_names=frozenset(group_names.combined),
         rule_actions=tuple(rule_refs),
-        final_action=profile.final_action,
+        group_members=tuple(group_names.member_refs),
+        final_action=final_action,
     ))
     sections.extend(rule_lines)
     sections.append("")
@@ -330,6 +346,12 @@ def _build_proxy_groups(
         if name_sinks is not None:
             bucket.add(name)
 
+    def _members(group: str, member_names: list[str]) -> None:
+        """结构化登记一个组的成员引用（输出名形态；组行的非策略选项不算成员）"""
+        if name_sinks is not None:
+            for member in member_names:
+                name_sinks.member_refs.append(GroupMemberRef(group=group, member=member))
+
     # 全部节点组
     sub_filter = f"^((?!{exclusion_keywords}).)+$"
     _sink(name_sinks.combined if name_sinks else set(), t("全部节点"))
@@ -350,6 +372,8 @@ def _build_proxy_groups(
     for rg in auto_regions:
         icon = f', icon-url={rg.icon_url}' if rg.icon_url else ""
         _sink(name_sinks.region if name_sinks else set(), t(rg.name))
+        # include-other-group 引用「全部节点」组
+        _members(t(rg.name), [t("全部节点")])
         lines.append(
             f'{_quote(t(rg.name))} = url-test, '
             f'policy-regex-filter={rg.filter_regex}, '
@@ -372,6 +396,7 @@ def _build_proxy_groups(
     if auto_regions and other_auto_enabled:
         has_other = True
         _sink(name_sinks.region if name_sinks else set(), t("其他"))
+        _members(t("其他"), [t("全部节点")])
         lines.append(
             f'{other_region_quoted} = url-test, '
             f'policy-regex-filter={other_filter}, '
@@ -385,10 +410,12 @@ def _build_proxy_groups(
 
     # ── 手动地区分组 ──
     manual_region_names = []
+    manual_region_display = []
     for rg in manual_regions:
         manual_name = f"{rg.name}手动"
         icon = f', icon-url={rg.icon_url}' if rg.icon_url else ""
         _sink(name_sinks.region if name_sinks else set(), t(manual_name))
+        _members(t(manual_name), [t("全部节点")])
         lines.append(
             f'{_quote(t(manual_name))} = select, '
             f'policy-regex-filter={rg.filter_regex}, '
@@ -396,11 +423,14 @@ def _build_proxy_groups(
             f'{icon}'
         )
         manual_region_names.append(_quote(t(manual_name)))
+        manual_region_display.append(t(manual_name))
     # 其他手动选择 — 独立开关（放在手动地区组之后）
     other_manual_names = []
+    other_manual_display = []
     if auto_regions and other_manual_enabled:
         has_other = True
         _sink(name_sinks.region if name_sinks else set(), t("其他手动"))
+        _members(t("其他手动"), [t("全部节点")])
         lines.append(
             f'{other_manual_quoted} = select, '
             f'policy-regex-filter={other_filter}, '
@@ -408,16 +438,21 @@ def _build_proxy_groups(
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/01Country/EuropeanUnion.png'
         )
         other_manual_names.append(other_manual_quoted)
+        other_manual_display.append(t("其他手动"))
     lines.append("")
 
     # ── 组合策略 ──
     auto_region_names = [_quote(t(rg.name)) for rg in auto_regions]
     all_region_names = auto_region_names + manual_region_names + other_manual_names
+    # 全部地区组显示名（代理组成员顺序与 all_region_names 一致）
+    all_region_display = ([t(rg.name) for rg in auto_regions]
+                          + manual_region_display + other_manual_display)
 
     # 自动选择：仅包含明确分区的自动测速组（排除「其他」兜底组）
     auto_select_members = list(auto_region_names)
     if auto_select_members:
         _sink(name_sinks.combined if name_sinks else set(), t("自动选择"))
+        _members(t("自动选择"), [t(rg.name) for rg in auto_regions])
         lines.append(
             f'{_quote(t("自动选择"))} = select, {", ".join(auto_select_members)}, '
             f'url=http://cp.cloudflare.com/generate_204, interval=300, tolerance=100, timeout=3, '
@@ -425,22 +460,30 @@ def _build_proxy_groups(
         )
     # 代理：自动选择 + 所有地区（自动+手动）
     proxy_members = []
+    proxy_member_display = []
     if auto_select_members:
         proxy_members.append(_quote(t("自动选择")))
+        proxy_member_display.append(t("自动选择"))
     proxy_members.extend(all_region_names)
+    proxy_member_display.extend(all_region_display)
     if proxy_members:
         _sink(name_sinks.combined if name_sinks else set(), t("代理"))
+        _members(t("代理"), proxy_member_display)
         lines.append(
             f'{_quote(t("代理"))} = select, {", ".join(proxy_members)}, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/05icon/rocket(1).png'
         )
     # 手动选择：大陆直连 + 自动选择 + 所有手动地区组
     manual_select_members = [_quote(t("大陆直连"))]
+    manual_select_display = [t("大陆直连")]
     if auto_select_members:
         manual_select_members.append(_quote(t("自动选择")))
+        manual_select_display.append(t("自动选择"))
     manual_select_members.extend(manual_region_names + other_manual_names)
+    manual_select_display.extend(manual_region_display + other_manual_display)
     if manual_region_names or other_manual_names or auto_select_members:
         _sink(name_sinks.combined if name_sinks else set(), t("手动选择"))
+        _members(t("手动选择"), manual_select_display)
         lines.append(
             f'{_quote(t("手动选择"))} = select, {", ".join(manual_select_members)}, '
             f'icon-url=https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/05icon/lightning.png'
@@ -459,6 +502,7 @@ def _build_proxy_groups(
         )
         icon = f', icon-url={sg.icon_url}' if sg.icon_url else ""
         _sink(name_sinks.service if name_sinks else set(), t(sg.name))
+        _members(t(sg.name), pinned_names + policy_names)
         lines.append(f'{_quote(t(sg.name))} = {sg.group_type}, {entries_str}{icon}')
 
     return lines
@@ -519,9 +563,9 @@ def _build_rules(rule_sources: list[RuleSource], pre_rules: list[CustomRule], ge
 
     lines.append("")
     lines.append(f"# >> {tcomment('final_rule')}")
-    # final_action 直通：空值由校验器拒绝，此处绝不静默回退到默认策略；
-    # 其引用由 validate_generated_references 经 context.final_action 单独
-    # 校验，不在 rule_actions 重复登记（同一问题只报一次）
+    # final_action 直通（调用方已 trim 并与校验共享同一值）：空值由校验器
+    # 拒绝，此处绝不静默回退到默认策略；其引用由 validate_generated_references
+    # 经 context.final_action 单独校验，不在 rule_actions 重复登记
     lines.append(f"FINAL,{_quote(t(final_action))},dns-failed")
 
     return lines
