@@ -1,7 +1,8 @@
 """平台 General 能力矩阵：能力表唯一真源、保存 API 过滤与生成器接入
 
-能力表（IOS_ONLY/MAC_ONLY/GATEWAY_ONLY + 强制安全值）是唯一真源，
-字段元数据与值过滤两个出口必须由同一张表派生，不允许漂移。
+能力表（COMMON/MAC_ONLY/IOS_ONLY/GATEWAY_ONLY + GENERATOR_ONLY +
+强制安全值）是唯一真源，字段元数据与值过滤两个出口必须由同一张表
+派生，不允许漂移。表外未知键不属于任何目标：PUT 拒绝、生成/读取丢弃。
 所有凭据/地址均为合成值（回环地址 + 占位用户名），不依赖真实运行库。
 """
 
@@ -11,9 +12,12 @@ from app.default_config import DEFAULT_GENERAL
 from app.general_fields import (GENERAL_GROUPS, general_fields_for_target,
                                 general_groups_for_target)
 from app.models import ConfigProfile
-from app.profile_targets import (GATEWAY_ONLY, IOS_ONLY, MAC_ONLY, ProfileTarget,
-                                 filter_general_for_target, forced_general_values,
-                                 general_targets_for)
+from app.profile_targets import (COMMON_GENERAL_KEYS, CONFIGURABLE_GENERAL_KEYS,
+                                 GATEWAY_ONLY, GENERATOR_ONLY_KEYS,
+                                 IOS_ONLY, KNOWN_GENERAL_KEYS, MAC_ONLY,
+                                 ProfileTarget, configurable_general_keys,
+                                 filter_general_for_target,
+                                 forced_general_values, general_targets_for)
 from app.routers.general import get_fields, get_values, save_values
 
 # 合成值全集：覆盖元数据全部键 + 平台专属键 + 危险强制键输入
@@ -157,10 +161,35 @@ class TestSingleSourceOfTruth:
         meta_keys = {f.key for g in GENERAL_GROUPS for f in g["fields"]}
         assert set(DEFAULT_GENERAL) <= meta_keys
 
-    def test_general_targets_for_unknown_key_is_universal(self):
-        """未知键（能力表三个集合之外）视为通用键，三平台均支持"""
-        assert set(general_targets_for("some-future-key")) == set(ProfileTarget)
+    def test_unknown_key_belongs_to_no_target(self):
+        """表外未知键不属于任何目标：PUT 拒绝、生成/读取丢弃"""
+        assert general_targets_for("some-future-key") == frozenset()
 
+    def test_generator_only_keys_allowed_in_output_not_configurable(self):
+        """skip-proxy 属生成期内部键：输出放行但不可配置"""
+        assert general_targets_for("skip-proxy") == frozenset(ProfileTarget)
+        assert "skip-proxy" in GENERATOR_ONLY_KEYS
+        for target in ProfileTarget:
+            assert "skip-proxy" not in configurable_general_keys(target)
+
+    @pytest.mark.parametrize("target", ALL_TARGETS)
+    def test_filter_drops_unknown_keeps_generator_only(self, target):
+        """filter：未知键丢弃；生成期内部键（skip-proxy）输出保留"""
+        out = filter_general_for_target(
+            target, {"some-unknown-key": "x", "skip-proxy": "localhost, 127.0.0.1"})
+        assert "some-unknown-key" not in out
+        assert out["skip-proxy"] == "localhost, 127.0.0.1"
+
+    def test_capability_covers_default_general_and_metadata(self):
+        """能力表完备性：DEFAULT_GENERAL 与字段元数据全部登记，无表外键"""
+        meta_keys = {f.key for g in GENERAL_GROUPS for f in g["fields"]}
+        # 元数据键 == 可配置键全集（双向对齐，防两侧漂移）
+        assert meta_keys == set(CONFIGURABLE_GENERAL_KEYS)
+        # 默认值与元数据都在已知键域内
+        assert set(DEFAULT_GENERAL) <= KNOWN_GENERAL_KEYS
+        # 已知键 = 可配置 + 生成期内部，无重叠
+        assert KNOWN_GENERAL_KEYS == set(CONFIGURABLE_GENERAL_KEYS) | set(GENERATOR_ONLY_KEYS)
+        assert COMMON_GENERAL_KEYS.isdisjoint(GENERATOR_ONLY_KEYS)
 
 # ===== GET /api/general/fields =====
 
@@ -223,6 +252,45 @@ class TestFieldsEndpoint:
         assert groups and all("label_zh" in g and "fields" in g for g in groups)
 
 
+class TestForcedFieldMetadata:
+    """强制安全字段的元数据逐目标回归：只暴露唯一允许选项"""
+
+    def _field(self, target, key):
+        return next(f for f in general_fields_for_target(target) if f["key"] == key)
+
+    @pytest.mark.parametrize("target", ALL_TARGETS)
+    def test_block_quic_single_option_forced(self, target):
+        f = self._field(target, "block-quic")
+        assert f["forced"] is True
+        assert [o["value"] for o in f["options"]] == ["per-policy"]
+
+    @pytest.mark.parametrize("target", ALL_TARGETS)
+    def test_udp_behaviour_single_option_forced(self, target):
+        f = self._field(target, "udp-policy-not-supported-behaviour")
+        assert f["forced"] is True
+        assert [o["value"] for o in f["options"]] == ["REJECT"]
+
+    def test_gateway_lan_restriction_forced(self):
+        f = self._field(ProfileTarget.MAC_GATEWAY, "gateway-restricted-to-lan")
+        assert f["forced"] is True
+
+    def test_ios_compat_and_suspend_forced(self):
+        for key in ("compatibility-mode", "auto-suspend"):
+            f = self._field(ProfileTarget.IOS_MOBILE, key)
+            assert f["forced"] is True, key
+
+    @pytest.mark.parametrize("target", ALL_TARGETS)
+    def test_non_forced_fields_not_marked(self, target):
+        forced_keys = set(forced_general_values(target))
+        for f in general_fields_for_target(target):
+            if f["key"] not in forced_keys:
+                assert not f.get("forced"), f["key"]
+
+    def test_workstation_has_no_ios_only_forced_fields(self):
+        keys = {f["key"] for f in general_fields_for_target(ProfileTarget.MAC_WORKSTATION)}
+        assert not ({"compatibility-mode", "auto-suspend", "gateway-restricted-to-lan"} & keys)
+
+
 # ===== GET /api/general/values =====
 
 class TestGetValuesEndpoint:
@@ -248,7 +316,19 @@ class TestGetValuesEndpoint:
         assert data["values"]["auto-suspend"] is True
         assert data["values"]["block-quic"] == "per-policy"
         assert "internet-test-url" not in data["values"]
-        assert "test-timeout" not in data["values"]
+
+    @pytest.mark.asyncio
+    async def test_get_values_drops_generator_only_and_unknown(self, db):
+        """存量 skip-proxy 与表外未知键不进入用户可配置值"""
+        profile = await _add_profile(
+            db, "脏值档", ProfileTarget.MAC_WORKSTATION,
+            general={"skip-proxy": "stale", "some-future-key": 1,
+                     "loglevel": "info"},
+        )
+        data = await get_values(profile_id=profile.id, db=db)
+        assert "skip-proxy" not in data["values"]
+        assert "some-future-key" not in data["values"]
+        assert data["values"]["loglevel"] == "info"
 
     @pytest.mark.asyncio
     async def test_get_values_none_uses_default(self, db):
@@ -328,7 +408,26 @@ class TestSaveValuesEndpoint:
         assert profile.general["wifi-assist"] is True
 
     @pytest.mark.asyncio
-    async def test_save_unknown_universal_key_allowed(self, db):
-        """能力表之外的键视为通用（自定义 JSON 入口可用）"""
-        await save_values(profile_id=1, values={"some-future-key": "on"}, db=db)
-        await db.refresh(await db.get(ConfigProfile, 1))
+    async def test_save_rejects_unknown_key_no_commit(self, db):
+        """表外未知键：422 指出 key 且持久层不提交（原值不动）"""
+        profile = await db.get(ConfigProfile, 1)
+        before = dict(profile.general or {})
+        with pytest.raises(Exception) as exc_info:
+            await save_values(profile_id=1, values={"some-future-key": "on"}, db=db)
+        assert getattr(exc_info.value, "status_code", None) == 422
+        assert "some-future-key" in str(exc_info.value.detail)
+        assert dict(profile.general or {}) == before
+
+    @pytest.mark.asyncio
+    async def test_save_cleans_legacy_unknown_and_generator_keys(self, db):
+        """持久层旧残留的未知键与生成期内部键随下次保存清理"""
+        profile = await _add_profile(
+            db, "脏档", ProfileTarget.MAC_WORKSTATION,
+            general={"some-future-key": "x", "skip-proxy": "stale",
+                     "compatibility-mode": 3, "loglevel": "notify"},
+        )
+        await save_values(profile_id=profile.id, values={"test-timeout": 8}, db=db)
+        assert set(profile.general) == {"loglevel", "test-timeout",
+                                        "block-quic",
+                                        "udp-policy-not-supported-behaviour"}
+        assert "skip-proxy" not in profile.general

@@ -9,8 +9,10 @@ from app.database import get_db
 from app.models import ConfigProfile, SystemConfig
 from app.general_fields import general_groups_for_target
 from app.default_config import DEFAULT_GENERAL, DEFAULT_SKIP_PROXY
-from app.profile_targets import (ProfileTarget, filter_general_for_target,
-                                 forced_general_values, general_targets_for)
+from app.profile_targets import (GENERATOR_ONLY_KEYS, ProfileTarget,
+                                 configurable_general_keys,
+                                 filter_general_for_target,
+                                 forced_general_values)
 from app.services.profile_resolution import (DefaultProfileMissing, ProfileNotFound,
                                              resolve_profile)
 
@@ -41,12 +43,17 @@ async def get_fields(profile_id: int | None = None, db: AsyncSession = Depends(g
 
 @router.get("/values")
 async def get_values(profile_id: int | None = None, db: AsyncSession = Depends(get_db)):
-    """返回当前生效的 General 值（按目标过滤 + 强制安全值）"""
+    """返回当前生效的 General 值（按目标过滤 + 强制安全值）。
+
+    只返回用户可配置键：生成期内部键（skip-proxy）与表外未知键
+    的存量残留一律丢弃。
+    """
     profile = await _resolve_or_404(db, profile_id)
     values = dict(DEFAULT_GENERAL)
     if profile.general:
         values.update(profile.general)
     values = filter_general_for_target(ProfileTarget(profile.target), _drop_empty(values))
+    values = {k: v for k, v in values.items() if k not in GENERATOR_ONLY_KEYS}
 
     return {
         "profile_id": profile.id,
@@ -57,17 +64,19 @@ async def get_values(profile_id: int | None = None, db: AsyncSession = Depends(g
 
 @router.put("/values")
 async def save_values(profile_id: int, values: dict, db: AsyncSession = Depends(get_db)):
-    """保存 General 值到指定 profile（增量合并）
+    """保存 General 值到指定 profile（增量合并，完整显式 allowlist）
 
-    - 当前目标不支持的请求键：422 并指出 key（不静默吞新输入）
+    - 请求键不在目标可配置集合（表外未知键或他平台专属键）：
+      422 并指出 key（不静默吞新输入），事务不提交
     - 强制安全键（block-quic 等）不允许危险覆盖值：422
-    - 旧目标持久残留的不兼容键：静默清理
+    - 持久层旧残留（他平台键/未知键/生成期内部键）：静默清理
     - 强制安全值随保存固化到持久层
     """
     profile = await _resolve_or_404(db, profile_id)
     target = ProfileTarget(profile.target)
 
-    unsupported = sorted(k for k in values if target not in general_targets_for(k))
+    allowed = configurable_general_keys(target)
+    unsupported = sorted(k for k in values if k not in allowed)
     if unsupported:
         raise HTTPException(
             422, f"当前目标 {target.value} 不支持字段: {', '.join(unsupported)}")
@@ -80,8 +89,8 @@ async def save_values(profile_id: int, values: dict, db: AsyncSession = Depends(
 
     current = dict(profile.general or {})
     current.update(values)
-    # 清理旧目标残留（持久值，非本次输入）后固化强制安全值
-    cleaned = {k: v for k, v in current.items() if target in general_targets_for(k)}
+    # 清理旧残留（持久值，非本次输入）后固化强制安全值
+    cleaned = {k: v for k, v in current.items() if k in allowed}
     cleaned.update(forced)
     profile.general = cleaned
     await db.commit()

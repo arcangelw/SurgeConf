@@ -6,7 +6,8 @@ FieldDef.targets 在模块加载时由 app.profile_targets 的能力矩阵统一
 
 from dataclasses import dataclass, field
 
-from app.profile_targets import ProfileTarget, general_targets_for
+from app.profile_targets import (ProfileTarget, forced_general_values,
+                                 general_targets_for)
 
 # 字段类型
 BOOL = "bool"
@@ -136,8 +137,13 @@ for _group in GENERAL_GROUPS:
         _f.targets = general_targets_for(_f.key)
 
 
-def _serialize_field(f: FieldDef) -> dict:
-    return {
+def _serialize_field(f: FieldDef, forced: dict) -> dict:
+    """序列化字段元数据；强制安全字段只暴露唯一允许选项并标记 forced。
+
+    元数据、保存校验与生成输出共用同一 forced 来源，客户端不会
+    看到 PUT 必然拒绝的选项（如 block-quic 的 direct/proxy）。
+    """
+    fd = {
         "key": f.key,
         "label_zh": f.label_zh,
         "label_en": f.label_en,
@@ -146,14 +152,19 @@ def _serialize_field(f: FieldDef) -> dict:
         "hint_en": f.hint_en,
         "options": [{"value": o[0], "label_zh": o[1], "label_en": o[2]} for o in f.options],
     }
+    if f.key in forced:
+        fd["options"] = [o for o in fd["options"] if o["value"] == str(forced[f.key])]
+        fd["forced"] = True
+    return fd
 
 
 def general_groups_for_target(target: ProfileTarget) -> list[dict]:
     """按目标过滤的分组字段元数据（空组跳过）"""
     target = ProfileTarget(target)
+    forced = forced_general_values(target)
     groups = []
     for g in GENERAL_GROUPS:
-        fields = [_serialize_field(f) for f in g["fields"] if target in f.targets]
+        fields = [_serialize_field(f, forced) for f in g["fields"] if target in f.targets]
         if fields:
             groups.append({
                 "key": g["key"],

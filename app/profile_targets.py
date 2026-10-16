@@ -33,10 +33,20 @@ def validate_target_mode(target: ProfileTarget, mode: UdpSecurityMode) -> None:
             f"target ios_mobile 不允许 udp_security_mode scoped")
 
 
-# ── General 能力矩阵（唯一真源）──
-# 通用键默认三平台可用；以下集合定义平台专属键，字段元数据
-# （app/general_fields.py 的 FieldDef.targets）与值过滤
-# （filter_general_for_target）都从这张表派生，禁止另建 allowlist。
+# ── General 能力矩阵（唯一真源，完整显式 allowlist）──
+# COMMON/MAC_ONLY/IOS_ONLY/GATEWAY_ONLY + GENERATOR_ONLY 登记全部合法键；
+# 表外未知键不属于任何目标（PUT 拒绝、生成/读取丢弃）。
+# 字段元数据（FieldDef.targets）与值过滤（filter_general_for_target）
+# 都从这张表派生，禁止另建 allowlist。
+COMMON_GENERAL_KEYS = frozenset({
+    "wifi-assist", "ipv6", "ipv6-vif", "udp-priority", "all-hybrid",
+    "internet-test-url", "proxy-test-url", "test-timeout",
+    "dns-server", "encrypted-dns-server", "encrypted-dns-follow-outbound-mode",
+    "always-real-ip", "hijack-dns",
+    "loglevel", "show-error-page-for-reject", "exclude-simple-hostnames",
+    "include-all-networks", "include-local-networks",
+    "block-quic", "udp-policy-not-supported-behaviour",
+})
 IOS_ONLY = frozenset({"compatibility-mode", "auto-suspend"})
 MAC_ONLY = frozenset({
     "external-controller-access", "http-api", "http-api-tls",
@@ -46,6 +56,15 @@ MAC_ONLY = frozenset({
     "use-local-host-item-for-proxy", "proxy-restricted-to-lan",
 })
 GATEWAY_ONLY = frozenset({"gateway-restricted-to-lan"})
+# 内部生成键：仅由生成器在输出时写入（如 skip-proxy 每次重算），
+# 不属于任何目标的用户可配置集合
+GENERATOR_ONLY_KEYS = frozenset({"skip-proxy"})
+
+# 全部合法键（含生成期内部键）
+KNOWN_GENERAL_KEYS = (COMMON_GENERAL_KEYS | IOS_ONLY | MAC_ONLY
+                      | GATEWAY_ONLY | GENERATOR_ONLY_KEYS)
+# 用户可配置键（UI 表单与 PUT 的 allowlist）
+CONFIGURABLE_GENERAL_KEYS = KNOWN_GENERAL_KEYS - GENERATOR_ONLY_KEYS
 
 # 全目标强制安全值：保存 API 拒绝危险覆盖，生成/读取一律以此为准
 _FORCED_COMMON = {
@@ -60,9 +79,10 @@ _FORCED_BY_TARGET = {
 
 
 def general_targets_for(key: str) -> frozenset[ProfileTarget]:
-    """单个 General 键支持的目标集合（能力表唯一派生入口）。
+    """单个 General 键允许出现在输出中的目标集合（能力表唯一派生入口）。
 
-    表外未知键视为通用键（自定义 JSON 入口可用），三平台均支持。
+    生成期内部键（skip-proxy 等）三平台输出均允许；表外未知键
+    不属于任何目标——PUT 拒绝、生成/读取丢弃。
     """
     if key in IOS_ONLY:
         return frozenset({ProfileTarget.IOS_MOBILE})
@@ -70,7 +90,16 @@ def general_targets_for(key: str) -> frozenset[ProfileTarget]:
         return frozenset({ProfileTarget.MAC_WORKSTATION, ProfileTarget.MAC_GATEWAY})
     if key in GATEWAY_ONLY:
         return frozenset({ProfileTarget.MAC_GATEWAY})
-    return frozenset(ProfileTarget)
+    if key in COMMON_GENERAL_KEYS or key in GENERATOR_ONLY_KEYS:
+        return frozenset(ProfileTarget)
+    return frozenset()
+
+
+def configurable_general_keys(target: ProfileTarget) -> frozenset[str]:
+    """目标可由用户配置的键（UI 元数据与 PUT 的同一 allowlist）"""
+    target = ProfileTarget(target)
+    return frozenset(
+        k for k in CONFIGURABLE_GENERAL_KEYS if target in general_targets_for(k))
 
 
 def forced_general_values(target: ProfileTarget) -> dict[str, object]:
@@ -81,8 +110,8 @@ def forced_general_values(target: ProfileTarget) -> dict[str, object]:
 def filter_general_for_target(target: ProfileTarget, values: dict[str, object]) -> dict[str, object]:
     """按目标过滤 General 值并强制安全值。
 
-    先丢弃目标不支持的键（含旧目标残留），再写入强制安全值；
-    危险输入一律被覆盖而非透传。
+    先丢弃目标不支持与表外未知的键（含旧目标残留），再写入强制
+    安全值；危险输入一律被覆盖而非透传。
     """
     target = ProfileTarget(target)
     output = {k: v for k, v in values.items() if target in general_targets_for(k)}

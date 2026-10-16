@@ -598,7 +598,8 @@ async def test_general_workstation_keeps_mac_keys_drops_ios(db):
     assert "compatibility-mode" not in general
     assert "auto-suspend" not in general
     assert "gateway-restricted-to-lan" not in general
-
+    # skip-proxy 是生成期内部键（GENERATOR_ONLY）：输出保留
+    assert any(l.startswith("skip-proxy = ") for l in general.splitlines())
 
 @pytest.mark.asyncio
 async def test_general_ios_profile_drops_mac_keys(db):
