@@ -5,6 +5,7 @@ import base64
 import logging
 import httpx
 from dataclasses import dataclass
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -312,6 +313,29 @@ class _EmptySubscriptionError(Exception):
     """拉取成功但解析不出任何节点（fail closed：不写入任何变更）"""
 
 
+class _StaleSnapshotError(Exception):
+    """写事务重查发现 URL 已被并发修改：拒绝把旧拉取结果写入"""
+
+
+class _FailureRecord(NamedTuple):
+    """失败状态短事务结果：订阅是否存在 + 记录事务读到的最新节点数
+
+    记录事务自身失败时保守返回 exists=True（避免把并发删除误判为
+    404），last_node_count=None 表示未知（调用方回退阶段 1 快照值）。
+    """
+
+    exists: bool
+    last_node_count: int | None
+
+
+async def _safe_rollback(db: AsyncSession) -> None:
+    """尽力回滚：自身失败不向外泄漏异常（二次异常吞掉）"""
+    try:
+        await db.rollback()
+    except Exception:
+        pass
+
+
 _ERROR_PUBLIC_MESSAGES = {
     "timeout": "订阅拉取超时，已保留上次可用节点",
     "http_status": "订阅源响应异常，已保留上次可用节点",
@@ -335,6 +359,8 @@ def safe_sync_error(exc: BaseException) -> tuple[str, str]:
         code = "http_status"
     elif isinstance(exc, httpx.RequestError):
         code = "network_error"
+    elif isinstance(exc, _StaleSnapshotError):
+        code = "internal_error"
     elif isinstance(exc, (_EmptySubscriptionError, NodeIdentityError, ValueError)):
         # ValueError 覆盖 URL 校验拒绝、解码与 JSON 解析错误
         code = "invalid_content"
@@ -351,8 +377,9 @@ class SyncResult:
     - 成功：node_count 为去重后节点数；inserted = 新 stable_key 建立的
       节点数；updated = 匹配到既有 stable_key 的处理数（即使字段值未变
       也计数）；removed = 本次结果中缺失而被删除的旧节点数。
-    - 失败：零节点写入，inserted/updated/removed 全 0；node_count 保持
-      上次成功值 last_node_count（从未成功过则为 None）。
+    - 失败：零节点写入，inserted/updated/removed 全 0；node_count 优先
+      取失败状态短事务读到的最新 last_node_count（并发成功会更新它），
+      读取不到时保持阶段 1 快照值（从未成功过则为 None）。
     """
 
     subscription_id: int
@@ -420,20 +447,23 @@ def _prepare_incoming(nodes: list[dict]) -> list[tuple[str, dict]]:
 
 
 async def _record_failed_attempt(db: AsyncSession, sub_id: int,
-                                  now: datetime, code: str) -> None:
+                                  now: datetime, code: str) -> _FailureRecord:
     """失败状态短事务：只更新 attempt/error_code/next。
 
     不触碰 last_success_at/last_node_count 与任何节点；enabled+auto 时
-    next = now + min(interval, 900)，否则 NULL。订阅并发删除时静默跳过；
-    本事务自身失败仅记录错误码。
+    next = now + min(interval, 900)，否则 NULL。订阅并发删除时返回
+    exists=False（调用方转 404/跳过，不泄漏）；本事务自身失败仅记录
+    错误码并保守返回 exists=True。
     """
     try:
+        # populate_existing：绕过 identity map 缓存，读到并发修改后的最新值
         sub = (await db.execute(
             select(Subscription).where(Subscription.id == sub_id)
+            .execution_options(populate_existing=True)
         )).scalar_one_or_none()
         if sub is None:
             await db.rollback()
-            return
+            return _FailureRecord(exists=False, last_node_count=None)
         sub.last_attempt_at = now
         sub.last_error_code = code
         if sub.enabled and sub.auto_update:
@@ -441,10 +471,13 @@ async def _record_failed_attempt(db: AsyncSession, sub_id: int,
             sub.next_update_at = now + timedelta(seconds=delay)
         else:
             sub.next_update_at = None
+        count = sub.last_node_count
         await db.commit()
+        return _FailureRecord(exists=True, last_node_count=count)
     except Exception:
         await db.rollback()
         logger.error("subscription %s failure state write failed: code=%s", sub_id, code)
+        return _FailureRecord(exists=True, last_node_count=None)
 
 
 async def sync_subscription(db: AsyncSession, sub_id: int,
@@ -453,23 +486,39 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
 
     订阅不存在（含同步期间被并发删除）返回 None，由调用方决定 404。
 
-    成功写事务：重查订阅与现有节点，按 stable_key 匹配——匹配项只更新
-    provider 字段（name/node_type/server/port/config/region_auto），保留
-    id、region_manual、enabled、pinned_services、created_at 等人工状态；
+    成功写事务：重查订阅与现有节点并校验 URL 未被并发修改（快照过期
+    则拒绝写入旧结果），按 stable_key 匹配——匹配项只更新 provider 字段
+    （name/node_type/server/port/config/region_auto），保留 id、
+    region_manual、enabled、pinned_services、created_at 等人工状态；
     新节点 enabled=True、人工字段为空；缺失旧节点删除；更新
     attempt/success/node_count、清空 error_code；一次 commit。
 
-    任何失败（拉取/解析/空结果/写事务异常）：节点零写入，独立短事务只
-    记录 attempt/error_code/next，保留最后可用节点与既有成功状态。
+    任何失败（快照读取/拉取/解析/空结果/写事务异常）：节点零写入，
+    独立短事务只记录 attempt/error_code/next，保留最后可用节点与既有
+    成功状态；CancelledError 等取消类异常先尽力回滚再原样传播，不记
+    失败状态。
     """
     now = _utc_naive(now)
 
     # 阶段 1：短只读事务取订阅快照（普通值，不携带 ORM 对象跨事务）
-    row = (await db.execute(
-        select(Subscription.url, Subscription.last_node_count)
-        .where(Subscription.id == sub_id)
-    )).first()
-    await db.commit()
+    try:
+        row = (await db.execute(
+            select(Subscription.url, Subscription.last_node_count)
+            .where(Subscription.id == sub_id)
+        )).first()
+        await db.commit()
+    except Exception as exc:
+        await _safe_rollback(db)
+        code, message = safe_sync_error(exc)
+        logger.error("subscription %s snapshot failed: code=%s", sub_id, code)
+        record = await _record_failed_attempt(db, sub_id, now, code)
+        if not record.exists:
+            return None
+        return SyncResult(sub_id, False, record.last_node_count, 0, 0, 0,
+                          code, message)
+    except BaseException:
+        await _safe_rollback(db)
+        raise
     if row is None:
         return None
     url, last_node_count = row
@@ -482,21 +531,31 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
     except Exception as exc:
         code, message = safe_sync_error(exc)
         logger.error("subscription %s sync failed: code=%s", sub_id, code)
-        await _record_failed_attempt(db, sub_id, now, code)
-        return SyncResult(sub_id, False, last_node_count, 0, 0, 0, code, message)
+        record = await _record_failed_attempt(db, sub_id, now, code)
+        if not record.exists:
+            return None
+        count = (record.last_node_count if record.last_node_count is not None
+                 else last_node_count)
+        return SyncResult(sub_id, False, count, 0, 0, 0, code, message)
 
     # 阶段 3：单一写事务 upsert
     try:
+        # populate_existing：绕过 identity map 缓存，URL 竞态检测取真实最新值
         sub = (await db.execute(
             select(Subscription).where(Subscription.id == sub_id)
+            .execution_options(populate_existing=True)
         )).scalar_one_or_none()
         if sub is None:
-            await db.rollback()
+            await _safe_rollback(db)
             return None
+        if sub.url != url:
+            # 快照过期：URL 已被并发修改，绝不把旧拉取结果写入
+            raise _StaleSnapshotError()
         existing = {
             node.stable_key: node
             for node in (await db.execute(
                 select(ProxyNode).where(ProxyNode.subscription_id == sub_id)
+                .execution_options(populate_existing=True)
             )).scalars()
         }
         incoming_keys = {key for key, _ in prepared}
@@ -543,11 +602,18 @@ async def sync_subscription(db: AsyncSession, sub_id: int,
         return SyncResult(sub_id, True, len(prepared), inserted, updated,
                           removed, None, "同步成功")
     except Exception as exc:
-        await db.rollback()
+        await _safe_rollback(db)
         code, message = safe_sync_error(exc)
         logger.error("subscription %s sync write failed: code=%s", sub_id, code)
-        await _record_failed_attempt(db, sub_id, now, code)
-        return SyncResult(sub_id, False, last_node_count, 0, 0, 0, code, message)
+        record = await _record_failed_attempt(db, sub_id, now, code)
+        if not record.exists:
+            return None
+        count = (record.last_node_count if record.last_node_count is not None
+                 else last_node_count)
+        return SyncResult(sub_id, False, count, 0, 0, 0, code, message)
+    except BaseException:
+        await _safe_rollback(db)
+        raise
 
 
 async def sync_all_subscriptions(db: AsyncSession) -> list[SyncResult]:

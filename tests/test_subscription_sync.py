@@ -6,6 +6,7 @@
 sync-all 混合结果、日志无异常文字。
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -14,8 +15,11 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
+                                    create_async_engine)
 
 import app.services.subscription as subscription_service
+from app.database import Base
 from app.models import Subscription, ProxyNode
 from app.routers.subscriptions import sync_one, sync_all
 from app.services.node_identity import stable_node_key
@@ -299,40 +303,91 @@ async def test_sync_failed_result_keeps_last_node_count(db, subscription, monkey
     assert success == UTC_NOW_NAIVE  # 成功时间不被失败覆盖
 
 
-@pytest.mark.asyncio
-async def test_sync_write_failure_rolls_back_atomically(db, subscription, monkeypatch):
-    from unittest.mock import AsyncMock
-    await add_subscription_node(db, subscription, name="Keep",
-                                region_manual="US", pinned_services=["AI服务"])
-    monkeypatch.setattr(subscription_service, "fetch_subscription",
-                        AsyncMock(return_value=[node_payload("Renamed")]))
-    ok = await sync_subscription(db, subscription.id, now=UTC_NOW)
-    assert ok.success is True
-    before = await node_snapshot(db, subscription.id)
+@pytest_asyncio.fixture
+async def file_db(tmp_path):
+    """文件库 + 主会话与会话工厂：race/原子回滚测试用全新会话验证真实落库状态"""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/race.sqlite3")
 
-    # 第 1 次 commit 是阶段 1 只读快照事务（正常）；第 2 次是写事务
-    # upsert commit（抛内部错误）；第 3 次起失败状态短事务正常提交
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _busy_timeout(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as s1:
+        yield s1, factory
+    await engine.dispose()
+
+
+async def make_subscription(session, **kw):
+    sub = Subscription(name=kw.get("name", "S"), url=kw.get("url", URL),
+                       enabled=kw.get("enabled", True),
+                       auto_update=kw.get("auto_update", True),
+                       update_interval=kw.get("update_interval", 3600))
+    session.add(sub)
+    await session.commit()
+    await session.refresh(sub)
+    return sub
+
+
+@pytest.mark.asyncio
+async def test_sync_write_failure_rolls_back_atomically(file_db, monkeypatch):
+    """写事务 DML（matched 更新 + insert + stale 删除）真实 flush 后 commit
+    故障：rollback 原子撤销；全新会话验证节点/人工字段/成功状态原样；
+    失败状态由独立短事务提交；同会话可继续下一次同步。"""
+    from unittest.mock import AsyncMock
+    s1, factory = file_db
+    sub = await make_subscription(s1)
+    sub_id = sub.id  # rollback/过期后不再访问 s1 实例属性
+    await add_subscription_node(
+        s1, sub, name="Keep", region_manual="US", enabled=False,
+        pinned_services=["AI服务"])
+    await add_subscription_node(s1, sub, name="Drop",
+                                config="Drop = trojan, 9.9.9.9, 443, password=y")
+    async with factory() as s2:
+        before_nodes = await node_snapshot(s2, sub_id)
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        AsyncMock(return_value=[node_payload("Renamed"),
+                                                other_payload("Fresh")]))
+
     calls = {"n": 0}
-    real_commit = db.commit
+    real_commit = s1.commit
 
     async def flaky_commit():
         calls["n"] += 1
         if calls["n"] == 2:
+            # 写事务 commit：先把全部 DML 真实送入事务再故障（非 mock echo）
+            await s1.flush()
             raise RuntimeError("disk i/o boom")
         await real_commit()
 
-    monkeypatch.setattr(db, "commit", flaky_commit)
-    result = await sync_subscription(db, subscription.id,
-                                     now=UTC_NOW + timedelta(hours=1))
+    monkeypatch.setattr(s1, "commit", flaky_commit)
+    result = await sync_subscription(s1, sub_id, now=UTC_NOW)
     assert result.success is False
     assert result.error_code == "internal_error"
     assert "boom" not in result.public_message
-    assert calls["n"] >= 2  # 失败状态事务已提交
-    assert await node_snapshot(db, subscription.id) == before
-    _, success, _, err, count = await sub_state(db, subscription.id)
-    assert success == UTC_NOW_NAIVE
-    assert err == "internal_error"
-    assert count == 1
+    assert calls["n"] >= 3  # 失败状态短事务已真实提交
+    # 全新会话验证：事务内 DML 全部回滚，人工字段/成功状态原样
+    async with factory() as s2:
+        assert await node_snapshot(s2, sub_id) == before_nodes
+        attempt, success, nxt, err, count = await sub_state(s2, sub_id)
+        assert attempt == UTC_NOW_NAIVE
+        assert success is None
+        assert count is None
+        assert err == "internal_error"
+        assert nxt == UTC_NOW_NAIVE + timedelta(seconds=900)
+    # 同会话可继续：下一次同步成功（commit 替身已恢复正常）
+    ok = await sync_subscription(s1, sub_id, now=UTC_NOW + timedelta(hours=1))
+    assert ok.success is True
+    async with factory() as s2:
+        after = await node_snapshot(s2, sub_id)
+    assert [n[1] for n in after] == ["Renamed", "Fresh"]
 
 
 # ===== 调度语义 =====
@@ -585,3 +640,171 @@ def test_sync_result_to_dict_exact_fields():
         "error_code": "timeout",
         "public_message": "订阅拉取超时，已保留上次可用节点",
     }
+
+
+# ===== Fix Round 1：快照事务边界 / 并发删除 / URL 竞态 / 取消传播 =====
+
+@pytest.mark.asyncio
+async def test_sync_snapshot_commit_failure_recovers_same_session(db, subscription, monkeypatch):
+    """阶段 1 只读 commit 故障：安全失败 DTO + 失败状态；同会话可继续同步"""
+    from unittest.mock import AsyncMock
+    await add_subscription_node(db, subscription, name="Keep")
+    calls = {"n": 0}
+    real_commit = db.commit
+
+    async def flaky_commit():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("snapshot boom /etc/secret")
+        await real_commit()
+
+    monkeypatch.setattr(db, "commit", flaky_commit)
+    result = await sync_subscription(db, subscription.id, now=UTC_NOW)
+    assert result.success is False
+    assert result.error_code == "internal_error"
+    assert "boom" not in result.public_message
+    assert "/etc/secret" not in result.public_message
+    # 失败状态短事务已提交（第 2 次 commit 恢复正常）
+    _, _, nxt, err, _ = await sub_state(db, subscription.id)
+    assert err == "internal_error"
+    assert nxt == UTC_NOW_NAIVE + timedelta(seconds=900)
+    # 同一 session 继续下一次同步成功
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        AsyncMock(return_value=[node_payload("Keep")]))
+    ok = await sync_subscription(db, subscription.id,
+                                 now=UTC_NOW + timedelta(hours=1))
+    assert ok.success is True
+
+
+@pytest.mark.asyncio
+async def test_sync_failure_concurrent_delete_returns_none(file_db, monkeypatch):
+    """拉取失败期间订阅被并发删除：失败状态事务发现不存在 → 返回 None"""
+    from sqlalchemy import delete as sa_delete
+    s1, factory = file_db
+    sub = await make_subscription(s1)
+    sub_id = sub.id  # rollback/过期后不再访问 s1 实例属性
+    await add_subscription_node(s1, sub, name="Keep")
+
+    async def fetch_fail_after_delete(url):
+        async with factory() as s2:
+            await s2.execute(sa_delete(ProxyNode).where(
+                ProxyNode.subscription_id == sub_id))
+            await s2.execute(sa_delete(Subscription).where(
+                Subscription.id == sub_id))
+            await s2.commit()
+        raise timeout_exc()
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        fetch_fail_after_delete)
+    assert await sync_subscription(s1, sub_id, now=UTC_NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_failure_count_uses_latest_from_record_txn(file_db, monkeypatch):
+    """失败 DTO node_count 用失败状态事务读到的最新值（并发成功已更新）"""
+    s1, factory = file_db
+    sub = await make_subscription(s1)
+    sub_id = sub.id  # rollback/过期后不再访问 s1 实例属性
+
+    async def fetch_fail_after_concurrent_success(url):
+        async with factory() as s2:
+            s2_sub = await s2.get(Subscription, sub_id)
+            s2_sub.last_node_count = 5
+            s2_sub.last_success_at = UTC_NOW_NAIVE
+            await s2.commit()
+        raise timeout_exc()
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        fetch_fail_after_concurrent_success)
+    result = await sync_subscription(s1, sub_id, now=UTC_NOW)
+    assert result.success is False
+    assert result.error_code == "timeout"
+    assert result.node_count == 5
+    async with factory() as s2:
+        s2_sub = await s2.get(Subscription, sub_id)
+        assert s2_sub.last_node_count == 5  # 失败路径不改写成功状态
+
+
+@pytest.mark.asyncio
+async def test_sync_stale_url_snapshot_rejects_write(file_db, monkeypatch, caplog):
+    """fetch 间隙 URL 被并发修改：写事务拒绝旧结果，安全失败且不泄漏 URL"""
+    s1, factory = file_db
+    sub = await make_subscription(s1)
+    sub_id = sub.id  # rollback/过期后不再访问 s1 实例属性
+    await add_subscription_node(s1, sub, name="Keep", region_manual="US")
+    async with factory() as s2:
+        before_nodes = await node_snapshot(s2, sub_id)
+
+    new_url = "https://changed.example.com/v2"
+
+    async def fetch_with_url_race(url):
+        async with factory() as s2:
+            s2_sub = await s2.get(Subscription, sub_id)
+            s2_sub.url = new_url
+            await s2.commit()
+        return [node_payload("Stale Rename")]
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        fetch_with_url_race)
+    with caplog.at_level(logging.ERROR, logger="app.services.subscription"):
+        result = await sync_subscription(s1, sub_id, now=UTC_NOW)
+    assert result.success is False
+    assert result.error_code == "internal_error"
+    assert new_url not in result.public_message
+    assert new_url not in caplog.text and URL not in caplog.text
+    # 旧拉取结果绝不落库：节点与成功状态原样，失败状态按 retry 语义记录
+    async with factory() as s2:
+        assert await node_snapshot(s2, sub_id) == before_nodes
+        attempt, success, nxt, err, _ = await sub_state(s2, sub_id)
+        assert attempt == UTC_NOW_NAIVE
+        assert success is None
+        assert err == "internal_error"
+        assert nxt == UTC_NOW_NAIVE + timedelta(seconds=900)
+
+
+@pytest.mark.asyncio
+async def test_sync_cancelled_error_propagates_from_fetch(db, subscription, monkeypatch):
+    """取消异常不被吞、不记失败状态（CancelledError 非 Exception 子类）"""
+    from unittest.mock import AsyncMock
+    await add_subscription_node(db, subscription, name="Keep")
+    before = await node_snapshot(db, subscription.id)
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await sync_subscription(db, subscription.id, now=UTC_NOW)
+    assert await node_snapshot(db, subscription.id) == before
+    attempt, success, _, err, _ = await sub_state(db, subscription.id)
+    assert attempt is None and success is None and err is None
+
+
+@pytest.mark.asyncio
+async def test_sync_cancelled_error_propagates_from_write(file_db, monkeypatch):
+    """写事务中被取消：先尽力回滚再传播；全新会话验证无 DML 残留、无失败状态"""
+    from unittest.mock import AsyncMock
+    s1, factory = file_db
+    sub = await make_subscription(s1)
+    sub_id = sub.id  # rollback/过期后不再访问 s1 实例属性
+    await add_subscription_node(s1, sub, name="Keep", region_manual="US")
+    async with factory() as s2:
+        before_nodes = await node_snapshot(s2, sub_id)
+
+    monkeypatch.setattr(subscription_service, "fetch_subscription",
+                        AsyncMock(return_value=[node_payload("Renamed")]))
+    calls = {"n": 0}
+    real_commit = s1.commit
+
+    async def cancel_on_write_commit():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            await s1.flush()  # 真实 DML 入事务后取消
+            raise asyncio.CancelledError()
+        await real_commit()
+
+    monkeypatch.setattr(s1, "commit", cancel_on_write_commit)
+    with pytest.raises(asyncio.CancelledError):
+        await sync_subscription(s1, sub_id, now=UTC_NOW)
+    async with factory() as s2:
+        assert await node_snapshot(s2, sub_id) == before_nodes
+        attempt, success, nxt, err, _ = await sub_state(s2, sub_id)
+        assert attempt is None and success is None
+        assert err is None and nxt is None
