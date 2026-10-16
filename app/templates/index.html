@@ -36,6 +36,29 @@
   </a>
 </div>
 
+<div class="stats sub-status-grid" id="sub-status" aria-live="polite">
+  <div class="stat-card sub-status-card is-due">
+    <span class="status-glyph glyph-due" aria-hidden="true"></span>
+    <div class="value" id="stat-due">-</div>
+    <div class="label">{{ t["dashboard.due"] }}</div>
+  </div>
+  <div class="stat-card sub-status-card is-healthy">
+    <span class="status-glyph glyph-healthy" aria-hidden="true"></span>
+    <div class="value" id="stat-healthy">-</div>
+    <div class="label">{{ t["dashboard.healthy"] }}</div>
+  </div>
+  <div class="stat-card sub-status-card is-failed">
+    <span class="status-glyph glyph-failed" aria-hidden="true"></span>
+    <div class="value" id="stat-failed">-</div>
+    <div class="label">{{ t["dashboard.failed"] }}</div>
+  </div>
+  <div class="stat-card sub-status-card is-never-synced">
+    <span class="status-glyph glyph-never" aria-hidden="true"></span>
+    <div class="value" id="stat-never-synced">-</div>
+    <div class="label">{{ t["dashboard.never_synced"] }}</div>
+  </div>
+</div>
+
 <div class="card">
   <div class="card-header">
     <h3>{{ t["dashboard.quick"] }}</h3>

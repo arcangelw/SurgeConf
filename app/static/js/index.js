@@ -2,16 +2,21 @@
 
 async function refreshStats() {
   try {
-    const [subs, nodesByRegion, regions, services, rules, profiles] = await Promise.all([
+    const [subs, nodesByRegion, regions, services, rules, profiles, statusSummary] = await Promise.all([
       API.get("/api/subscriptions"),
       API.get("/api/nodes/by-region"),
       API.get("/api/groups/regions"),
       API.get("/api/groups/services"),
       API.get("/api/configs/rules"),
       API.get("/api/configs/profiles"),
+      API.get("/api/subscriptions/status-summary"),
     ]);
 
     document.getElementById("stat-subs").textContent = subs.length;
+    document.getElementById("stat-due").textContent = statusSummary.due;
+    document.getElementById("stat-healthy").textContent = statusSummary.healthy;
+    document.getElementById("stat-failed").textContent = statusSummary.failed;
+    document.getElementById("stat-never-synced").textContent = statusSummary.never_synced;
     document.getElementById("stat-regions").textContent = regions.length;
     document.getElementById("stat-services").textContent = services.length;
     document.getElementById("stat-rules").textContent = rules.length;

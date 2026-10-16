@@ -952,6 +952,12 @@ async def test_subscription_interval_boundaries_accepted(client, interval):
     assert next(s for s in rows if s["id"] == sub_id)["update_interval"] == interval
 
 
+def _parse_api_utc(value):
+    """API UTC 时间（YYYY-MM-DDTHH:MM:SSZ）→ naive UTC datetime"""
+    from datetime import datetime
+    return datetime.fromisoformat(value.rstrip("Z"))
+
+
 async def _next_of(client, sub_id):
     rows = (await client.get("/api/subscriptions")).json()
     return next(s for s in rows if s["id"] == sub_id)["next_update_at"]
@@ -1000,11 +1006,12 @@ async def test_subscription_update_scheduling_matrix(client):
     assert await _next_of(client, sub_id) == created_next
 
     # 3) enabled+auto 下 interval 改变 → now + 新 interval
-    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+    # API 时间序列化按规范去微秒，t0 同步截断以对齐精度
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
     resp = await client.put(f"/api/subscriptions/{sub_id}",
                             json={"update_interval": 7200})
     assert resp.status_code == 200
-    nxt = datetime.fromisoformat(await _next_of(client, sub_id))
+    nxt = _parse_api_utc(await _next_of(client, sub_id))
     t1 = datetime.now(timezone.utc).replace(tzinfo=None)
     assert t0 + timedelta(seconds=7200) <= nxt <= t1 + timedelta(seconds=7200)
 
@@ -1013,9 +1020,10 @@ async def test_subscription_update_scheduling_matrix(client):
     assert await _next_of(client, sub_id) is None
 
     # 5) 从 auto-off 开启 → now（立即到期）
-    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+    # API 时间序列化按规范去微秒，t0 同步截断以对齐精度
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
     await client.put(f"/api/subscriptions/{sub_id}", json={"auto_update": True})
-    nxt = datetime.fromisoformat(await _next_of(client, sub_id))
+    nxt = _parse_api_utc(await _next_of(client, sub_id))
     t1 = datetime.now(timezone.utc).replace(tzinfo=None)
     assert t0 <= nxt <= t1
 

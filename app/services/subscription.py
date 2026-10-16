@@ -363,6 +363,9 @@ _ERROR_PUBLIC_MESSAGES = {
     "internal_error": "同步发生内部错误，已保留上次可用节点",
 }
 
+# 对外可见的同步错误码 allowlist（Task4 状态 DTO/序列化复用，防 router/service 漂移）
+SYNC_ERROR_CODES = frozenset(_ERROR_PUBLIC_MESSAGES)
+
 
 def safe_sync_error(exc: BaseException) -> tuple[str, str]:
     """把同步异常映射为固定错误码与公开消息。

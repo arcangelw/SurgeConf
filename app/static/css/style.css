@@ -427,6 +427,155 @@ textarea {
   margin-top: 4px;
 }
 
+/* ===== 订阅状态（Task 4）：图形 + 文本标识，不仅依赖颜色 ===== */
+
+/* 首页聚合卡：CSS 图形（时钟/对勾/叉/虚线圆）与文本标签同时呈现 */
+.sub-status-card { display: flex; flex-direction: column; gap: 2px; }
+
+.status-glyph {
+  position: relative;
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.glyph-due { border: 2px solid var(--warning); border-radius: 50%; }
+.glyph-due::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 5px;
+  background: var(--warning);
+  border-radius: 1px;
+  transform: translate(-50%, -100%);
+}
+
+.glyph-healthy::after {
+  content: "";
+  display: block;
+  width: 11px;
+  height: 6px;
+  border-left: 3px solid var(--success);
+  border-bottom: 3px solid var(--success);
+  border-radius: 1px;
+  transform: rotate(-45deg);
+  margin: 5px auto 0;
+}
+
+.glyph-failed::before,
+.glyph-failed::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 16px;
+  background: var(--danger);
+  border-radius: 2px;
+}
+.glyph-failed::before { transform: translate(-50%, -50%) rotate(45deg); }
+.glyph-failed::after { transform: translate(-50%, -50%) rotate(-45deg); }
+
+.glyph-never { border: 2px dashed var(--text2); border-radius: 50%; }
+
+/* 订阅详情卡状态徽章：小号图形跟随徽章前景色 */
+.status-badge { display: inline-flex; align-items: center; gap: 5px; }
+.status-due { background: rgba(253, 203, 110, 0.15); color: var(--warning); }
+.status-healthy { background: rgba(0, 184, 148, 0.15); color: var(--success); }
+.status-failed { background: rgba(231, 76, 60, 0.15); color: var(--danger); }
+.status-never_synced { background: rgba(139, 143, 163, 0.15); color: var(--text2); }
+.status-disabled { background: rgba(139, 143, 163, 0.15); color: var(--text2); }
+
+.status-glyph-sm {
+  position: relative;
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+}
+
+.glyph-sm-due { border: 1.5px solid currentColor; border-radius: 50%; }
+.glyph-sm-due::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 1px;
+  height: 3px;
+  background: currentColor;
+  transform: translate(-50%, -100%);
+}
+
+.glyph-sm-healthy::after {
+  content: "";
+  display: block;
+  width: 6px;
+  height: 3px;
+  border-left: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  margin: 2px auto 0;
+}
+
+.glyph-sm-failed::before,
+.glyph-sm-failed::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 1.5px;
+  height: 8px;
+  background: currentColor;
+}
+.glyph-sm-failed::before { transform: translate(-50%, -50%) rotate(45deg); }
+.glyph-sm-failed::after { transform: translate(-50%, -50%) rotate(-45deg); }
+
+.glyph-sm-never_synced { border: 1.5px dashed currentColor; border-radius: 50%; }
+.glyph-sm-disabled { border: 1.5px solid currentColor; border-radius: 50%; opacity: 0.7; }
+
+/* 订阅详情卡：服务端值全部 DOM API/textContent 填充 */
+.sub-detail-card .card-header h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sub-color-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sub-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text2);
+}
+
+.sub-meta-item { display: inline-flex; align-items: baseline; gap: 4px; min-width: 0; }
+.sub-meta-label { flex-shrink: 0; }
+.sub-meta-value { color: var(--text); font-weight: 500; overflow-wrap: anywhere; }
+.sub-tag-badge { flex-shrink: 0; }
+.sub-error-item .sub-meta-value { color: var(--danger); font-weight: 600; }
+
+/* 表单字段级提示（订阅更新间隔范围等） */
+.field-hint { font-size: 11px; color: var(--text2); margin-top: 4px; }
+
+@media (max-width: 768px) {
+  .sub-detail-meta { gap: 4px 10px; }
+  .sub-meta-value { overflow-wrap: break-word; }
+}
+
 /* 配置预览 */
 .config-preview {
   background: var(--surface2);

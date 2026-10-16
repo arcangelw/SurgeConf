@@ -2,6 +2,68 @@
  *  左栏：全部节点 / 订阅源 / 地区组（可拖拽排序）/ 服务组（可拖拽排序）
  *  右栏：按 selection 渲染——all=节点全表，sub=源信息+节点表，region=组信息+成员表，service=组信息+钉选成员表 */
 
+// ===== 订阅状态共享工具 =====
+
+/** 同步错误码 → i18n 键（后端已收敛五码；未知码前端同样收敛为 internal_error 文案） */
+const SUB_ERROR_CODE_KEYS = {
+  timeout: "sub.err.timeout",
+  http_status: "sub.err.http_status",
+  invalid_content: "sub.err.invalid_content",
+  network_error: "sub.err.network_error",
+  internal_error: "sub.err.internal_error",
+};
+
+function subErrorCodeKey(code) {
+  return SUB_ERROR_CODE_KEYS[code] || "sub.err.internal_error";
+}
+
+const SUB_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+/** 服务端颜色仅接受规范 #RRGGBB（其余 fallback），绝不透传进任何 style/属性 */
+function safeSubColor(color, fallback = "#6c5ce7") {
+  return typeof color === "string" && SUB_COLOR_RE.test(color) ? color.toLowerCase() : fallback;
+}
+
+/** 浏览器时区本地时间格式化（缓存单一 Intl.DateTimeFormat）；null/无效值安全占位 */
+let _subTimeFmt = null;
+function formatSubTime(iso, emptyKey) {
+  if (!iso) return I18N[emptyKey] || "—";
+  // 服务端约定输出带 Z；若缺时区后缀按 UTC 解释
+  const normalized = /Z$|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + "Z";
+  const ts = Date.parse(normalized);
+  if (Number.isNaN(ts)) return I18N["sub.time.invalid"] || "—";
+  if (!_subTimeFmt) {
+    _subTimeFmt = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+  }
+  return _subTimeFmt.format(ts);
+}
+
+/** 展示状态优先级：disabled > failed > never_synced > due > healthy（due 维度可与其他状态重叠） */
+function subStatus(sub, now = Date.now()) {
+  if (!sub.enabled) return "disabled";
+  if (sub.last_error_code) return "failed";
+  if (!sub.last_success_at) return "never_synced";
+  if (sub.auto_update && sub.next_update_at) {
+    const ts = Date.parse(sub.next_update_at);
+    if (!Number.isNaN(ts) && ts <= now) return "due";
+  }
+  return "healthy";
+}
+
+/** 状态徽章：文本 + CSS 图形标识（不仅依赖颜色） */
+function buildStatusBadge(sub) {
+  const status = subStatus(sub);
+  const badge = document.createElement("span");
+  badge.className = `badge status-badge status-${status}`;
+  const glyph = document.createElement("span");
+  glyph.className = `status-glyph-sm glyph-sm-${status}`;
+  glyph.setAttribute("aria-hidden", "true");
+  const text = document.createElement("span");
+  text.textContent = I18N[`sub.status.${status}`] || status;
+  badge.append(glyph, text);
+  return badge;
+}
+
 // ===== 状态 =====
 
 let selection = "all"; // "all" | "sub:{id}" | "region:{id}" | "service:{id}"
@@ -112,7 +174,7 @@ function renderSidebar() {
     section(I18N["proxies.section_subs"],
       allSubs.map(s => item(`sub:${s.id}`, translateName(s.name), {
         id: s.id,
-        dot: s.enabled ? (s.color || "#6c5ce7") : "var(--text2)",
+        dot: s.enabled ? safeSubColor(s.color) : "var(--text2)",
       })).join(""),
       `<button class="px-add" onclick="showAddModal()">+ ${I18N["btn.add"]}</button>`) +
     `<div id="px-region-list">` +
@@ -280,39 +342,102 @@ async function loadNodes() {
 async function renderSubDetail(subId) {
   const sub = allSubs.find(s => s.id === subId);
   const main = document.getElementById("px-main");
+  main.innerHTML = "";
   if (!sub) {
-    main.innerHTML = `<div class="card"><div class="empty"><p>${I18N["sub.empty"]}</p></div></div>`;
+    const card = document.createElement("div");
+    card.className = "card";
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    const p = document.createElement("p");
+    p.textContent = I18N["sub.empty"];
+    empty.appendChild(p);
+    card.appendChild(empty);
+    main.appendChild(card);
     return;
   }
-  // 列表响应不携带 URL：选中订阅时按需请求已认证详情端点
-  let subUrl = "";
-  try {
-    const detail = await API.get(`/api/subscriptions/${subId}`);
-    subUrl = detail.url || "";
-  } catch (e) { toast(e.message, "error"); }
-  main.innerHTML = `
-    <div class="card" style="margin-bottom:16px;">
-      <div class="card-header">
-        <div>
-          <h3 style="display:flex;align-items:center;gap:8px;">
-            <span style="width:10px;height:10px;border-radius:50%;background:${sub.color};flex-shrink:0;"></span>
-            ${escapeHtml(translateName(sub.name))}
-            <span class="badge ${sub.enabled ? 'badge-success' : 'badge-danger'}">${sub.enabled ? I18N["btn.enable"] : I18N["btn.disable"]}</span>
-          </h3>
-          <p style="font-size:12px;color:var(--text2);margin-top:4px;word-break:break-all;">${escapeHtml(subUrl)}</p>
-          <p style="font-size:12px;color:var(--text2);margin-top:2px;">
-            ${sub.tag ? `<span class="badge" style="background:${sub.color}22;color:${sub.color};border:1px solid ${sub.color}44;">${escapeHtml(sub.tag)}</span> ` : ""}
-            ${I18N["sub.last_success"]}: ${escapeHtml(sub.last_success_at || I18N["sub.not_synced"])}
-          </p>
-        </div>
-        <div class="px-info-actions">
-          <button class="btn btn-sm btn-success" onclick="syncOne(${sub.id}, this)">${I18N["btn.sync"]}</button>
-          <button class="btn btn-sm btn-outline" onclick='editSub(${JSON.stringify(sub)})'>${I18N["btn.edit"]}</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteSub(${sub.id}, '${escapeHtml(sub.name)}')">${I18N["btn.delete"]}</button>
-        </div>
-      </div>
-    </div>
-    <div class="card">
+  // 列表响应不含 URL：详情卡只展示状态；URL 仅在用户点击编辑时由 editSub 按需请求
+  const color = safeSubColor(sub.color);
+
+  const card = document.createElement("div");
+  card.className = "card sub-detail-card";
+  card.style.marginBottom = "16px";
+
+  const header = document.createElement("div");
+  header.className = "card-header";
+
+  const info = document.createElement("div");
+
+  const h3 = document.createElement("h3");
+  const dot = document.createElement("span");
+  dot.className = "sub-color-dot";
+  dot.style.background = color;
+  const nameEl = document.createElement("span");
+  nameEl.textContent = translateName(sub.name);
+  h3.append(dot, nameEl, buildStatusBadge(sub));
+  info.appendChild(h3);
+
+  const metaItem = (label, value, extraClass) => {
+    const item = document.createElement("span");
+    item.className = "sub-meta-item" + (extraClass ? ` ${extraClass}` : "");
+    const labelEl = document.createElement("span");
+    labelEl.className = "sub-meta-label";
+    labelEl.textContent = `${label}:`;
+    const valueEl = document.createElement("span");
+    valueEl.className = "sub-meta-value";
+    valueEl.textContent = value;
+    item.append(labelEl, valueEl);
+    return item;
+  };
+
+  const meta = document.createElement("div");
+  meta.className = "sub-detail-meta";
+  if (sub.tag) {
+    const tagBadge = document.createElement("span");
+    tagBadge.className = "badge sub-tag-badge";
+    tagBadge.style.background = color + "22";
+    tagBadge.style.color = color;
+    tagBadge.style.border = "1px solid " + color + "44";
+    tagBadge.textContent = sub.tag;
+    meta.appendChild(tagBadge);
+  }
+  meta.appendChild(metaItem(I18N["sub.last_attempt"],
+    formatSubTime(sub.last_attempt_at, "sub.not_synced")));
+  // 失败时保留上次成功时间（历史成功仍有参考价值）
+  meta.appendChild(metaItem(I18N["sub.last_success"],
+    formatSubTime(sub.last_success_at, "sub.not_synced")));
+  meta.appendChild(metaItem(I18N["sub.next_update"],
+    formatSubTime(sub.next_update_at, "sub.not_scheduled")));
+  meta.appendChild(metaItem(I18N["sub.node_count"],
+    sub.last_node_count == null ? "—" : String(sub.last_node_count)));
+  if (sub.last_error_code) {
+    meta.appendChild(metaItem(I18N["sub.error_title"],
+      I18N[subErrorCodeKey(sub.last_error_code)], "sub-error-item"));
+  }
+  info.appendChild(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "px-info-actions";
+  const mkBtn = (cls, label, onClick) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = cls;
+    btn.textContent = label;
+    btn.addEventListener("click", onClick);
+    return btn;
+  };
+  const syncBtn = mkBtn("btn btn-sm btn-success", I18N["btn.sync"], () => syncOne(sub.id, syncBtn));
+  const editBtn = mkBtn("btn btn-sm btn-outline", I18N["btn.edit"], () => editSub(sub));
+  const delBtn = mkBtn("btn btn-sm btn-danger", I18N["btn.delete"], () => deleteSub(sub.id, sub.name));
+  actions.append(syncBtn, editBtn, delBtn);
+
+  header.append(info, actions);
+  card.appendChild(header);
+  main.appendChild(card);
+
+  // 节点表：外壳模板仅插值 subId（parseInt 后的数字）与静态 i18n 文本
+  const tableCard = document.createElement("div");
+  tableCard.className = "card";
+  tableCard.innerHTML = `
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
         <input type="text" id="node-search" placeholder="${I18N["proxies.search_placeholder"]}"
           oninput="loadSubNodes(${subId})" style="width:160px;">
@@ -336,8 +461,8 @@ async function renderSubDetail(subId) {
       <div id="empty-state" class="empty" style="display:none;">
         <div class="icon">🌐</div>
         <p>${I18N["node.empty"]}</p>
-      </div>
-    </div>`;
+      </div>`;
+  main.appendChild(tableCard);
   loadSubNodes(subId);
 }
 
@@ -838,9 +963,11 @@ async function editSub(s) {
   document.getElementById("edit-id").value = s.id;
   document.getElementById("sub-name").value = s.name;
   document.getElementById("sub-tag").value = s.tag || "";
-  document.getElementById("sub-color").value = s.color || "#6c5ce7";
+  document.getElementById("sub-color").value = safeSubColor(s.color);
   document.getElementById("sub-url").value = subUrl;
-  document.getElementById("sub-enabled").checked = s.enabled;
+  document.getElementById("sub-enabled").checked = !!s.enabled;
+  document.getElementById("sub-auto-update").checked = !!s.auto_update;
+  document.getElementById("sub-interval").value = s.update_interval ?? 86400;
   showModal("sub-modal");
 }
 

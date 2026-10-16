@@ -105,7 +105,8 @@
     </div>
     <div class="form-group">
       <label>{{ t["sub.interval"] }}</label>
-      <input type="number" id="sub-interval" value="86400">
+      <input type="number" id="sub-interval" value="86400" min="300" max="604800" step="1">
+      <p class="field-hint">{{ t["sub.interval_hint"] }}</p>
     </div>
     <div class="modal-footer">
       <button class="btn btn-outline" onclick="hideModal('sub-modal')">{{ t["btn.cancel"] }}</button>

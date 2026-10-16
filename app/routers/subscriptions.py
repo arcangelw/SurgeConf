@@ -1,6 +1,7 @@
 """订阅管理 API"""
 
-from datetime import timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,11 +13,59 @@ from app.database import get_db
 from app.models import (Subscription, ProxyNode, UPDATE_INTERVAL_MIN,
                         UPDATE_INTERVAL_MAX)
 from app.services.subscription import (sync_subscription,
-                                       sync_all_subscriptions, _utc_naive)
+                                       sync_all_subscriptions, _utc_naive,
+                                       SYNC_ERROR_CODES)
 
 router = APIRouter(prefix="/api/subscriptions", tags=["订阅管理"])
 
 SUB_COLORS = ["#6c5ce7", "#00b894", "#e17055", "#0984e3", "#fdcb6e", "#e84393", "#00cec9", "#d63031"]
+
+# 规范颜色格式：仅接受 #RRGGBB（序列化时统一收敛为小写）
+SUB_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _palette_color(sub_id: int) -> str:
+    return SUB_COLORS[(sub_id - 1) % len(SUB_COLORS)]
+
+
+def _safe_color(value: Optional[str], sub_id: int) -> str:
+    """存量脏颜色收敛到调色板 fallback，绝不透传进前端样式"""
+    if isinstance(value, str) and SUB_COLOR_RE.match(value):
+        return value.lower()
+    return _palette_color(sub_id)
+
+
+def _iso_utc(value: Optional[datetime]) -> Optional[str]:
+    """时间序列化：DB naive 当 UTC、aware 转 UTC，去微秒输出 YYYY-MM-DDTHH:MM:SSZ"""
+    if value is None:
+        return None
+    dt = value.astimezone(timezone.utc) if value.tzinfo is not None else value
+    return dt.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _safe_error_code(code: Optional[str]) -> Optional[str]:
+    """错误码对外只允许固定五码：脏/未知码收敛为 internal_error，绝不原样返回"""
+    if code is None:
+        return None
+    return code if code in SYNC_ERROR_CODES else "internal_error"
+
+
+def _subscription_summary(sub: Subscription) -> dict:
+    """列表/详情共用安全摘要：固定 12 字段，绝不包含 url/created_at/server/config"""
+    return {
+        "id": sub.id,
+        "name": sub.name,
+        "tag": sub.tag,
+        "color": _safe_color(sub.color, sub.id),
+        "enabled": sub.enabled,
+        "auto_update": sub.auto_update,
+        "update_interval": sub.update_interval,
+        "last_attempt_at": _iso_utc(sub.last_attempt_at),
+        "last_success_at": _iso_utc(sub.last_success_at),
+        "next_update_at": _iso_utc(sub.next_update_at),
+        "last_error_code": _safe_error_code(sub.last_error_code),
+        "last_node_count": sub.last_node_count,
+    }
 
 
 class SubscriptionCreate(BaseModel):
@@ -28,6 +77,16 @@ class SubscriptionCreate(BaseModel):
     auto_update: bool = True
     update_interval: int = Field(default=86400, ge=UPDATE_INTERVAL_MIN,
                                  le=UPDATE_INTERVAL_MAX)
+
+    @field_validator("color")
+    @classmethod
+    def _validate_color(cls, value: Optional[str]) -> Optional[str]:
+        """null 表示清除（回退调色板）；非空必须是规范 #RRGGBB"""
+        if value is None:
+            return None
+        if not SUB_COLOR_RE.match(value):
+            raise ValueError("color 必须为 #RRGGBB 格式")
+        return value.lower()
 
 
 class SubscriptionUpdate(BaseModel):
@@ -48,54 +107,64 @@ class SubscriptionUpdate(BaseModel):
             raise ValueError("update_interval 不可为空")
         return value
 
+    @field_validator("color")
+    @classmethod
+    def _validate_color(cls, value: Optional[str]) -> Optional[str]:
+        """null 表示清除（回退调色板）；非空必须是规范 #RRGGBB"""
+        if value is None:
+            return None
+        if not SUB_COLOR_RE.match(value):
+            raise ValueError("color 必须为 #RRGGBB 格式")
+        return value.lower()
+
 
 @router.get("")
 async def list_subscriptions(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Subscription).order_by(Subscription.id))
-    subs = result.scalars().all()
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "tag": s.tag,
-            "color": s.color or SUB_COLORS[(s.id - 1) % len(SUB_COLORS)],
-            "enabled": s.enabled,
-            "auto_update": s.auto_update,
-            "update_interval": s.update_interval,
-            "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
-            "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
-            "next_update_at": s.next_update_at.isoformat() if s.next_update_at else None,
-            "last_error_code": s.last_error_code,
-            "last_node_count": s.last_node_count,
-            "created_at": s.created_at.isoformat() if s.created_at else None,
-        }
-        for s in subs
-    ]
+    return [_subscription_summary(s) for s in result.scalars().all()]
+
+
+@router.get("/status-summary")
+async def subscription_status_summary(db: AsyncSession = Depends(get_db)):
+    """订阅同步状态聚合（exact keys：due/healthy/failed/never_synced）。
+
+    - 只查询调度与状态列，不读/不返回 URL 或节点配置；
+    - 禁用订阅不进入任何一项；
+    - due = enabled+auto_update+next<=now（到期维度，可与其它状态重叠）；
+    - healthy = enabled+last_success 非空+error 空；
+      failed = enabled+error 非空；
+      never_synced = enabled+last_success 空（与 failed 可同时成立）。
+    """
+    rows = await db.execute(
+        select(Subscription.enabled, Subscription.auto_update,
+               Subscription.next_update_at, Subscription.last_success_at,
+               Subscription.last_error_code))
+    now = _utc_naive()
+    summary = {"due": 0, "healthy": 0, "failed": 0, "never_synced": 0}
+    for enabled, auto_update, next_at, success_at, error_code in rows.all():
+        if not enabled:
+            continue
+        if auto_update and next_at is not None and next_at <= now:
+            summary["due"] += 1
+        if error_code:
+            summary["failed"] += 1
+        if success_at is None:
+            summary["never_synced"] += 1
+        elif not error_code:
+            summary["healthy"] += 1
+    return summary
 
 
 @router.get("/{sub_id}")
 async def get_subscription(sub_id: int, db: AsyncSession = Depends(get_db)):
-    """已认证订阅详情：返回 URL 供编辑（列表不携带）"""
+    """已认证订阅详情：summary + url（url 仅供管理编辑回填；列表不携带）"""
     result = await db.execute(select(Subscription).where(Subscription.id == sub_id))
     sub = result.scalar_one_or_none()
     if not sub:
         raise HTTPException(404, "订阅不存在")
-    return {
-        "id": sub.id,
-        "name": sub.name,
-        "url": sub.url,
-        "tag": sub.tag,
-        "color": sub.color or SUB_COLORS[(sub.id - 1) % len(SUB_COLORS)],
-        "enabled": sub.enabled,
-        "auto_update": sub.auto_update,
-        "update_interval": sub.update_interval,
-        "last_attempt_at": sub.last_attempt_at.isoformat() if sub.last_attempt_at else None,
-        "last_success_at": sub.last_success_at.isoformat() if sub.last_success_at else None,
-        "next_update_at": sub.next_update_at.isoformat() if sub.next_update_at else None,
-        "last_error_code": sub.last_error_code,
-        "last_node_count": sub.last_node_count,
-        "created_at": sub.created_at.isoformat() if sub.created_at else None,
-    }
+    data = _subscription_summary(sub)
+    data["url"] = sub.url
+    return data
 
 
 @router.post("")
