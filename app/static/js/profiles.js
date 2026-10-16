@@ -133,10 +133,8 @@ const TABS = [
   { key: "generate", labelKey: "profile.tab_generate" },
 ];
 
-/** 目标可见页签：iOS 无 UDP 例外能力（udp_policy.py 矩阵），不渲染 UDP 页签 */
-function tabsVisibleFor(target) {
-  return target === "ios_mobile" ? TABS.filter(t => t.key !== "udp") : TABS;
-}
+// 全目标都渲染 UDP 页签：iOS 页签内仅模式（strict/compatible）与风险说明，
+// 不渲染任何例外控件（见 renderUdpTab）
 
 function activeTabOf(profileId) {
   return openSections.get(profileId)?.tab
@@ -175,7 +173,7 @@ async function loadData() {
           </div>
         </div>
         <div class="tab-bar" id="tab-bar-${p.id}">
-          ${tabsVisibleFor(p.target).map(t => `<button class="tab-btn${t.key === activeTab ? ' active' : ''}" data-tab="${t.key}"
+          ${TABS.map(t => `<button class="tab-btn${t.key === activeTab ? ' active' : ''}" data-tab="${t.key}"
             onclick="switchTab(${p.id}, '${t.key}')">${I18N[t.labelKey]}</button>`).join("")}
         </div>
         <div id="tab-content-${p.id}"></div>
@@ -202,13 +200,6 @@ function renderTabContent(profileId) {
   const tab = activeTabOf(profileId);
   const el = document.getElementById(`tab-content-${profileId}`);
   if (!el) return;
-  // iOS 档案没有 UDP 页签：残留展开状态（localStorage 陈旧值 / 目标刚切换）
-  // 不渲染任何例外控件，直接回退概览，绝无陈旧控件
-  const profile = allProfiles.find(p => p.id === profileId);
-  if (tab === "udp" && profile?.target === "ios_mobile") {
-    switchTab(profileId, "overview");
-    return;
-  }
   if (tab === "general") renderGeneralTab(profileId);
   else if (tab === "udp") renderUdpTab(profileId);
   else if (tab === "rules") renderRulesTab(profileId);
@@ -620,16 +611,21 @@ function renderUdpTab(profileId) {
   const el = document.getElementById(`tab-content-${profileId}`);
   const p = allProfiles.find(x => x.id === profileId);
   if (!el || !p) return;
-  if (p.target === "ios_mobile") {
-    // iOS：无例外管理，只显示能力说明与 compatible 的 WebRTC 风险提示
-    el.innerHTML = `
-      <p class="udp-note">${I18N["profile.udp_ios_note"]}</p>
-      <p class="udp-note udp-note-warn">${I18N["profile.udp_ios_webrtc_note"]}</p>`;
-    return;
-  }
   const modes = UDP_MODES_BY_TARGET[p.target] || UDP_MODES_BY_TARGET.mac_workstation;
   const modeOptions = modes.map(m =>
     `<option value="${m}"${m === p.udp_security_mode ? " selected" : ""}>${I18N[MODE_LABEL_KEYS[m]]}</option>`).join("");
+  // iOS：保留模式管理（strict/compatible）与风险说明；不渲染任何例外控件
+  if (p.target === "ios_mobile") {
+    el.innerHTML = `
+      <h3 style="font-size:14px;margin-bottom:8px;">${I18N["profile.mode_label"]}</h3>
+      <div class="udp-mode-row">
+        <select id="udp-mode-${profileId}" class="udp-mode-select" aria-label="${I18N["profile.mode_label"]}">${modeOptions}</select>
+        <button class="btn btn-sm btn-primary" onclick="saveUdpMode(${profileId}, this)">${I18N["profile.udp_mode_save"]}</button>
+      </div>
+      <p class="udp-note" style="margin-top:14px;">${I18N["profile.udp_ios_note"]}</p>
+      <p class="udp-note udp-note-warn">${I18N["profile.udp_ios_webrtc_note"]}</p>`;
+    return;
+  }
   const isGateway = p.target === "mac_gateway";
   const fastpathNote = isGateway ? `
     <div class="udp-fastpath" role="note">
@@ -664,25 +660,76 @@ function renderUdpTab(profileId) {
   loadUdpExceptions(profileId);
 }
 
+/** 单行例外（纯 DOM API 构建）：服务端 masked/display_name 只经 textContent
+ *  赋值，绝不进入 innerHTML/DOM 属性；操作按钮用 addEventListener 闭包持有
+ *  行级数据，任何服务端值不落到 onclick/data-*。 */
+function buildUdpExceptionRow(e, profileId) {
+  const tr = document.createElement("tr");
+
+  const tdValue = document.createElement("td");
+  const code = document.createElement("code");
+  code.style.fontSize = "12px";
+  code.textContent = e.match_value_masked;
+  tdValue.appendChild(code);
+  tr.appendChild(tdValue);
+
+  const tdName = document.createElement("td");
+  tdName.style.fontSize = "12px";
+  tdName.textContent = e.display_name || "-";
+  tr.appendChild(tdName);
+
+  const tdStatus = document.createElement("td");
+  const badge = document.createElement("span");
+  badge.className = `badge ${e.enabled ? "badge-success" : "badge-danger"}`;
+  badge.textContent = e.enabled ? I18N["btn.enable"] : I18N["btn.disable"];
+  tdStatus.appendChild(badge);
+  tr.appendChild(tdStatus);
+
+  const tdSort = document.createElement("td");
+  tdSort.style.fontSize = "12px";
+  tdSort.textContent = String(e.sort_order ?? 0);
+  tr.appendChild(tdSort);
+
+  const tdActions = document.createElement("td");
+  const btnEdit = document.createElement("button");
+  btnEdit.className = "btn btn-sm btn-outline";
+  btnEdit.type = "button";
+  btnEdit.textContent = I18N["btn.edit"];
+  btnEdit.addEventListener("click", () => editUdpException(e, profileId));
+  tdActions.appendChild(btnEdit);
+
+  const btnToggle = document.createElement("button");
+  btnToggle.className = `btn btn-sm ${e.enabled ? "btn-outline" : "btn-success"}`;
+  btnToggle.type = "button";
+  btnToggle.textContent = e.enabled ? I18N["btn.disable"] : I18N["btn.enable"];
+  btnToggle.addEventListener("click", () => toggleUdpException(e.id, !e.enabled, profileId));
+  tdActions.appendChild(btnToggle);
+
+  const btnDelete = document.createElement("button");
+  btnDelete.className = "btn btn-sm btn-danger";
+  btnDelete.type = "button";
+  btnDelete.textContent = I18N["btn.delete"];
+  // 从确认开始到 DELETE 结束整段禁用（withLoading）；双击第二击在
+  // disabled 守卫处直接返回（浏览器通常已不向 disabled 按钮派发 click）
+  btnDelete.addEventListener("click", () => {
+    if (btnDelete.disabled) return;
+    deleteUdpException(e.id, profileId, btnDelete);
+  });
+  tdActions.appendChild(btnDelete);
+
+  tr.appendChild(tdActions);
+  return tr;
+}
+
 async function loadUdpExceptions(profileId) {
   const tbody = document.getElementById(`udp-list-${profileId}`);
   if (!tbody) return;
   try {
     const list = await API.get(`/api/configs/profiles/${profileId}/udp-exceptions`);
     udpExceptionCounts.set(Number(profileId), list.length);
-    // 列表仅含服务端白名单字段（match_value_masked）：完整值从不进入本页任何状态
-    tbody.innerHTML = list.map(e => `
-      <tr>
-        <td><code style="font-size:12px;">${escapeHtml(e.match_value_masked)}</code></td>
-        <td style="font-size:12px;">${escapeHtml(e.display_name || "-")}</td>
-        <td><span class="badge ${e.enabled ? "badge-success" : "badge-danger"}">${e.enabled ? I18N["btn.enable"] : I18N["btn.disable"]}</span></td>
-        <td style="font-size:12px;">${escapeHtml(String(e.sort_order ?? 0))}</td>
-        <td>
-          <button class="btn btn-sm btn-outline" onclick='editUdpException(${JSON.stringify(e)}, ${profileId})'>${I18N["btn.edit"]}</button>
-          <button class="btn btn-sm ${e.enabled ? "btn-outline" : "btn-success"}" onclick="toggleUdpException(${e.id}, ${!e.enabled}, ${profileId})">${e.enabled ? I18N["btn.disable"] : I18N["btn.enable"]}</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteUdpException(${e.id}, ${profileId})">${I18N["btn.delete"]}</button>
-        </td>
-      </tr>`).join("");
+    // 列表仅含服务端白名单字段（match_value_masked）；行全部由 DOM API 构建
+    const rows = list.map(e => buildUdpExceptionRow(e, Number(profileId)));
+    tbody.replaceChildren(...rows);
     compactActions();
     updateScopedWarning(profileId, list);
   } catch (e) { toast(e.message, "error"); }
@@ -728,15 +775,19 @@ function udpExceptionDialog() {
   };
 }
 
-/** 对话框以任何方式（按钮/ESC/遮罩）离开 show 状态都立即丢弃输入的完整值 */
-function armUdpExceptionClearOnClose(dlg, valueInput) {
-  const observer = new MutationObserver(() => {
-    if (!dlg.classList.contains("show")) {
-      valueInput.value = "";
-      observer.disconnect();
-    }
+/** 对话框离开 show 状态（按钮/ESC/遮罩）即清空完整值输入。
+ *  单一持久 observer（首次打开时创建，永不累积）：无论开关多少次，
+ *  始终只有一个监听在守护，关闭即清空。 */
+let udpExceptionClearObserver = null;
+function ensureUdpExceptionClearObserver() {
+  if (udpExceptionClearObserver) return;
+  const dlg = document.getElementById("udp-exception-modal");
+  const input = document.getElementById("udp-exc-value");
+  if (!dlg || !input) return;
+  udpExceptionClearObserver = new MutationObserver(() => {
+    if (!dlg.classList.contains("show")) input.value = "";
   });
-  observer.observe(dlg, { attributes: true, attributeFilter: ["class"] });
+  udpExceptionClearObserver.observe(dlg, { attributes: true, attributeFilter: ["class"] });
 }
 
 function showAddUdpException(profileId) {
@@ -755,7 +806,7 @@ function showAddUdpException(profileId) {
   el.displayName.value = "";
   el.enabled.checked = true;
   el.sort.value = udpExceptionCounts.get(Number(profileId)) || 0;
-  armUdpExceptionClearOnClose(el.dlg, el.valueInput);
+  ensureUdpExceptionClearObserver();
   showModal("udp-exception-modal");
 }
 
@@ -777,7 +828,7 @@ function editUdpException(exc, profileId) {
   el.displayName.value = exc.display_name || "";
   el.enabled.checked = exc.enabled !== false;
   el.sort.value = exc.sort_order ?? 0;
-  armUdpExceptionClearOnClose(el.dlg, el.valueInput);
+  ensureUdpExceptionClearObserver();
   showModal("udp-exception-modal");
 }
 
@@ -831,13 +882,16 @@ async function toggleUdpException(excId, enabled, profileId) {
   } catch (e) { toast(e.message, "error"); }
 }
 
-async function deleteUdpException(excId, profileId) {
-  if (!(await confirmDialog(I18N["profile.udp_confirm_delete"], { danger: true }))) return;
-  try {
-    await API.del(`/api/configs/profiles/${profileId}/udp-exceptions/${excId}`);
-    toast(I18N["msg.deleted"]);
-    loadUdpExceptions(profileId);
-  } catch (e) { toast(e.message, "error"); }
+/** 从确认开始到 DELETE 结束整段禁用按钮（withLoading），双击仅发一次请求 */
+async function deleteUdpException(excId, profileId, btn) {
+  await withLoading(btn, async () => {
+    if (!(await confirmDialog(I18N["profile.udp_confirm_delete"], { danger: true }))) return;
+    try {
+      await API.del(`/api/configs/profiles/${profileId}/udp-exceptions/${excId}`);
+      toast(I18N["msg.deleted"]);
+      loadUdpExceptions(profileId);
+    } catch (e) { toast(e.message, "error"); }
+  });
 }
 
 // ===== 生成 Tab（generator.js 平移，profile 固定为当前方案） =====
