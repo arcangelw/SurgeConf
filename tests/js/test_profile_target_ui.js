@@ -135,9 +135,11 @@ function createProfilesPage({ role = "home_gateway", sessionFails = false, unaut
 }
 
 /** 独立 settings.js context */
-function createSettingsPage({ role = "work_computer", passwordConfigured = false, sessionFails = false } = {}) {
+function createSettingsPage({ role = "work_computer", passwordConfigured = false,
+                              sessionFails = false, putFails = false } = {}) {
   const elements = new Map();
-  const sessionState = { fails: sessionFails };
+  const sessionState = { fails: sessionFails, unauthenticated: false };
+  const putState = { fails: putFails };
   const calls = { put: [], toasts: [] };
   const documentStub = {
     documentElement: { lang: "zh" },
@@ -149,6 +151,7 @@ function createSettingsPage({ role = "work_computer", passwordConfigured = false
     async get(url) {
       if (url.includes("/api/auth/session")) {
         if (sessionState.fails) throw new Error("session unavailable");
+        if (sessionState.unauthenticated) return { authenticated: false };
         return { authenticated: true,
           installation_role: role, admin_access: "local_only",
           password_configured: passwordConfigured };
@@ -159,7 +162,11 @@ function createSettingsPage({ role = "work_computer", passwordConfigured = false
       return {};
     },
     async post(url, body) { return {}; },
-    async put(url, body) { calls.put.push({ url, body }); return {}; },
+    async put(url, body) {
+      calls.put.push({ url, body });
+      if (putState.fails) throw new Error("put failed");
+      return {};
+    },
     async del() { return {}; },
   };
   const sandbox = {
@@ -168,7 +175,16 @@ function createSettingsPage({ role = "work_computer", passwordConfigured = false
     location: { protocol: "http:", port: "61830", host: "127.0.0.1:61830" },
     navigator: {}, I18N: I18N_STUB, API,
     toast: (msg, type) => calls.toasts.push({ msg, type }),
-    withLoading: async (_btn, fn) => fn(),
+    // 与生产 app.js withLoading 逐行为一致：进入时快照 disabled → loading
+    // 置 true → finally 恢复快照（这正是 round 2 修复所针对的恢复语义）
+    withLoading: async (btn, fn) => {
+      if (!btn || !fn) return fn?.();
+      const prev = btn.disabled;
+      btn.disabled = true;
+      btn.classList.add("btn-loading");
+      try { return await fn(); }
+      finally { btn.disabled = prev; btn.classList.remove("btn-loading"); }
+    },
     confirmDialog: async () => true,
     console,
   };
@@ -176,7 +192,9 @@ function createSettingsPage({ role = "work_computer", passwordConfigured = false
   vm.runInContext(SETTINGS_SRC + `
 ;globalThis.__hooks = { saveAccess, loadAccess };`, sandbox, { filename: "settings.js" });
   const reg = (id, initial) => { const el = makeElement(initial); elements.set(id, el); return el; };
-  return { sandbox, elements, reg, calls, failSession: () => { sessionState.fails = true; } };
+  return { sandbox, elements, reg, calls,
+           failSession: () => { sessionState.fails = true; },
+           unauthenticateSession: () => { sessionState.unauthenticated = true; } };
 }
 
 const drain = () => new Promise((r) => setTimeout(r, 0));
@@ -352,7 +370,7 @@ const drain = () => new Promise((r) => setTimeout(r, 0));
     assert.ok(page.calls.toasts.some(t => t.msg.includes("加载失败")), "加载失败明确报错");
     assert.ok(allDisabled(els), "失败后表单保持禁用");
     // 程序触发 saveAccess（绕过 disabled 控件）：guard 仍拒绝
-    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    await page.sandbox.__hooks.saveAccess(els.save);
     assert.equal(page.calls.put.length, 0, "guard 拒绝未加载状态的提交");
     assert.ok(page.calls.toasts.some(t => t.msg.includes("加载失败")), "guard 报错提示");
   }
@@ -365,7 +383,7 @@ const drain = () => new Promise((r) => setTimeout(r, 0));
     page.failSession();  // 切换 stub 为失败
     await page.sandbox.__hooks.loadAccess();
     assert.ok(allDisabled(els), "成功后再失败必须回锁全部控件");
-    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    await page.sandbox.__hooks.saveAccess(els.save);
     assert.equal(page.calls.put.length, 0, "guard 复位后拒绝提交");
   }
   {
@@ -375,14 +393,14 @@ const drain = () => new Promise((r) => setTimeout(r, 0));
     await page.sandbox.__hooks.loadAccess();
     assert.equal(els.role.value, "work_computer", "loadAccess 回显实例角色");
     assert.ok(!allDisabled(els), "成功后全部启用");
-    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    await page.sandbox.__hooks.saveAccess(els.save);
     assert.equal(page.calls.put.length, 1);
     assert.equal(page.calls.put[0].url, "/api/settings/access");
     assert.equal(page.calls.put[0].body.installation_role, "work_computer",
       "saveAccess 提交 select 当前值（回显后的角色）");
     // 用户显式改选后提交所选值（非硬编码）
     els.role.value = "home_gateway";
-    await page.sandbox.__hooks.saveAccess(await Promise.resolve({}));
+    await page.sandbox.__hooks.saveAccess(els.save);
     assert.equal(page.calls.put.length, 2);
     assert.equal(page.calls.put[1].body.installation_role, "home_gateway",
       "saveAccess 提交用户改选的角色");
@@ -393,6 +411,49 @@ const drain = () => new Promise((r) => setTimeout(r, 0));
     const els = regAccessForm(page, { roleValue: "work_computer" });
     await page.sandbox.__hooks.loadAccess();
     assert.equal(els.role.value, "home_gateway", "非法角色回落默认");
+  }
+  // ===== Round 2：saveAccess 组合路径以 accessLoaded 为最终权威 =====
+  // withLoading 为生产语义（快照恢复 disabled），四条路径逐一断言最终 DOM 与 PUT 次数
+  {
+    // 路径1：保存请求本身失败 → 最终全部禁用（按钮不被 withLoading 恢复为可点）
+    const page = createSettingsPage({ role: "work_computer", putFails: true });
+    const els = regAccessForm(page);
+    await page.sandbox.__hooks.loadAccess();
+    assert.ok(!allDisabled(els), "保存前已启用");
+    await page.sandbox.__hooks.saveAccess(els.save);
+    assert.equal(page.calls.put.length, 1, "PUT 尝试恰好一次");
+    assert.ok(allDisabled(els), "PUT 失败后最终全部禁用（含保存按钮）");
+    assert.equal(els.save.disabled, true, "保存按钮不被 withLoading 快照恢复为 false");
+  }
+  {
+    // 路径2：保存成功后 reload 失败 → 全部禁用
+    const page = createSettingsPage({ role: "work_computer" });
+    const els = regAccessForm(page);
+    await page.sandbox.__hooks.loadAccess();
+    page.failSession();  // PUT 将成功，随后的 session 回读失败
+    await page.sandbox.__hooks.saveAccess(els.save);
+    assert.equal(page.calls.put.length, 1, "PUT 成功一次");
+    assert.ok(allDisabled(els), "保存成功但回读失败最终全部禁用");
+  }
+  {
+    // 路径3：切 lan 后隐式会话失效（回读 authenticated:false）→ 全部禁用
+    const page = createSettingsPage({ role: "work_computer" });
+    const els = regAccessForm(page);
+    await page.sandbox.__hooks.loadAccess();
+    page.unauthenticateSession();
+    await page.sandbox.__hooks.saveAccess(els.save);
+    assert.equal(page.calls.put.length, 1, "PUT 成功一次");
+    assert.ok(allDisabled(els), "回读未认证最终全部禁用");
+  }
+  {
+    // 路径4：成功 reload → 保持启用且按钮可点（false 为真实快照恢复值）
+    const page = createSettingsPage({ role: "work_computer" });
+    const els = regAccessForm(page);
+    await page.sandbox.__hooks.loadAccess();
+    await page.sandbox.__hooks.saveAccess(els.save);
+    assert.equal(page.calls.put.length, 1);
+    assert.ok(!allDisabled(els), "成功回读后保持全部启用");
+    assert.equal(els.save.disabled, false, "成功路径按钮恢复可点");
   }
 
   console.log("test_profile_target_ui.js: all assertions passed");

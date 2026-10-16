@@ -156,7 +156,10 @@ async function saveAccess(btn) {
     toast(I18N["settings.access_password_required"], "error");
     return;
   }
+  // 进入保存即视为「会话未确认」：只有组合路径末尾的 loadAccess 成功回读
+  // 才恢复可用。PUT 失败 / 回读失败 / 回读未认证时 accessLoaded 均为 false
   await withLoading(btn, async () => {
+    accessLoaded = false;
     try {
       await API.put("/api/settings/access", {
         installation_role: role,
@@ -170,6 +173,10 @@ async function saveAccess(btn) {
       await loadAccess();
     } catch (e) { toast(e.message, "error"); }
   });
+  // withLoading 的 finally 按进入时快照恢复按钮 disabled（此时快照是 false）；
+  // 组合路径结束后以 accessLoaded 为最终权威重施门控，否则「保存成功但回读
+  // 失败」场景下按钮会被 withLoading 恢复为可点，违背锁定承诺
+  if (!accessLoaded) setAccessFormDisabled(true);
 }
 
 // ===== 系统级配置 =====
