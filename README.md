@@ -178,10 +178,10 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
 ### 升级与运行数据
 
 ```bash
-cd <SurgeConf 目录> && git pull && ./surgeconf.sh restart   # 迁移幂等、静默执行
+cd <SurgeConf 目录> && git pull && ./venv/bin/python -m pip install -r requirements.txt && ./surgeconf.sh restart   # 迁移幂等、静默执行
 ```
 
-- 升级后的逐项验证（数据迁移、产物断言、三平台 UDP 验收清单）见 [docs/MIGRATION_VERIFY.md](docs/MIGRATION_VERIFY.md)；多设备部署照此指南在各设备执行。
+- 升级后的逐项验证（数据迁移、产物断言、三平台 UDP 验收清单）见 [docs/MIGRATION_VERIFY.md](docs/MIGRATION_VERIFY.md)；多设备部署照此指南在各设备执行。升级链 fail-fast：`git pull` 或依赖安装任一失败即中止、不重启服务，修复后重新执行整条命令。
 - 数据库与备份位于 `SURGECONF_DATA_DIR`（默认 `~/Library/Application Support/SurgeConf`），日志在 `~/Library/Logs/SurgeConf/surgeconf.log`；仓库目录不存放任何运行数据。
 - 三平台物理设备（Mac 工作站 / 家庭网关 / Surge iOS 5.14.6）的加载与观察属人工验收步骤，以 MIGRATION_VERIFY 清单为准记录结论。
 

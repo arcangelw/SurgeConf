@@ -27,10 +27,10 @@ LOG="$HOME/Library/Logs/SurgeConf/surgeconf.log"
 6. **抖音优先直连**：补齐 `DouYin` 规则源并放在 `TikTok` 之前。两者都覆盖 `snssdk.com`，优先直连可避免抖音评论、视频和直播误走 TikTok 海外出口。
 
    验证：`SELECT name,action,sort_order FROM rule_sources WHERE name IN ('DouYin','TikTok') ORDER BY sort_order;` 中 `DouYin / 大陆直连` 位于 `TikTok` 之前。
-7. **恢复媒体 QUIC 性能**：删除旧版全局 `UDP/443 → REJECT`，并补 `block-quic = per-policy`。DIRECT 保留 QUIC/HTTP3，代理按 UDP 能力自适应处理；STUN 防泄漏改为按档案模式注入（见第 9 条）。
+7. **恢复媒体 QUIC 性能**：删除项目托管的旧全局 `UDP/443 → REJECT` 内置行（`remove_global_quic_v1`，精确文本匹配），并补 `block-quic = per-policy`。DIRECT 保留 QUIC/HTTP3，代理按 UDP 能力自适应处理；STUN 防泄漏改为按档案模式注入（见第 9 条）。用户自建的类似规则不被该迁移识别为托管行，照常保留——如已不需要可自行删除，不判迁移失败。
 8. **`no_resolve_keywords` 系统键退役**：IP 类规则集的 no-resolve 判定已结构化（`rule_sources.ip_rules` 布尔列），关键词系统键不再被生成器读取，迁移删除该键避免面板残留失效配置。
 9. **UDP 安全改为按档案动态生成**（`udp_security_modes_v1`）：
-   - **v1 清理只删除冻结签名的旧全局托管行**：`profile_id IS NULL` + `position='pre'` + `sort_order` 精确相等 + `comment` 精确相等 + `rule_text` 仅空白差异（签名见 `app/default_config.py::LEGACY_MANAGED_STUN_SIGNATURES`，即历史四条全局 STUN 阻断）。曾手改过 `comment` 或 `sort_order` 的 lookalike 一律视为用户规则保留——既不误删，也不复活。
+   - **v1 清理只删除冻结签名的旧全局托管行**：`profile_id IS NULL` + `position='pre'` + `sort_order` 精确相等 + `comment` 精确相等 + `rule_text` 匹配时**仅忽略逗号两侧的 ASCII 空格/Tab**（行首尾空白、token 内部空白、Unicode 空白与大小写一律保留；含 CR/LF 的行直接判不匹配）（签名见 `app/default_config.py::LEGACY_MANAGED_STUN_SIGNATURES`，即历史四条全局 STUN 阻断）。曾手改过 `comment` 或 `sort_order` 的 lookalike 一律视为用户规则保留——既不误删，也不复活。
    - **新托管 STUN 规则动态生成，绝不落库**（`custom_rules` 中不再有任何托管 STUN 行）。生成器按每个档案的 `udp_security_mode` 注入：
 
      | 模式 | 产物 `[Rule]` 段（注释行 `# >> 托管 UDP 安全规则` 之后、第一条 RULE-SET 之前） |
@@ -49,8 +49,8 @@ LOG="$HOME/Library/Logs/SurgeConf/surgeconf.log"
 grep "数据迁移" "$LOG"
 ```
 
-- 老库首次启动：每个未记账迁移各一行 `[数据迁移] <key>: <N> 项变更`（例：`[数据迁移] udp_security_modes_v1: 4 项变更`；`N=0` 也合法——该设备老库本就没有可删行，记账本身即迁移已执行）
-- 新库或已迁移库：无新增行（幂等，无变更不打印）
+- 老库首次启动：每个未记账且**实际产生变更**的迁移各打印一行 `[数据迁移] <key>: <N> 项变更`（例：`[数据迁移] udp_security_modes_v1: 4 项变更`）。**零变更的迁移只记账、不打印日志**——因此首次执行 `udp_security_modes_v1` 若老库本就没有可删行（N=0），日志无此行，属正常；是否执行以 `data_migration_records` 计数确认（见步骤 2），不能以日志有无判定。
+- 新库或已迁移库：无新增日志行、`data_migration_records` 无新增记录（幂等）。
 
 ### 2. UDP 安全迁移与例外（只读计数，不回显值）
 
@@ -113,7 +113,7 @@ RULE-SET,<URL 含 /ip/ 的规则集>,<任意策略>,no-resolve  ← 至少一行
 | `scoped` | 例外 DIRECT 行在前（示例：`AND,((MAC-ADDRESS,02:00:00:00:00:01),(PROTOCOL,UDP)),DIRECT`，规范占位值），四条 REJECT 按上表顺序殿后；无启用例外时与 strict 相同 |
 | `compatible` | 无 `# >> 托管 UDP 安全规则` 段、无任何托管 STUN 行；`ios_mobile` 产物恒无 `PROCESS-*` / `MAC-ADDRESS` 规则 |
 
-任何产物不应再出现全局 `UDP/443 → REJECT` 行。说明：RULE-SET 行的策略随设备配置而异，判定依据是「URL 含 /ip/ 且以 ,no-resolve 结尾」而非具体策略名。
+产物断言口径：**项目托管的全局 `UDP/443 → REJECT` 不再生成**；你自建的类似规则（如历史手工添加）照常保留在产物中，属正常不算迁移失败——如已不需要，在管理界面删除即可。说明：RULE-SET 行的策略随设备配置而异，判定依据是「URL 含 /ip/ 且以 ,no-resolve 结尾」而非具体策略名。
 
 ### 6. 运行时实测（Surge 已重载新配置后）
 
@@ -148,11 +148,13 @@ ifconfig | grep "inet6" | grep -v "fe80::" | grep -v "::1"   # 无输出 ✓
 ### 7. 幂等确认
 
 ```bash
-BEFORE=$(grep -c "数据迁移" "$LOG"); ./surgeconf.sh restart && sleep 4; \
-AFTER=$(grep -c "数据迁移" "$LOG"); echo "$BEFORE -> $AFTER"
+R_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM data_migration_records;")
+L_BEFORE=$(grep -c "数据迁移" "$LOG"); ./surgeconf.sh restart && sleep 4; \
+L_AFTER=$(grep -c "数据迁移" "$LOG"); R_AFTER=$(sqlite3 "$DB" "SELECT COUNT(*) FROM data_migration_records;"); \
+echo "日志 $L_BEFORE -> $L_AFTER；记录 $R_BEFORE -> $R_AFTER"
 ```
 
-判定：`AFTER == BEFORE`（无新增迁移日志行；历史已有行不计增量）。
+判定：`L_AFTER == L_BEFORE` 且 `R_AFTER == R_BEFORE`（无新增迁移日志行，也无新增记账记录；历史已有行不计增量。注意零变更迁移不打印日志，故幂等判定必须包含记录数比对）。
 
 ## 三平台 UDP 验收清单
 
@@ -165,7 +167,7 @@ AFTER=$(grep -c "数据迁移" "$LOG"); echo "$BEFORE -> $AFTER"
 | 项 | 手段 |
 |---|---|
 | 三模式托管行数量与顺序（strict 四条 / scoped 例外后四条 / compatible 零托管） | `tests/test_udp_policy.py`、`tests/test_generator.py` |
-| 产物无全局 UDP/443 拒绝、General 强制键（`block-quic = per-policy`、`udp-policy-not-supported-behaviour = REJECT`） | `tests/test_generator.py` |
+| 产物无项目托管的全局 UDP/443 拒绝（用户自建除外）、General 强制键（`block-quic = per-policy`、`udp-policy-not-supported-behaviour = REJECT`） | `tests/test_generator.py` |
 | iOS 产物无 `PROCESS-*` / `MAC-ADDRESS` 规则 | `tests/test_target_rule_capabilities.py` |
 | Mac 两目标产物通过 Surge Mac 6.6.0 `surge-cli --check` | 开发机 CLI 校验（本计划 Task 6 执行） |
 | 仓库文档无真实 MAC / 私网地址 / 用户目录 / 凭据 | `tests/test_open_source_safety.py` |
@@ -179,7 +181,7 @@ AFTER=$(grep -c "数据迁移" "$LOG"); echo "$BEFORE -> $AFTER"
    '/Applications/Surge.app/Contents/Applications/surge-cli' --raw dump rule
    ```
 
-   预期：例外进程 DIRECT 规则位于四条 STUN REJECT 之前；无全局 UDP/443 拒绝行。
+   预期：例外进程 DIRECT 规则位于四条 STUN REJECT 之前；无**项目托管的**全局 UDP/443 拒绝行（你自建的历史规则照常保留——若已不需要，可自行删除，不判迁移失败）。
 3. 启动配置为例外的实时视频/通话应用，确认画面与声音正常（UDP 放行生效）。
 4. 浏览器 WebRTC 检测页：不出现公开直连 STUN 候选（例外进程之外的防护仍生效）。
 
@@ -206,10 +208,10 @@ AFTER=$(grep -c "数据迁移" "$LOG"); echo "$BEFORE -> $AFTER"
 ## 静默升级操作（其他设备）
 
 ```bash
-cd <SurgeConf 目录> && git pull && ./surgeconf.sh restart
+cd <SurgeConf 目录> && git pull && ./venv/bin/python -m pip install -r requirements.txt && ./surgeconf.sh restart
 ```
 
-- 迁移自动执行、幂等、无交互；用户自定义值（非旧默认）不会被覆盖。
+- 迁移自动执行、幂等、无交互；用户自定义值（非旧默认）不会被覆盖。升级链为 fail-fast：`git pull` 或依赖安装（`pip install -r requirements.txt`）任一失败即中止，不会重启服务——修复后重新执行整条命令。
 - SurgeConf 侧完成后，Surge 客户端需重载 profile（若开启「自动重载外置配置」则完全静默）。
 - 前端静态资源版本随 git HEAD 自动更新（`?v=<hash>`），浏览器普通刷新即拉新，无需清缓存。
 

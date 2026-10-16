@@ -23,7 +23,7 @@
 
 ```bash
 cd <SurgeConf 目录>
-git pull && ./surgeconf.sh restart && sleep 3
+git pull && ./venv/bin/python -m pip install -r requirements.txt && ./surgeconf.sh restart && sleep 3   # fail-fast：拉取/依赖安装失败即中止，不重启
 ./venv/bin/python -m pytest tests/ -q        # 应 112 passed
 ```
 
