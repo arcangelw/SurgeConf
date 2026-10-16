@@ -20,7 +20,7 @@ DATA_MIGRATION_KEYS = {
     "dns_defaults_v1", "remove_global_quic_v1", "no_resolve_keywords_v1",
     "dangling_rule_source_actions_v1",
     "rule_source_ip_flags_v1", "rule_source_order_invariants_v1",
-    "retire_no_resolve_keywords_v1",
+    "retire_no_resolve_keywords_v1", "udp_security_modes_v1",
 }
 
 

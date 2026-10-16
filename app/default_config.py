@@ -464,6 +464,28 @@ DEFAULT_PRE_RULES = [
      "comment": "拦截 YouTube UDP 流量"},
     {"rule_text": "DOMAIN-SUFFIX,z.ai,大陆直连", "position": "pre", "sort_order": 11,
      "comment": "智谱AI"},
+    {"rule_text": "DOMAIN-SUFFIX,claudeusercontent.com,AI服务", "position": "pre", "sort_order": 95,
+     "comment": "Claude Artifacts 用户内容 CDN 归组 AI 服务"},
+]
+
+# 内置安全规则（随版本分发的防护，老库启动时幂等补齐；只增不删，不复活用户删过的其他默认规则）
+# ⚠ sort_order >= 90 是安全规则保留区：新增普通默认规则勿使用 90+，否则会被当安全规则在每次启动时强制补齐（用户删除后复活）
+# 注：历史四条全局 STUN 阻断已迁出（UDP 安全改为按档案 udp_security_mode 动态注入，见 app/udp_policy.py），
+# 存量库由数据迁移 udp_security_modes_v1 精确清除，勿再将其加回任何播种/补种列表
+SECURITY_PRE_RULES = [r for r in DEFAULT_PRE_RULES if r["sort_order"] >= 90]
+
+# 托管 STUN 阻断的生成文本：仅由生成器按档案 UDP 安全模式动态注入（Task 4 接入），
+# 绝不持久化为 CustomRule；顺序即注入顺序
+MANAGED_STUN_RULES = (
+    "DOMAIN-KEYWORD,stun,REJECT",
+    "AND,((PROTOCOL,UDP),(DEST-PORT,3478)),REJECT",
+    "AND,((PROTOCOL,UDP),(DEST-PORT,19302)),REJECT",
+    "PROTOCOL,STUN,REJECT",
+)
+
+# 历史内置全局 STUN 阻断的冻结签名（d8d36a3 引入、eb5b7bf 补齐第四条，文本从未变更）。
+# 仅供数据迁移 udp_security_modes_v1 做精确删除比对，禁止用于播种/补种/生成
+LEGACY_MANAGED_STUN_SIGNATURES = (
     {"rule_text": "DOMAIN-KEYWORD,stun,REJECT", "position": "pre", "sort_order": 90,
      "comment": "阻断 STUN 防止 WebRTC 泄露真实出口"},
     {"rule_text": "AND,((PROTOCOL,UDP), (DEST-PORT,3478)),REJECT", "position": "pre", "sort_order": 91,
@@ -472,14 +494,7 @@ DEFAULT_PRE_RULES = [
      "comment": "阻断 IP 直连 STUN (UDP 19302)"},
     {"rule_text": "PROTOCOL,STUN,REJECT", "position": "pre", "sort_order": 94,
      "comment": "DPI 级阻断任意端口 STUN，兜底非标端口探测"},
-    {"rule_text": "DOMAIN-SUFFIX,claudeusercontent.com,AI服务", "position": "pre", "sort_order": 95,
-     "comment": "Claude Artifacts 用户内容 CDN 归组 AI 服务"},
-]
-
-
-# 内置安全规则（随版本分发的防护，老库启动时幂等补齐；只增不删，不复活用户删过的其他默认规则）
-# ⚠ sort_order >= 90 是安全规则保留区：新增普通默认规则勿使用 90+，否则会被当安全规则在每次启动时强制补齐（用户删除后复活）
-SECURITY_PRE_RULES = [r for r in DEFAULT_PRE_RULES if r["sort_order"] >= 90]
+)
 
 # 通用自定义规则 - 放在规则集之后，补充未覆盖的域名
 DEFAULT_GENERAL_RULES = [

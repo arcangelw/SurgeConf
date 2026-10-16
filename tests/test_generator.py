@@ -863,3 +863,23 @@ async def test_locale_target_and_general_never_cross_profiles(db, two_profiles):
     assert "loglevel = debug" not in first_general
     assert "second.example" not in first_config
     assert DEFAULT_MITM["hostname"] in first_config
+
+
+@pytest.mark.asyncio
+async def test_generated_config_keeps_user_stun_without_managed_block(db):
+    """托管 STUN 阻断迁出默认值后（Task 4 动态注入前）：默认产物不补回
+    STUN 托管规则与全局 UDP/443 阻断；用户自建 STUN 规则照常输出"""
+    db.add(CustomRule(profile_id=None, position="pre", sort_order=50, enabled=True,
+                      rule_text="PROTOCOL,STUN,REJECT", comment="user-owned"))
+    await db.commit()
+
+    config = await generate_surge_config(db)
+
+    # 用户自建 STUN 规则照常输出
+    assert "PROTOCOL,STUN,REJECT" in config
+    # 默认产物不含四条托管 STUN 与全局 UDP/443 阻断（生成器无硬编码注入）
+    assert "DOMAIN-KEYWORD,stun,REJECT" not in config
+    assert "DEST-PORT,3478" not in config
+    assert "DEST-PORT,19302" not in config
+    assert "DEST-PORT,443" not in config
+    assert "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT" not in config

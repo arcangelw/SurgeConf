@@ -1,4 +1,4 @@
-"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键 / 悬空规则源引用修复 / 顺序不变量重排 / IP 标记回填）
+"""数据迁移 apply_data_migrations 行为测试（内置安全规则 / ipv6-vif 归一 / DNS 默认值升级 / 系统键 / 悬空规则源引用修复 / 顺序不变量重排 / IP 标记回填 / 托管 STUN 规则退役）
 
 持久化验证要点：断言一律通过独立新 session（db.bind 新开）查询，
 防止 autoflush 后未 commit 的事务内可见性造成假阳性。
@@ -8,9 +8,13 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.services.data_migrations import apply_data_migrations
-from app.models import CustomRule, ConfigProfile, ProxyNode, SystemConfig, RuleSource
-from app.default_config import DEFAULT_RULE_SOURCES, SECURITY_PRE_RULES
+from app.services import data_migrations
+from app.services.data_migrations import apply_data_migrations, has_data_migration
+from app.models import (CustomRule, ConfigProfile, ProxyNode, SystemConfig, RuleSource,
+                        DataMigrationRecord)
+from app.default_config import (DEFAULT_PRE_RULES, DEFAULT_RULE_SOURCES,
+                                LEGACY_MANAGED_STUN_SIGNATURES, SECURITY_PRE_RULES)
+from app.bootstrap import seed_defaults
 
 
 async def _fresh_view(db) -> AsyncSession:
@@ -26,7 +30,7 @@ def _factory(db):
 
 @pytest.mark.asyncio
 async def test_security_rules_backfilled_on_legacy_db(db):
-    """老库（无内置安全规则）迁移后补齐 STUN 阻断三条，且已持久化"""
+    """老库（无内置安全规则）迁移后补齐现役内置安全规则，且已持久化"""
     before = (await db.execute(select(CustomRule.rule_text))).scalars().all()
     assert not any("stun" in r.lower() for r in before), "前置条件：老库无 STUN 规则"
 
@@ -595,3 +599,173 @@ async def test_ip_flags_backfill_builtin_only_and_idempotent(db):
     assert sources["ASN China"].ip_rules is True
     assert sources["Domestic (non_ip)"].ip_rules is False
     assert sources["自家 IP 集"].ip_rules is False  # 自定义源不按 URL 猜
+
+# ===== udp_security_modes_v1：托管 STUN 规则退役（迁出持久化默认值）=====
+
+
+def _add_legacy_stun_rules(db) -> list[CustomRule]:
+    """按历史内置完整签名（d8d36a3 引入 / eb5b7bf 补齐）种入托管 STUN 规则"""
+    rules = [CustomRule(profile_id=None, enabled=True, **sig)
+             for sig in LEGACY_MANAGED_STUN_SIGNATURES]
+    db.add_all(rules)
+    return rules
+
+
+@pytest.mark.asyncio
+async def test_fresh_bootstrap_seed_contains_no_managed_stun_rules(db_fk_on):
+    """fresh DB 完整播种不得再产生四条 STUN CustomRule 与全局 UDP/443 阻断；
+    其余默认 pre 规则原样保留"""
+    factory = async_sessionmaker(db_fk_on.bind, class_=AsyncSession, expire_on_commit=False)
+    await seed_defaults(factory)
+
+    async with factory() as fresh:
+        rows = (await fresh.execute(
+            select(CustomRule.rule_text).where(CustomRule.position == "pre")
+        )).scalars().all()
+    texts = set(rows)
+    for sig in LEGACY_MANAGED_STUN_SIGNATURES:
+        assert sig["rule_text"] not in texts
+    assert "AND,((PROTOCOL,UDP), (DEST-PORT,443)),REJECT" not in texts
+    assert texts == {r["rule_text"] for r in DEFAULT_PRE_RULES}
+
+
+@pytest.mark.asyncio
+async def test_udp_mode_migration_removes_only_managed_stun_rules(db):
+    """完整命中历史内置签名的行删除；用户自建同文本规则保留；成功记账"""
+    managed = _add_legacy_stun_rules(db)
+    user = CustomRule(profile_id=None, position="pre", sort_order=12,
+                      rule_text="PROTOCOL,STUN,REJECT", comment="user-owned")
+    db.add(user)
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        remaining = (await fresh.execute(select(CustomRule))).scalars().all()
+        assert user.id in {row.id for row in remaining}
+        assert not ({row.id for row in managed} & {row.id for row in remaining})
+        assert await has_data_migration(fresh, "udp_security_modes_v1")
+
+
+@pytest.mark.asyncio
+async def test_udp_mode_migration_preserves_user_lookalikes(db):
+    """签名不完全一致的相似规则一律保留；仅空白差异的重复托管行与重复历史行一并删除"""
+    profile_id = (await db.execute(select(ConfigProfile.id))).scalar_one()
+    s0, s1 = LEGACY_MANAGED_STUN_SIGNATURES[0], LEGACY_MANAGED_STUN_SIGNATURES[1]
+    keep = [
+        # 同 rule 不同 comment
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text=s0["rule_text"], comment="自己拦的"),
+        # 同 rule 同 comment 不同 sort_order
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"] + 100,
+                   rule_text=s0["rule_text"], comment=s0["comment"]),
+        # 同 rule 同 comment 不同 position
+        CustomRule(profile_id=None, position="general", sort_order=s0["sort_order"],
+                   rule_text=s0["rule_text"], comment=s0["comment"]),
+        # profile-owned 完整签名
+        CustomRule(profile_id=profile_id, position="pre", sort_order=s0["sort_order"],
+                   rule_text=s0["rule_text"], comment=s0["comment"]),
+        # 大小写变体（规范化不折叠大小写）
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,STUN,REJECT", comment=s0["comment"]),
+        # 同 comment 不同 rule
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text="DOMAIN-KEYWORD,turn,REJECT", comment=s0["comment"]),
+        # 子串相似不匹配（34781 ≠ 3478）
+        CustomRule(profile_id=None, position="pre", sort_order=s1["sort_order"],
+                   rule_text="AND,((PROTOCOL,UDP), (DEST-PORT,34781)),REJECT", comment=s1["comment"]),
+    ]
+    doomed = [
+        # 历史无语义空白差异（逗号后无空格）+ 其余签名精确 → 删除
+        CustomRule(profile_id=None, position="pre", sort_order=s1["sort_order"],
+                   rule_text="AND,((PROTOCOL,UDP),(DEST-PORT,3478)),REJECT", comment=s1["comment"]),
+        # 重复的历史完整签名行 → 一并删除
+        CustomRule(profile_id=None, position="pre", sort_order=s0["sort_order"],
+                   rule_text=s0["rule_text"], comment=s0["comment"]),
+    ]
+    db.add_all((*keep, *doomed))
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        remaining = {row.id for row in (await fresh.execute(select(CustomRule))).scalars().all()}
+    assert {r.id for r in keep} <= remaining
+    assert not ({r.id for r in doomed} & remaining)
+
+
+@pytest.mark.asyncio
+async def test_udp_mode_migration_idempotent_records_once(db):
+    """重复调用不再修改数据，记账仅一条"""
+    from app.services.generator import generate_surge_config
+
+    _add_legacy_stun_rules(db)
+    await db.commit()
+
+    first = await apply_data_migrations(_factory(db))
+    async with await _fresh_view(db) as fresh:
+        after_first = set((await fresh.execute(select(CustomRule.id))).scalars().all())
+
+    second = await apply_data_migrations(_factory(db))
+    async with await _fresh_view(db) as fresh:
+        after_second = set((await fresh.execute(select(CustomRule.id))).scalars().all())
+        records = (await fresh.execute(
+            select(DataMigrationRecord.key).where(DataMigrationRecord.key == "udp_security_modes_v1")
+        )).scalars().all()
+
+    assert "udp_security_modes_v1" in first
+    assert "udp_security_modes_v1" not in second
+    assert after_second == after_first
+    assert len(records) == 1
+
+    # 端到端：迁移后生成器不补回托管 STUN / 全局 UDP 443 阻断
+    factory = _factory(db)
+    async with factory() as fresh:
+        config = await generate_surge_config(fresh)
+    assert "DOMAIN-KEYWORD,stun,REJECT" not in config
+    assert "DEST-PORT,3478" not in config
+    assert "DEST-PORT,19302" not in config
+    assert "DEST-PORT,443" not in config
+
+
+@pytest.mark.asyncio
+async def test_udp_mode_migration_failure_rolls_back_without_record(db, monkeypatch):
+    """删除执行后、记账提交前失败：整体回滚（行保留）且不写 record"""
+    rules = _add_legacy_stun_rules(db)
+    await db.commit()
+
+    original = data_migrations._migrate_udp_security_modes
+
+    async def fail_after_delete(session):
+        removed = await original(session)
+        assert removed == len(LEGACY_MANAGED_STUN_SIGNATURES)
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setitem(data_migrations.DATA_MIGRATIONS, "udp_security_modes_v1", fail_after_delete)
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        await apply_data_migrations(_factory(db))
+
+    async with await _fresh_view(db) as fresh:
+        texts = set((await fresh.execute(select(CustomRule.rule_text))).scalars().all())
+        recorded = (await fresh.execute(
+            select(DataMigrationRecord.key).where(DataMigrationRecord.key == "udp_security_modes_v1")
+        )).scalar_one_or_none()
+    for r in rules:
+        assert r.rule_text in texts
+    assert recorded is None
+
+
+@pytest.mark.asyncio
+async def test_udp_mode_migration_log_reports_count_only(db, capsys):
+    """迁移日志仅输出数量行，不含规则文本 / comment / 端口等规则内容"""
+    _add_legacy_stun_rules(db)
+    await db.commit()
+
+    await apply_data_migrations(_factory(db))
+
+    err = capsys.readouterr().err
+    lines = [l for l in err.splitlines() if "udp_security_modes_v1" in l]
+    assert lines == [f"[数据迁移] udp_security_modes_v1: {len(LEGACY_MANAGED_STUN_SIGNATURES)} 项变更"]
+    for token in ("stun", "STUN", "3478", "19302", "WebRTC", "DPI", "REJECT", "泄露"):
+        assert token not in err

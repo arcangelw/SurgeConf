@@ -9,7 +9,8 @@ import sys
 
 from sqlalchemy import delete, select, update
 
-from app.default_config import DEFAULT_RULE_SOURCES, SECURITY_PRE_RULES
+from app.default_config import (DEFAULT_RULE_SOURCES, LEGACY_MANAGED_STUN_SIGNATURES,
+                                SECURITY_PRE_RULES)
 from app.models import (ConfigProfile, CustomRule, DataMigrationRecord,
                         RuleSource, SystemConfig)
 from app.services.config_validation import (
@@ -325,6 +326,39 @@ async def _migrate_retire_no_resolve_keywords(db) -> int:
     return 1
 
 
+def _normalized_rule_text(text: str) -> str:
+    """规则文本空白规范化：仅折叠/移除空白（语义无关的历史排版差异），
+    不折叠大小写、不做子串或域名模糊匹配"""
+    return "".join(text.split())
+
+
+async def _migrate_udp_security_modes(db) -> int:
+    """退役历史内置的全局 STUN 阻断（UDP 安全改为按档案 udp_security_mode 动态注入）。
+
+    仅删除与冻结签名（app.default_config.LEGACY_MANAGED_STUN_SIGNATURES）同时满足
+    profile_id IS NULL、position、sort_order、comment 精确相等且 rule_text 仅空白
+    差异的行；用户自建的相似规则（不同 comment/sort/position/profile/rule）一律保留。
+    """
+    signature_by_text = {
+        _normalized_rule_text(s["rule_text"]): s
+        for s in LEGACY_MANAGED_STUN_SIGNATURES
+    }
+    candidates = (await db.execute(
+        select(CustomRule.id, CustomRule.rule_text, CustomRule.comment, CustomRule.sort_order)
+        .where(CustomRule.profile_id.is_(None), CustomRule.position == "pre")
+    )).all()
+    doomed_ids = [
+        row.id for row in candidates
+        if (sig := signature_by_text.get(_normalized_rule_text(row.rule_text)))
+        and row.comment == sig["comment"]
+        and row.sort_order == sig["sort_order"]
+    ]
+    if not doomed_ids:
+        return 0
+    await db.execute(delete(CustomRule).where(CustomRule.id.in_(doomed_ids)))
+    return len(doomed_ids)
+
+
 # 有序注册表：新增业务迁移一律追加新 key，禁止修改已发布 key 的语义
 DATA_MIGRATIONS: dict = {
     "security_rules_v1": _migrate_security_rules,
@@ -337,6 +371,7 @@ DATA_MIGRATIONS: dict = {
     "rule_source_ip_flags_v1": _migrate_rule_source_ip_flags,
     "rule_source_order_invariants_v1": _migrate_rule_source_order_invariants,
     "retire_no_resolve_keywords_v1": _migrate_retire_no_resolve_keywords,
+    "udp_security_modes_v1": _migrate_udp_security_modes,
 }
 
 
