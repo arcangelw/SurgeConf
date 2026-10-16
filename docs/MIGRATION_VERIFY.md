@@ -4,6 +4,13 @@
 > 按本文逐步验证迁移是否生效。全部通过即报告「迁移验证通过」。
 > 迁移逻辑：`app/bootstrap.py::apply_data_migrations`（幂等，每次启动执行，可安全重复）。
 
+运行数据已迁出源码目录。先在 shell 中定义（与启动脚本一致的解析规则）：
+
+```bash
+DB="${SURGECONF_DATA_DIR:-$HOME/Library/Application Support/SurgeConf}/surge_conf.db"
+LOG="$HOME/Library/Logs/SurgeConf/surgeconf.log"
+```
+
 ## 迁移内容（随代码静默分发）
 
 1. **WebRTC 防泄漏规则** 4 条前置规则补齐（域名、STUN 端口×2、协议级 STUN）
@@ -15,7 +22,7 @@
 5. **`no_resolve_keywords` 系统键补齐**（IP 类规则集 no-resolve 关键词，供面板管理；生成器有代码兜底）
 6. **删除死配置 `geoip-maxmind-url`**：产物无 GEOIP 规则（国内判定走 domestic.ip/ChinaMax/ASN China 三集），该 mmdb 库不会被查询——省一次下载与常驻内存
 
-   验证：`sqlite3 data/surge_conf.db "SELECT COUNT(*) FROM config_profiles WHERE general LIKE '%geoip-maxmind-url%';"` 返回 0，且 preview 产物无 geoip 行、url-test 组均为 `tolerance=100`（官方默认，消除 50ms 容差导致的抖动切换与连接重建）。
+   验证：`sqlite3 "$DB" "SELECT COUNT(*) FROM config_profiles WHERE general LIKE '%geoip-maxmind-url%';"` 返回 0，且 preview 产物无 geoip 行、url-test 组均为 `tolerance=100`（官方默认，消除 50ms 容差导致的抖动切换与连接重建）。
 7. **关闭 Surge 内置 Web 面板**：`http-api-web-dashboard` → `false`（常驻内存；SurgeConf 面板不依赖它，官方默认亦为 false。Surge 的 HTTP API 端口不受影响）
 
    验证：preview 产物含 `http-api-web-dashboard = false`。
@@ -29,7 +36,7 @@
 ### 1. 迁移日志
 
 ```bash
-grep "数据迁移" logs/surgeconf.log
+grep "数据迁移" "$LOG"
 ```
 
 - 老库首次启动：应有一条 `[数据迁移] 补齐内置安全规则 N 条，修正存量 ipv6-vif M 个档案，升级 General 配置 G 个档案，补系统键 K 项，补抖音直连规则源 Y 项，移除全局 QUIC 阻断 Q 条`（N≤5、M≥0、G≥0、K≤1、Y≤1、Q≤1 均正常——老库可能已有部分规则/值；出现该行即迁移已执行）
@@ -38,7 +45,7 @@ grep "数据迁移" logs/surgeconf.log
 ### 2. WebRTC / Claude 规则落库
 
 ```bash
-sqlite3 data/surge_conf.db "SELECT rule_text FROM custom_rules WHERE rule_text LIKE '%stun%' OR rule_text LIKE '%3478%' OR rule_text LIKE '%19302%' OR rule_text LIKE '%443)),REJECT%' OR rule_text LIKE '%claudeusercontent%' ORDER BY sort_order;"
+sqlite3 "$DB" "SELECT rule_text FROM custom_rules WHERE rule_text LIKE '%stun%' OR rule_text LIKE '%3478%' OR rule_text LIKE '%19302%' OR rule_text LIKE '%443)),REJECT%' OR rule_text LIKE '%claudeusercontent%' ORDER BY sort_order;"
 ```
 
 预期包含以下 5 行（历史自建规则含这些关键词会多出其他行，集合包含即通过）：
@@ -54,7 +61,7 @@ DOMAIN-SUFFIX,claudeusercontent.com,AI服务
 ### 3. ipv6-vif 归一
 
 ```bash
-sqlite3 data/surge_conf.db "SELECT id, name, json_extract(general,'$.ipv6-vif') FROM config_profiles;"
+sqlite3 "$DB" "SELECT id, name, json_extract(general,'$.ipv6-vif') FROM config_profiles;"
 ```
 
 预期：所有档案均为 `disabled`（NULL 也合法 = 继承模板默认 disabled）。`always` 为用户主动选择的合法值，不动。
@@ -62,7 +69,7 @@ sqlite3 data/surge_conf.db "SELECT id, name, json_extract(general,'$.ipv6-vif') 
 ### 4. DNS 默认值升级
 
 ```bash
-sqlite3 data/surge_conf.db "SELECT id, name, json_extract(general,'$.encrypted-dns-server'), json_extract(general,'$.hijack-dns') FROM config_profiles;"
+sqlite3 "$DB" "SELECT id, name, json_extract(general,'$.encrypted-dns-server'), json_extract(general,'$.hijack-dns') FROM config_profiles;"
 ```
 
 预期（老默认被精确匹配升级后）：
@@ -126,8 +133,8 @@ ifconfig | grep "inet6" | grep -v "fe80::" | grep -v "::1"   # 无输出 ✓
 ### 7. 幂等确认
 
 ```bash
-BEFORE=$(grep -c "数据迁移" logs/surgeconf.log); ./surgeconf.sh restart && sleep 4; \
-AFTER=$(grep -c "数据迁移" logs/surgeconf.log); echo "$BEFORE -> $AFTER"
+BEFORE=$(grep -c "数据迁移" "$LOG"); ./surgeconf.sh restart && sleep 4; \
+AFTER=$(grep -c "数据迁移" "$LOG"); echo "$BEFORE -> $AFTER"
 ```
 
 判定：`AFTER == BEFORE`（无新增迁移日志行；历史已有行不计增量）。
@@ -146,7 +153,7 @@ cd <SurgeConf 目录> && git pull && ./surgeconf.sh restart
 
 | 现象 | 处置 |
 |---|---|
-| 规则未补齐 | 先看启动日志有无异常栈；仍缺则手动插入（重启服务后生效）：`sqlite3 data/surge_conf.db "INSERT INTO custom_rules (profile_id, rule_text, position, sort_order, enabled, comment) VALUES (NULL,'PROTOCOL,STUN,REJECT','pre',94,1,'DPI 级阻断任意端口 STUN，兜底非标端口探测'),(NULL,'DOMAIN-SUFFIX,claudeusercontent.com,AI服务','pre',95,1,'Claude Artifacts 用户内容 CDN 归组 AI 服务');"` |
+| 规则未补齐 | 先看启动日志有无异常栈；仍缺则手动插入（重启服务后生效）：`sqlite3 "$DB" "INSERT INTO custom_rules (profile_id, rule_text, position, sort_order, enabled, comment) VALUES (NULL,'PROTOCOL,STUN,REJECT','pre',94,1,'DPI 级阻断任意端口 STUN，兜底非标端口探测'),(NULL,'DOMAIN-SUFFIX,claudeusercontent.com,AI服务','pre',95,1,'Claude Artifacts 用户内容 CDN 归组 AI 服务');"` |
 | ipv6-vif 仍旧值 | 迁移只归一 auto/native/off/disable 四个旧值，`always` 视为用户选择不动；确认库值后手工 UPDATE 为 disabled |
 | DNS 未升级 | 迁移只精确匹配旧默认串；该设备曾自定义 DNS 则有意跳过（不算失败），需要新默认时手工改或删键重启 |
 | STUN 仍通 | 确认 Surge 重载了新生成配置（SurgeConf 生成 ≠ Surge 已加载）；确认增强模式开启 |

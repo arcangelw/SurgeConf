@@ -1,5 +1,6 @@
 """Surge 配置文件生成器 - 支持中英文分组名"""
 
+import os
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -104,6 +105,14 @@ async def generate_surge_config(db: AsyncSession, profile_id: int | None = None,
 
     # General
     general = dict(DEFAULT_GENERAL)
+    # 控制器凭据：无静态默认，仅在对应环境变量非空时注入为默认值
+    # （配置方案 General 表单的显式值仍可覆盖）
+    env_controller = os.environ.get("SURGE_CONTROLLER_ACCESS", "").strip()
+    if env_controller:
+        general["external-controller-access"] = env_controller
+    env_http_api = os.environ.get("SURGE_HTTP_API", "").strip()
+    if env_http_api:
+        general["http-api"] = env_http_api
     if profile and profile.general:
         general.update(profile.general)
     # skip-proxy：默认条目 + 旧残留 + 系统级自定义 + host 勾选域名，合并去重

@@ -1,6 +1,8 @@
 """MITM 配置管理单元测试 + MITM API 覆盖式契约（Task 5）"""
 
+import configparser
 import json
+from pathlib import Path
 
 import pytest
 from app.models import ConfigProfile
@@ -9,6 +11,15 @@ from app.services.generator import generate_surge_config
 
 # admin_client / secure_app fixtures（回环隐式会话 + CSRF）来自 Task 5 测试模块
 from tests.test_profile_tokens import admin_client, secure_app  # noqa: F401
+
+_SYNTHETIC_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "synthetic_profile.conf"
+
+
+def _synthetic(key: str) -> str:
+    """从合成夹具读取明确标记的虚构 MITM 数据（无真实证书前缀/长度）。"""
+    parser = configparser.ConfigParser()
+    parser.read(_SYNTHETIC_FIXTURE, encoding="utf-8")
+    return parser["mitm"][key]
 
 
 # ════════════════════════════════════════════
@@ -34,9 +45,9 @@ class TestProfileMitmField:
             "skip-server-cert-verify": False,
             "tcp-connection": True,
             "h2": False,
-            "hostname": "*.example.com, *.test.com",
-            "ca-passphrase": "secret123",
-            "ca-p12": "MIIJ5QIBAzCCCa8GCSqGSIb3DQEHAaCCCaAEggmc...",
+            "hostname": _synthetic("hostname"),
+            "ca-passphrase": _synthetic("ca-passphrase"),
+            "ca-p12": _synthetic("ca-p12"),
         }
         p = ConfigProfile(name="测试MITM", locale="zh", mitm=mitm)
         db.add(p)
@@ -45,9 +56,9 @@ class TestProfileMitmField:
         assert p.mitm["skip-server-cert-verify"] is False
         assert p.mitm["tcp-connection"] is True
         assert p.mitm["h2"] is False
-        assert p.mitm["hostname"] == "*.example.com, *.test.com"
-        assert p.mitm["ca-passphrase"] == "secret123"
-        assert p.mitm["ca-p12"] == "MIIJ5QIBAzCCCa8GCSqGSIb3DQEHAaCCCaAEggmc..."
+        assert p.mitm["hostname"] == _synthetic("hostname")
+        assert p.mitm["ca-passphrase"] == _synthetic("ca-passphrase")
+        assert p.mitm["ca-p12"] == _synthetic("ca-p12")
 
     @pytest.mark.asyncio
     async def test_partial_mitm_override(self, db):
@@ -144,20 +155,20 @@ class TestGeneratorMitm:
 
     @pytest.mark.asyncio
     async def test_mitm_with_ca_fields(self, db):
-        """ca-passphrase 和 ca-p12 正确输出（含长 base64）"""
+        """ca-passphrase 和 ca-p12 正确输出（合成 base64 夹具）"""
         from app.models import ConfigProfile
         p = ConfigProfile(name="CA测试", locale="zh",
                           mitm={
-                              "ca-passphrase": "testpass",
-                              "ca-p12": "MIIDCAAB...longbase64==",
+                              "ca-passphrase": _synthetic("ca-passphrase"),
+                              "ca-p12": _synthetic("ca-p12"),
                           })
         db.add(p)
         await db.commit()
 
         config = await generate_surge_config(db, profile_id=p.id)
         mitm_lines = self._extract_mitm(config)
-        assert "ca-passphrase = testpass" in mitm_lines
-        assert "ca-p12 = MIIDCAAB...longbase64==" in mitm_lines
+        assert f"ca-passphrase = {_synthetic('ca-passphrase')}" in mitm_lines
+        assert f"ca-p12 = {_synthetic('ca-p12')}" in mitm_lines
 
     @pytest.mark.asyncio
     async def test_mitm_bool_values_format(self, db):
@@ -250,7 +261,7 @@ class TestMitmApiContract:
     async def test_detail_never_echoes_secrets(self, admin_client):
         """写入秘密后详情仅返回 configured；响应文本不含明文"""
         resp = await admin_client.put(self.BASE, json={
-            "mitm": {"ca-passphrase": "top-secret-pass", "ca-p12": "MIICfake==", "hostname": "x.com"},
+            "mitm": {"ca-passphrase": "top-secret-pass", "ca-p12": _synthetic("ca-p12"), "hostname": "x.com"},
         })
         assert resp.status_code == 200
         detail = (await admin_client.get(self.BASE)).json()
@@ -258,7 +269,7 @@ class TestMitmApiContract:
         assert detail["mitm"]["ca-p12"] == {"configured": True}
         assert detail["mitm"]["hostname"] == "x.com"
         dumped = json.dumps(detail)
-        assert "top-secret-pass" not in dumped and "MIICfake==" not in dumped
+        assert "top-secret-pass" not in dumped and _synthetic("ca-p12") not in dumped
 
     @pytest.mark.asyncio
     async def test_empty_secret_input_keeps_current_value(self, admin_client):

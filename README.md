@@ -99,28 +99,50 @@ cd SurgeConf
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SURGE_HOST` | `127.0.0.1` | 监听地址（前台运行）；开机自启（plist）固定为 `0.0.0.0` 以支持局域网访问 |
+| `SURGE_HOST` | `127.0.0.1` | 监听地址（所有运行模式一致）。需要局域网管理时显式设置为 `0.0.0.0` 或具体网卡地址，并先在设置页切换 `lan_authenticated` 访问模式 |
 | `SURGE_PORT` | `61830` | 监听端口 |
-| `SURGE_API_TOKEN` | — | API 认证 Token（留空不启用认证） |
-| `SURGE_CONTROLLER_ACCESS` | `arcangelw@0.0.0.0:6160` | Surge 外部控制器访问凭据 |
-| `SURGE_HTTP_API` | `arcangelw@0.0.0.0:6166` | Surge HTTP API 访问凭据 |
+| `SURGECONF_DATA_DIR` | `~/Library/Application Support/SurgeConf` | 数据目录（数据库、备份、导出、会话密钥） |
+| `SURGE_CONTROLLER_ACCESS` | —（不输出该键） | Surge 外部控制器访问凭据，非空时注入生成的 `[General]`；示例：`example-access-key@127.0.0.1:6160` |
+| `SURGE_HTTP_API` | —（不输出该键） | Surge HTTP API 访问凭据，非空时注入生成的 `[General]`；示例：`example-access-key@127.0.0.1:6166` |
 
-> 监听地址说明：前台运行（`run`）默认 `127.0.0.1` 仅本机访问；注册开机自启（`enable`）生成的 plist 中固定使用 `0.0.0.0` 以支持局域网访问。如需在前台运行时也暴露到局域网：`SURGE_HOST=0.0.0.0 ./surgeconf.sh run`。
+> 凭据键不再内置静态默认值：未设置环境变量且未在配置方案 General 表单中填写时，生成产物不含 `external-controller-access` / `http-api` 行。日志统一写入 `~/Library/Logs/SurgeConf/surgeconf.log`，仓库目录不再产生任何运行数据。
 
 ## API 文档
 
 http://127.0.0.1:61830/docs
 
-## API 认证
+## 管理访问与认证
 
-默认情况下所有 API 无需认证即可访问。如需保护 API 端点，设置环境变量即可启用 Bearer Token 认证：
+管理界面默认 `local_only`：仅本机回环可访问，回环请求自动获得管理会话，无需密码。局域网设备一律 403。
+
+需要在其他设备上管理时，切换为 `lan_authenticated`：
 
 ```bash
-export SURGE_API_TOKEN=your_token_here
-./surgeconf.sh run
+# 1. 设置页（本机访问）→ 访问模式：安装角色 home_gateway + lan_authenticated，
+#    首次切换必须同时设置管理密码（仅保存 scrypt 哈希）
+# 2. 以局域网监听启动：
+SURGE_HOST=0.0.0.0 ./surgeconf.sh run
+# 或注册开机自启（plist 记录同样的 SURGE_HOST）：
+SURGE_HOST=0.0.0.0 ./surgeconf.sh enable
 ```
 
-启用后，API 请求需要携带 `Authorization: Bearer your_token_here` 头，页面和静态资源不受影响。
+`lan_authenticated` 下：未登录的 API 请求返回 401，页面重定向到登录页；所有状态变更请求必须携带与会话一致的 `X-CSRF-Token`。逐档案只读订阅使用独立的一次性 Profile Token（`GET /api/configs/profiles/{id}/subscribe?token=...`），与登录会话互不影响。
+
+## 部署形态
+
+**工作实例（默认）** — 仅本机管理：
+
+```bash
+./surgeconf.sh run          # 前台；或 ./surgeconf.sh enable 注册开机自启
+```
+
+**家庭网关** — 局域网设备管理 + Surge 作为共享出口：
+
+```bash
+SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
+```
+
+访问模式切换为 `lan_authenticated` 并设置管理密码后，局域网设备通过 `http://<主机地址>:61830` 登录管理。
 
 ---
 
@@ -399,10 +421,12 @@ SurgeConf/
 │       ├── css/             # 样式
 │       ├── js/              # app.js 公共层 + rules-common.js + 每页一个 JS（无构建）
 │       └── vendor/          # 第三方库（SortableJS 本地化）
-├── data/                    # SQLite 数据库 + 生成的配置
 ├── tests/                   # 单元测试
 ├── start.sh                 # 启动脚本（开发模式）
 ├── surgeconf.sh             # 服务管理脚本（启停/自启/状态）
 ├── run_surgeconf.sh         # launchd 包装脚本（动态路径解析）
 └── requirements.txt
 ```
+
+> 运行数据（数据库/备份/导出/密钥）位于 `~/Library/Application Support/SurgeConf`，
+> 日志位于 `~/Library/Logs/SurgeConf/surgeconf.log` —— 仓库目录不存放任何运行数据。

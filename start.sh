@@ -1,9 +1,19 @@
 #!/bin/bash
 # SurgeConf 启动脚本
 
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
-mkdir -p logs
+
+# 收紧新建文件权限：数据库/WAL/会话密钥默认仅属主可读写
+umask 077
+
+# 运行目录（默认 Application Support；SURGECONF_DATA_DIR 可整体重定向）
+DATA_DIR="${SURGECONF_DATA_DIR:-$HOME/Library/Application Support/SurgeConf}"
+LOG_DIR="$HOME/Library/Logs/SurgeConf"
+mkdir -p "$DATA_DIR" "$LOG_DIR"
+chmod 700 "$DATA_DIR" "$LOG_DIR"
 
 # 检查虚拟环境
 if [ ! -d "venv" ]; then
@@ -21,11 +31,13 @@ PORT="${SURGE_PORT:-61830}"
 echo "SurgeConf 启动中..."
 echo "访问地址: http://${HOST}:${PORT}"
 
-if [ "$1" = "--daemon" ]; then
-  nohup uvicorn app.main:app --host "$HOST" --port "$PORT" > logs/surgeconf.log 2>&1 &
+if [ "${1:-}" = "--daemon" ]; then
+  nohup uvicorn app.main:app --host "$HOST" --port "$PORT" --no-access-log \
+    >> "$LOG_DIR/surgeconf.log" 2>&1 &
   echo "PID: $!"
-elif [ "$1" = "--production" ]; then
-  uvicorn app.main:app --host "$HOST" --port "$PORT"
+  echo "日志: $LOG_DIR/surgeconf.log"
+elif [ "${1:-}" = "--production" ]; then
+  uvicorn app.main:app --host "$HOST" --port "$PORT" --no-access-log
 else
-  uvicorn app.main:app --host "$HOST" --port "$PORT" --reload
+  uvicorn app.main:app --host "$HOST" --port "$PORT" --no-access-log --reload
 fi

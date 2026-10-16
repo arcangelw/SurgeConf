@@ -1,9 +1,8 @@
-"""默认数据种子 - 中文命名，arcangelw 控制器"""
+"""默认数据种子 — 中文命名"""
 
-# 控制器凭据可通过环境变量覆盖
-import os as _os
-_CONTROLLER_ACCESS = _os.environ.get("SURGE_CONTROLLER_ACCESS") or "arcangelw@0.0.0.0:6160"
-_HTTP_API = _os.environ.get("SURGE_HTTP_API") or "arcangelw@0.0.0.0:6166"
+# 控制器凭据（external-controller-access / http-api）不再内置静态默认值：
+# 仅当 SURGE_CONTROLLER_ACCESS / SURGE_HTTP_API 环境变量非空时由生成器注入，
+# 或由用户在配置方案的 General 表单中显式填写。
 
 # 完整的中英文名称映射表
 # 数据库中统一存储中文名（左侧），生成英文配置时替换为右侧
@@ -308,7 +307,7 @@ DEFAULT_RULE_SOURCES = [
      "action": "DIRECT", "rule_type": "RULE-SET", "category": "lan", "sort_order": 65},
 ]
 
-# 控制器默认使用 arcangelw
+# 控制器凭据键不设默认：见文件头部说明
 DEFAULT_GENERAL = {
     "wifi-assist": True,
     "all-hybrid": False,
@@ -324,8 +323,6 @@ DEFAULT_GENERAL = {
     "http-listen": "0.0.0.0",
     "socks5-listen": "0.0.0.0",
     "allow-hotspot-access": True,
-    "external-controller-access": _CONTROLLER_ACCESS,
-    "http-api": _HTTP_API,
     "http-api-tls": True,
     "http-api-web-dashboard": False,
     "compatibility-mode": 1,
