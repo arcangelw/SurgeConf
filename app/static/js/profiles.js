@@ -4,10 +4,14 @@
 let dnsPresets = [];
 let profileRegions = [];
 let profileServices = [];
-// General 字段元数据按档案缓存：目标（workstation/gateway/iOS）决定可配置字段与
-// forced 集合，绝不跨档案共享；缓存键即档案 id，乱序/并发响应不会串档
-const fieldMetaByProfile = new Map();   // profileId → 服务端按目标过滤后的字段元数据
-const fieldMetaInflight = new Map();    // profileId → 进行中的加载 Promise（并发去重）
+// General 字段元数据不做持久缓存：目标（workstation/gateway/iOS）决定可配置字段
+// 与 forced 集合，档案的 target 可被 PUT /api/configs/profiles/{id} 修改，档案也可
+// 被删除——任何持久缓存都会在生命周期事件后过期。每次 render/open 与 save 前
+// 都按当前 profile_id 重新 GET；仅同一调用窗口内 inflight 去重。
+// generation（每档案单调递增）由档案 update/delete 推进：旧 generation 的响应
+// 不得渲染、不得用于收集/提交（fail closed）。
+const fieldMetaInflight = new Map();   // profileId → { gen, promise } 进行中的加载
+const fieldMetaGen = new Map();        // profileId → 当前 generation（失效即 +1）
 let serverIps = [];      // 生成 Tab 可选服务器地址（全局共享）
 let allProfiles = [];    // 当前方案列表（loadData 后有效）
 
@@ -36,19 +40,38 @@ async function loadDnsPresets() {
   } catch (e) { /* ignore */ }
 }
 
-/** 加载指定档案的 General 字段元数据（缓存 + inflight 去重）。
+/** 档案当前 metadata generation（未失效过 = 0） */
+function generalMetaGen(profileId) {
+  return fieldMetaGen.get(Number(profileId)) || 0;
+}
+
+/** 档案生命周期失效：update（含 target 变更）/删除成功后调用。
+ *  推进 generation 并丢弃在途 inflight——仍在等待旧响应的 render/save
+ *  在响应归来时按 generation 不匹配放弃，新调用也不会复用旧 inflight。 */
+function invalidateGeneralMeta(profileId) {
+  const pid = Number(profileId);
+  fieldMetaGen.set(pid, generalMetaGen(pid) + 1);
+  fieldMetaInflight.delete(pid);
+}
+
+/** 加载指定档案的 General 字段元数据（无持久缓存，每次都重新 GET）。
  *  必须携带 profile_id：不同目标的可配置字段与 forced 集合不同，
- *  禁止无参请求默认档案后跨档案共用。错误上抛，由调用方统一提示。 */
+ *  禁止无参请求默认档案后跨档案共用。仅同一 generation 窗口内并发去重
+ *  （共享同一 inflight promise）；完成后清槽位，下次调用重新请求。
+ *  错误上抛，由调用方统一提示。 */
 function loadGeneralFields(profileId) {
-  const cached = fieldMetaByProfile.get(profileId);
-  if (cached) return Promise.resolve(cached);
-  const inflight = fieldMetaInflight.get(profileId);
-  if (inflight) return inflight;
-  const req = API.get(`/api/general/fields?profile_id=${encodeURIComponent(profileId)}`)
-    .then(meta => { fieldMetaByProfile.set(profileId, meta); return meta; })
-    .finally(() => { fieldMetaInflight.delete(profileId); });
-  fieldMetaInflight.set(profileId, req);
-  return req;
+  const pid = Number(profileId);
+  const gen = generalMetaGen(pid);
+  const inflight = fieldMetaInflight.get(pid);
+  if (inflight && inflight.gen === gen) return inflight.promise;
+  const promise = API.get(`/api/general/fields?profile_id=${encodeURIComponent(pid)}`);
+  fieldMetaInflight.set(pid, { gen, promise });
+  promise.catch(() => {}).then(() => {
+    // 完成即清：不留持久缓存；仅清自己的槽位（期间被失效/替换则不动）
+    const cur = fieldMetaInflight.get(pid);
+    if (cur && cur.promise === promise) fieldMetaInflight.delete(pid);
+  });
+  return promise;
 }
 
 async function loadServerIps() {
@@ -228,7 +251,10 @@ async function renderGeneralTab(profileId) {
       </div>
     </details>`;
   // 先取当前档案的字段元数据（目标决定可配置字段与 forced 集合）再渲染/填值；
-  // 加载失败不渲染表单——没有 metadata 就无法判定 forced 键，必须 fail closed
+  // 加载失败不渲染表单——没有 metadata 就无法判定 forced 键，必须 fail closed。
+  // 等待期间档案被更新/删除（generation 推进）则放弃本次渲染：
+  // 旧响应可能来自旧 target，渲染它等于向用户展示过期字段集合
+  const gen = generalMetaGen(profileId);
   let meta;
   try {
     meta = await loadGeneralFields(profileId);
@@ -236,6 +262,7 @@ async function renderGeneralTab(profileId) {
     toast(e.message, "error");
     return;
   }
+  if (generalMetaGen(profileId) !== gen) return;
   renderGeneralForm(profileId, meta);
   await loadGeneralValues(profileId);
 }
@@ -380,13 +407,12 @@ function bool(v) {
   return false;
 }
 
-function collectGeneralValues(profileId) {
+function collectGeneralValues(profileId, meta) {
   const values = {};
   // 服务端强制安全字段不收集：后端保存时无条件写入强制值；
-  // 依据当前档案的 metadata（owner 必须匹配 profileId）而非 DOM 属性判定，
+  // 依据调用方刚按当前档案拉取的 metadata（显式传入）而非 DOM 属性判定，
   // DOM 篡改也不会提交；metadata 缺失说明 owner 不确定，fail closed 拒绝收集
-  const meta = fieldMetaByProfile.get(profileId);
-  if (!meta) {
+  if (!Array.isArray(meta)) {
     toast(I18N["general.meta_missing"], "error");
     return null;
   }
@@ -431,10 +457,17 @@ function collectGeneralValues(profileId) {
 async function saveGeneralValues(profileId, btn) {
   await withLoading(btn, async () => {
     try {
-      // 保存前确保 metadata 属于当前档案（命中缓存或重新拉取，owner 必然匹配）；
-      // 拉取失败则中止提交，不用旧/默认档案的 forced 集合做判定
-      await loadGeneralFields(profileId);
-      const values = collectGeneralValues(profileId);
+      // 保存前重新拉取当前档案 metadata（无持久缓存，必发 fresh GET）；
+      // 拉取失败或等待期间档案被更新/删除（generation 变化）则中止提交，
+      // 不用旧 target 的 forced 集合做判定。后端并发变更导致的 422
+      // 走 catch 统一报错：fail closed，不重试不静默提交
+      const gen = generalMetaGen(profileId);
+      const meta = await loadGeneralFields(profileId);
+      if (generalMetaGen(profileId) !== gen) {
+        toast(I18N["general.meta_stale"], "error");
+        return;
+      }
+      const values = collectGeneralValues(profileId, meta);
       if (!values) return;
       await API.put(`/api/general/values?profile_id=${encodeURIComponent(profileId)}`, values);
       toast(I18N["msg.saved"]);
@@ -730,6 +763,9 @@ async function saveProfile() {
   try {
     if (id) {
       await API.put(`/api/configs/profiles/${id}`, data);
+      // 档案已更新（PUT 可改 target 等字段）：General metadata 可能随 target
+      // 变化，立即失效——在途响应按旧 generation 丢弃，下次打开/保存重拉
+      invalidateGeneralMeta(id);
       toast(I18N["msg.updated"]);
     } else {
       await API.post("/api/configs/profiles", data);
@@ -757,6 +793,8 @@ async function deleteProfile(id, btn) {
       // 后端单事务级联删除：定制规则 + Host 映射 + 档案本体
       await API.del(`/api/configs/profiles/${id}`);
       openSections.delete(id);
+      // 档案已删除：失效该档案 metadata/generation，在途响应不得回填或供使用
+      invalidateGeneralMeta(id);
       toast(I18N["msg.deleted"]); loadData();
     } catch (e) { toast(e.message, "error"); }
   });
@@ -861,6 +899,8 @@ async function saveMitm(profileId) {
   if (hostname) mitm['hostname'] = hostname;
   try {
     await API.put(`/api/configs/profiles/${profileId}`, { mitm });
+    // 档案 PUT 成功：General metadata generation 失效（下次打开/保存重拉）
+    invalidateGeneralMeta(profileId);
     toast(I18N["profile.mitm_save"]);
     loadMitm(profileId);
   } catch (e) { toast(e.message, "error"); }
@@ -871,6 +911,8 @@ async function resetMitm(profileId) {
   try {
     // 显式整体重置（独立动作）：清空全部 MITM 覆盖，回到生成器默认值
     await API.put(`/api/configs/profiles/${profileId}`, { mitm_reset: true });
+    // 档案 PUT 成功：General metadata generation 失效（下次打开/保存重拉）
+    invalidateGeneralMeta(profileId);
     toast(I18N["profile.mitm_reset"]);
     loadMitm(profileId);
   } catch (e) { toast(e.message, "error"); }
@@ -881,6 +923,8 @@ async function clearMitmSecret(profileId, key) {
   try {
     // 显式清除指定秘密键（独立字段），与保存互不影响
     await API.put(`/api/configs/profiles/${profileId}`, { mitm_clear: [key] });
+    // 档案 PUT 成功：General metadata generation 失效（下次打开/保存重拉）
+    invalidateGeneralMeta(profileId);
     toast(I18N["profile.mitm_cleared"].replace("{0}", key));
     loadMitm(profileId);
   } catch (e) { toast(e.message, "error"); }

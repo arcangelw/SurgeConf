@@ -1,0 +1,1057 @@
+{
+  "mac_workstation": [
+    {
+      "key": "network",
+      "label_zh": "网络与代理",
+      "label_en": "Network & Proxy",
+      "fields": [
+        {
+          "key": "wifi-assist",
+          "label_zh": "Wi-Fi 辅助",
+          "label_en": "Wi-Fi Assist",
+          "type": "bool",
+          "hint_zh": "Wi-Fi 和蜂窝同时使用",
+          "hint_en": "Use Wi-Fi and cellular simultaneously",
+          "options": []
+        },
+        {
+          "key": "ipv6",
+          "label_zh": "IPv6",
+          "label_en": "IPv6",
+          "type": "bool",
+          "hint_zh": "启用 IPv6 支持",
+          "hint_en": "Enable IPv6 support",
+          "options": []
+        },
+        {
+          "key": "ipv6-vif",
+          "label_zh": "IPv6 VIF 模式",
+          "label_en": "IPv6 VIF Mode",
+          "type": "select",
+          "hint_zh": "IPv6 虚拟网卡模式",
+          "hint_en": "IPv6 virtual interface mode",
+          "options": [
+            {
+              "value": "disabled",
+              "label_zh": "关闭",
+              "label_en": "Disabled"
+            },
+            {
+              "value": "auto",
+              "label_zh": "自动",
+              "label_en": "Auto"
+            },
+            {
+              "value": "always",
+              "label_zh": "始终",
+              "label_en": "Always"
+            }
+          ]
+        },
+        {
+          "key": "udp-priority",
+          "label_zh": "UDP 优先",
+          "label_en": "UDP Priority",
+          "type": "bool",
+          "hint_zh": "优先处理 UDP 流量",
+          "hint_en": "Prioritize UDP traffic",
+          "options": []
+        },
+        {
+          "key": "all-hybrid",
+          "label_zh": "全部混合代理",
+          "label_en": "All Hybrid Proxy",
+          "type": "bool",
+          "hint_zh": "所有代理使用混合模式",
+          "hint_en": "Use hybrid mode for all proxies",
+          "options": []
+        },
+        {
+          "key": "internet-test-url",
+          "label_zh": "网络检测 URL",
+          "label_en": "Internet Test URL",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "proxy-test-url",
+          "label_zh": "代理检测 URL",
+          "label_en": "Proxy Test URL",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "test-timeout",
+          "label_zh": "测试超时（秒）",
+          "label_en": "Test Timeout (sec)",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "dns",
+      "label_zh": "DNS",
+      "label_en": "DNS",
+      "fields": [
+        {
+          "key": "dns-server",
+          "label_zh": "DNS 服务器",
+          "label_en": "DNS Servers",
+          "type": "tags",
+          "hint_zh": "传统 DNS，逗号分隔",
+          "hint_en": "Plain DNS, comma separated",
+          "options": []
+        },
+        {
+          "key": "encrypted-dns-server",
+          "label_zh": "加密 DNS",
+          "label_en": "Encrypted DNS",
+          "type": "tags",
+          "hint_zh": "h3://quic://tls://https:// 逗号分隔，并发先答先用",
+          "hint_en": "h3://quic://tls://https:// comma separated, first answer wins",
+          "options": []
+        },
+        {
+          "key": "encrypted-dns-follow-outbound-mode",
+          "label_zh": "加密 DNS 跟随出站模式",
+          "label_en": "Encrypted DNS Follow Outbound",
+          "type": "bool",
+          "hint_zh": "关闭=恒直连，避免解析依赖代理",
+          "hint_en": "Off=always DIRECT, avoids resolve-via-proxy loop",
+          "options": []
+        },
+        {
+          "key": "always-real-ip",
+          "label_zh": "始终返回真实 IP",
+          "label_en": "Always Real IP",
+          "type": "tags",
+          "hint_zh": "这些域名绕过 fake-ip",
+          "hint_en": "Domains that bypass fake-ip",
+          "options": []
+        },
+        {
+          "key": "hijack-dns",
+          "label_zh": "劫持 DNS",
+          "label_en": "Hijack DNS",
+          "type": "tags",
+          "hint_zh": "劫持明文 DNS 请求，*:53 全劫持",
+          "hint_en": "Hijack plain DNS, *:53 for all",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "controller",
+      "label_zh": "控制器与 API",
+      "label_en": "Controller & API",
+      "fields": [
+        {
+          "key": "external-controller-access",
+          "label_zh": "远程控制器",
+          "label_en": "External Controller",
+          "type": "text",
+          "hint_zh": "格式: user@host:port",
+          "hint_en": "Format: user@host:port",
+          "options": []
+        },
+        {
+          "key": "http-api",
+          "label_zh": "HTTP API",
+          "label_en": "HTTP API",
+          "type": "text",
+          "hint_zh": "格式: user@host:port",
+          "hint_en": "Format: user@host:port",
+          "options": []
+        },
+        {
+          "key": "http-api-tls",
+          "label_zh": "HTTP API TLS",
+          "label_en": "HTTP API TLS",
+          "type": "bool",
+          "hint_zh": "HTTP API 强制 TLS 连接",
+          "hint_en": "Require TLS for HTTP API",
+          "options": []
+        },
+        {
+          "key": "http-api-web-dashboard",
+          "label_zh": "HTTP API Web 面板",
+          "label_en": "HTTP API Web Dashboard",
+          "type": "bool",
+          "hint_zh": "Surge 内置 Web 面板，常驻内存；SurgeConf 不依赖，默认关",
+          "hint_en": "Built-in web dashboard, memory resident; SurgeConf doesn't need it",
+          "options": []
+        },
+        {
+          "key": "http-listen",
+          "label_zh": "HTTP 代理监听地址",
+          "label_en": "HTTP Proxy Listen",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "socks5-listen",
+          "label_zh": "SOCKS5 代理监听地址",
+          "label_en": "SOCKS5 Proxy Listen",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "allow-wifi-access",
+          "label_zh": "允许 Wi-Fi 访问",
+          "label_en": "Allow Wi-Fi Access",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "wifi-access-http-port",
+          "label_zh": "Wi-Fi HTTP 端口",
+          "label_en": "Wi-Fi HTTP Port",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "wifi-access-socks5-port",
+          "label_zh": "Wi-Fi SOCKS5 端口",
+          "label_en": "Wi-Fi SOCKS5 Port",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "allow-hotspot-access",
+          "label_zh": "允许热点访问",
+          "label_en": "Allow Hotspot Access",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "advanced",
+      "label_zh": "高级",
+      "label_en": "Advanced",
+      "fields": [
+        {
+          "key": "loglevel",
+          "label_zh": "日志级别",
+          "label_en": "Log Level",
+          "type": "select",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": [
+            {
+              "value": "verbose",
+              "label_zh": "详细",
+              "label_en": "Verbose"
+            },
+            {
+              "value": "info",
+              "label_zh": "信息",
+              "label_en": "Info"
+            },
+            {
+              "value": "notify",
+              "label_zh": "通知",
+              "label_en": "Notify"
+            },
+            {
+              "value": "warning",
+              "label_zh": "警告",
+              "label_en": "Warning"
+            },
+            {
+              "value": "error",
+              "label_zh": "错误",
+              "label_en": "Error"
+            }
+          ]
+        },
+        {
+          "key": "show-error-page-for-reject",
+          "label_zh": "拒绝时显示错误页",
+          "label_en": "Show Error Page for Reject",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "exclude-simple-hostnames",
+          "label_zh": "排除简单主机名",
+          "label_en": "Exclude Simple Hostnames",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "read-etc-hosts",
+          "label_zh": "读取 hosts 文件",
+          "label_en": "Read /etc/hosts",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "use-local-host-item-for-proxy",
+          "label_zh": "代理使用本地 Host",
+          "label_en": "Use Local Host for Proxy",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "include-all-networks",
+          "label_zh": "包含所有网络",
+          "label_en": "Include All Networks",
+          "type": "bool",
+          "hint_zh": "VPN 模式：禁止非 VPN 流量",
+          "hint_en": "VPN mode: block non-VPN traffic",
+          "options": []
+        },
+        {
+          "key": "include-local-networks",
+          "label_zh": "包含本地网络",
+          "label_en": "Include Local Networks",
+          "type": "bool",
+          "hint_zh": "本地网络也走代理",
+          "hint_en": "Route local network through proxy too",
+          "options": []
+        },
+        {
+          "key": "block-quic",
+          "label_zh": "QUIC 处理策略",
+          "label_en": "Block QUIC",
+          "type": "select",
+          "hint_zh": "强制安全值 per-policy：DIRECT 直连保留 QUIC，代理按策略处理",
+          "hint_en": "Forced safe value per-policy: QUIC direct stays, proxied per policy",
+          "options": [
+            {
+              "value": "per-policy",
+              "label_zh": "按策略",
+              "label_en": "Per Policy"
+            }
+          ],
+          "forced": true
+        },
+        {
+          "key": "udp-policy-not-supported-behaviour",
+          "label_zh": "UDP 不支持策略行为",
+          "label_en": "UDP Unsupported Policy",
+          "type": "select",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": [
+            {
+              "value": "REJECT",
+              "label_zh": "拒绝",
+              "label_en": "Reject"
+            }
+          ],
+          "forced": true
+        },
+        {
+          "key": "proxy-restricted-to-lan",
+          "label_zh": "代理限制到局域网",
+          "label_en": "Proxy Restricted to LAN",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        }
+      ]
+    }
+  ],
+  "mac_gateway": [
+    {
+      "key": "network",
+      "label_zh": "网络与代理",
+      "label_en": "Network & Proxy",
+      "fields": [
+        {
+          "key": "wifi-assist",
+          "label_zh": "Wi-Fi 辅助",
+          "label_en": "Wi-Fi Assist",
+          "type": "bool",
+          "hint_zh": "Wi-Fi 和蜂窝同时使用",
+          "hint_en": "Use Wi-Fi and cellular simultaneously",
+          "options": []
+        },
+        {
+          "key": "ipv6",
+          "label_zh": "IPv6",
+          "label_en": "IPv6",
+          "type": "bool",
+          "hint_zh": "启用 IPv6 支持",
+          "hint_en": "Enable IPv6 support",
+          "options": []
+        },
+        {
+          "key": "ipv6-vif",
+          "label_zh": "IPv6 VIF 模式",
+          "label_en": "IPv6 VIF Mode",
+          "type": "select",
+          "hint_zh": "IPv6 虚拟网卡模式",
+          "hint_en": "IPv6 virtual interface mode",
+          "options": [
+            {
+              "value": "disabled",
+              "label_zh": "关闭",
+              "label_en": "Disabled"
+            },
+            {
+              "value": "auto",
+              "label_zh": "自动",
+              "label_en": "Auto"
+            },
+            {
+              "value": "always",
+              "label_zh": "始终",
+              "label_en": "Always"
+            }
+          ]
+        },
+        {
+          "key": "udp-priority",
+          "label_zh": "UDP 优先",
+          "label_en": "UDP Priority",
+          "type": "bool",
+          "hint_zh": "优先处理 UDP 流量",
+          "hint_en": "Prioritize UDP traffic",
+          "options": []
+        },
+        {
+          "key": "all-hybrid",
+          "label_zh": "全部混合代理",
+          "label_en": "All Hybrid Proxy",
+          "type": "bool",
+          "hint_zh": "所有代理使用混合模式",
+          "hint_en": "Use hybrid mode for all proxies",
+          "options": []
+        },
+        {
+          "key": "internet-test-url",
+          "label_zh": "网络检测 URL",
+          "label_en": "Internet Test URL",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "proxy-test-url",
+          "label_zh": "代理检测 URL",
+          "label_en": "Proxy Test URL",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "test-timeout",
+          "label_zh": "测试超时（秒）",
+          "label_en": "Test Timeout (sec)",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "dns",
+      "label_zh": "DNS",
+      "label_en": "DNS",
+      "fields": [
+        {
+          "key": "dns-server",
+          "label_zh": "DNS 服务器",
+          "label_en": "DNS Servers",
+          "type": "tags",
+          "hint_zh": "传统 DNS，逗号分隔",
+          "hint_en": "Plain DNS, comma separated",
+          "options": []
+        },
+        {
+          "key": "encrypted-dns-server",
+          "label_zh": "加密 DNS",
+          "label_en": "Encrypted DNS",
+          "type": "tags",
+          "hint_zh": "h3://quic://tls://https:// 逗号分隔，并发先答先用",
+          "hint_en": "h3://quic://tls://https:// comma separated, first answer wins",
+          "options": []
+        },
+        {
+          "key": "encrypted-dns-follow-outbound-mode",
+          "label_zh": "加密 DNS 跟随出站模式",
+          "label_en": "Encrypted DNS Follow Outbound",
+          "type": "bool",
+          "hint_zh": "关闭=恒直连，避免解析依赖代理",
+          "hint_en": "Off=always DIRECT, avoids resolve-via-proxy loop",
+          "options": []
+        },
+        {
+          "key": "always-real-ip",
+          "label_zh": "始终返回真实 IP",
+          "label_en": "Always Real IP",
+          "type": "tags",
+          "hint_zh": "这些域名绕过 fake-ip",
+          "hint_en": "Domains that bypass fake-ip",
+          "options": []
+        },
+        {
+          "key": "hijack-dns",
+          "label_zh": "劫持 DNS",
+          "label_en": "Hijack DNS",
+          "type": "tags",
+          "hint_zh": "劫持明文 DNS 请求，*:53 全劫持",
+          "hint_en": "Hijack plain DNS, *:53 for all",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "controller",
+      "label_zh": "控制器与 API",
+      "label_en": "Controller & API",
+      "fields": [
+        {
+          "key": "external-controller-access",
+          "label_zh": "远程控制器",
+          "label_en": "External Controller",
+          "type": "text",
+          "hint_zh": "格式: user@host:port",
+          "hint_en": "Format: user@host:port",
+          "options": []
+        },
+        {
+          "key": "http-api",
+          "label_zh": "HTTP API",
+          "label_en": "HTTP API",
+          "type": "text",
+          "hint_zh": "格式: user@host:port",
+          "hint_en": "Format: user@host:port",
+          "options": []
+        },
+        {
+          "key": "http-api-tls",
+          "label_zh": "HTTP API TLS",
+          "label_en": "HTTP API TLS",
+          "type": "bool",
+          "hint_zh": "HTTP API 强制 TLS 连接",
+          "hint_en": "Require TLS for HTTP API",
+          "options": []
+        },
+        {
+          "key": "http-api-web-dashboard",
+          "label_zh": "HTTP API Web 面板",
+          "label_en": "HTTP API Web Dashboard",
+          "type": "bool",
+          "hint_zh": "Surge 内置 Web 面板，常驻内存；SurgeConf 不依赖，默认关",
+          "hint_en": "Built-in web dashboard, memory resident; SurgeConf doesn't need it",
+          "options": []
+        },
+        {
+          "key": "http-listen",
+          "label_zh": "HTTP 代理监听地址",
+          "label_en": "HTTP Proxy Listen",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "socks5-listen",
+          "label_zh": "SOCKS5 代理监听地址",
+          "label_en": "SOCKS5 Proxy Listen",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "allow-wifi-access",
+          "label_zh": "允许 Wi-Fi 访问",
+          "label_en": "Allow Wi-Fi Access",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "wifi-access-http-port",
+          "label_zh": "Wi-Fi HTTP 端口",
+          "label_en": "Wi-Fi HTTP Port",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "wifi-access-socks5-port",
+          "label_zh": "Wi-Fi SOCKS5 端口",
+          "label_en": "Wi-Fi SOCKS5 Port",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "allow-hotspot-access",
+          "label_zh": "允许热点访问",
+          "label_en": "Allow Hotspot Access",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "advanced",
+      "label_zh": "高级",
+      "label_en": "Advanced",
+      "fields": [
+        {
+          "key": "loglevel",
+          "label_zh": "日志级别",
+          "label_en": "Log Level",
+          "type": "select",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": [
+            {
+              "value": "verbose",
+              "label_zh": "详细",
+              "label_en": "Verbose"
+            },
+            {
+              "value": "info",
+              "label_zh": "信息",
+              "label_en": "Info"
+            },
+            {
+              "value": "notify",
+              "label_zh": "通知",
+              "label_en": "Notify"
+            },
+            {
+              "value": "warning",
+              "label_zh": "警告",
+              "label_en": "Warning"
+            },
+            {
+              "value": "error",
+              "label_zh": "错误",
+              "label_en": "Error"
+            }
+          ]
+        },
+        {
+          "key": "show-error-page-for-reject",
+          "label_zh": "拒绝时显示错误页",
+          "label_en": "Show Error Page for Reject",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "exclude-simple-hostnames",
+          "label_zh": "排除简单主机名",
+          "label_en": "Exclude Simple Hostnames",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "read-etc-hosts",
+          "label_zh": "读取 hosts 文件",
+          "label_en": "Read /etc/hosts",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "use-local-host-item-for-proxy",
+          "label_zh": "代理使用本地 Host",
+          "label_en": "Use Local Host for Proxy",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "include-all-networks",
+          "label_zh": "包含所有网络",
+          "label_en": "Include All Networks",
+          "type": "bool",
+          "hint_zh": "VPN 模式：禁止非 VPN 流量",
+          "hint_en": "VPN mode: block non-VPN traffic",
+          "options": []
+        },
+        {
+          "key": "include-local-networks",
+          "label_zh": "包含本地网络",
+          "label_en": "Include Local Networks",
+          "type": "bool",
+          "hint_zh": "本地网络也走代理",
+          "hint_en": "Route local network through proxy too",
+          "options": []
+        },
+        {
+          "key": "block-quic",
+          "label_zh": "QUIC 处理策略",
+          "label_en": "Block QUIC",
+          "type": "select",
+          "hint_zh": "强制安全值 per-policy：DIRECT 直连保留 QUIC，代理按策略处理",
+          "hint_en": "Forced safe value per-policy: QUIC direct stays, proxied per policy",
+          "options": [
+            {
+              "value": "per-policy",
+              "label_zh": "按策略",
+              "label_en": "Per Policy"
+            }
+          ],
+          "forced": true
+        },
+        {
+          "key": "udp-policy-not-supported-behaviour",
+          "label_zh": "UDP 不支持策略行为",
+          "label_en": "UDP Unsupported Policy",
+          "type": "select",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": [
+            {
+              "value": "REJECT",
+              "label_zh": "拒绝",
+              "label_en": "Reject"
+            }
+          ],
+          "forced": true
+        },
+        {
+          "key": "proxy-restricted-to-lan",
+          "label_zh": "代理限制到局域网",
+          "label_en": "Proxy Restricted to LAN",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "gateway-restricted-to-lan",
+          "label_zh": "网关限制到局域网",
+          "label_en": "Gateway Restricted to LAN",
+          "type": "bool",
+          "hint_zh": "仅 Surge Mac 网关模式：限制配置生效范围到局域网",
+          "hint_en": "Surge Mac gateway only: restrict config to LAN",
+          "options": [],
+          "forced": true
+        }
+      ]
+    }
+  ],
+  "ios_mobile": [
+    {
+      "key": "network",
+      "label_zh": "网络与代理",
+      "label_en": "Network & Proxy",
+      "fields": [
+        {
+          "key": "wifi-assist",
+          "label_zh": "Wi-Fi 辅助",
+          "label_en": "Wi-Fi Assist",
+          "type": "bool",
+          "hint_zh": "Wi-Fi 和蜂窝同时使用",
+          "hint_en": "Use Wi-Fi and cellular simultaneously",
+          "options": []
+        },
+        {
+          "key": "ipv6",
+          "label_zh": "IPv6",
+          "label_en": "IPv6",
+          "type": "bool",
+          "hint_zh": "启用 IPv6 支持",
+          "hint_en": "Enable IPv6 support",
+          "options": []
+        },
+        {
+          "key": "ipv6-vif",
+          "label_zh": "IPv6 VIF 模式",
+          "label_en": "IPv6 VIF Mode",
+          "type": "select",
+          "hint_zh": "IPv6 虚拟网卡模式",
+          "hint_en": "IPv6 virtual interface mode",
+          "options": [
+            {
+              "value": "disabled",
+              "label_zh": "关闭",
+              "label_en": "Disabled"
+            },
+            {
+              "value": "auto",
+              "label_zh": "自动",
+              "label_en": "Auto"
+            },
+            {
+              "value": "always",
+              "label_zh": "始终",
+              "label_en": "Always"
+            }
+          ]
+        },
+        {
+          "key": "udp-priority",
+          "label_zh": "UDP 优先",
+          "label_en": "UDP Priority",
+          "type": "bool",
+          "hint_zh": "优先处理 UDP 流量",
+          "hint_en": "Prioritize UDP traffic",
+          "options": []
+        },
+        {
+          "key": "all-hybrid",
+          "label_zh": "全部混合代理",
+          "label_en": "All Hybrid Proxy",
+          "type": "bool",
+          "hint_zh": "所有代理使用混合模式",
+          "hint_en": "Use hybrid mode for all proxies",
+          "options": []
+        },
+        {
+          "key": "compatibility-mode",
+          "label_zh": "兼容模式",
+          "label_en": "Compatibility Mode",
+          "type": "int",
+          "hint_zh": "仅 Surge iOS 生效：1=代理+VIF 接管（性能最好），3=仅 VIF 接管（默认），0=自动",
+          "hint_en": "Surge iOS only: 1=Proxy+VIF (best perf), 3=VIF only (default), 0=auto",
+          "options": [],
+          "forced": true
+        },
+        {
+          "key": "auto-suspend",
+          "label_zh": "自动挂起",
+          "label_en": "Auto Suspend",
+          "type": "bool",
+          "hint_zh": "仅 Surge iOS 生效：后台自动挂起以省电",
+          "hint_en": "Surge iOS only: auto suspend in background to save battery",
+          "options": [],
+          "forced": true
+        },
+        {
+          "key": "internet-test-url",
+          "label_zh": "网络检测 URL",
+          "label_en": "Internet Test URL",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "proxy-test-url",
+          "label_zh": "代理检测 URL",
+          "label_en": "Proxy Test URL",
+          "type": "text",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "test-timeout",
+          "label_zh": "测试超时（秒）",
+          "label_en": "Test Timeout (sec)",
+          "type": "int",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "dns",
+      "label_zh": "DNS",
+      "label_en": "DNS",
+      "fields": [
+        {
+          "key": "dns-server",
+          "label_zh": "DNS 服务器",
+          "label_en": "DNS Servers",
+          "type": "tags",
+          "hint_zh": "传统 DNS，逗号分隔",
+          "hint_en": "Plain DNS, comma separated",
+          "options": []
+        },
+        {
+          "key": "encrypted-dns-server",
+          "label_zh": "加密 DNS",
+          "label_en": "Encrypted DNS",
+          "type": "tags",
+          "hint_zh": "h3://quic://tls://https:// 逗号分隔，并发先答先用",
+          "hint_en": "h3://quic://tls://https:// comma separated, first answer wins",
+          "options": []
+        },
+        {
+          "key": "encrypted-dns-follow-outbound-mode",
+          "label_zh": "加密 DNS 跟随出站模式",
+          "label_en": "Encrypted DNS Follow Outbound",
+          "type": "bool",
+          "hint_zh": "关闭=恒直连，避免解析依赖代理",
+          "hint_en": "Off=always DIRECT, avoids resolve-via-proxy loop",
+          "options": []
+        },
+        {
+          "key": "always-real-ip",
+          "label_zh": "始终返回真实 IP",
+          "label_en": "Always Real IP",
+          "type": "tags",
+          "hint_zh": "这些域名绕过 fake-ip",
+          "hint_en": "Domains that bypass fake-ip",
+          "options": []
+        },
+        {
+          "key": "hijack-dns",
+          "label_zh": "劫持 DNS",
+          "label_en": "Hijack DNS",
+          "type": "tags",
+          "hint_zh": "劫持明文 DNS 请求，*:53 全劫持",
+          "hint_en": "Hijack plain DNS, *:53 for all",
+          "options": []
+        }
+      ]
+    },
+    {
+      "key": "advanced",
+      "label_zh": "高级",
+      "label_en": "Advanced",
+      "fields": [
+        {
+          "key": "loglevel",
+          "label_zh": "日志级别",
+          "label_en": "Log Level",
+          "type": "select",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": [
+            {
+              "value": "verbose",
+              "label_zh": "详细",
+              "label_en": "Verbose"
+            },
+            {
+              "value": "info",
+              "label_zh": "信息",
+              "label_en": "Info"
+            },
+            {
+              "value": "notify",
+              "label_zh": "通知",
+              "label_en": "Notify"
+            },
+            {
+              "value": "warning",
+              "label_zh": "警告",
+              "label_en": "Warning"
+            },
+            {
+              "value": "error",
+              "label_zh": "错误",
+              "label_en": "Error"
+            }
+          ]
+        },
+        {
+          "key": "show-error-page-for-reject",
+          "label_zh": "拒绝时显示错误页",
+          "label_en": "Show Error Page for Reject",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "exclude-simple-hostnames",
+          "label_zh": "排除简单主机名",
+          "label_en": "Exclude Simple Hostnames",
+          "type": "bool",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": []
+        },
+        {
+          "key": "include-all-networks",
+          "label_zh": "包含所有网络",
+          "label_en": "Include All Networks",
+          "type": "bool",
+          "hint_zh": "VPN 模式：禁止非 VPN 流量",
+          "hint_en": "VPN mode: block non-VPN traffic",
+          "options": []
+        },
+        {
+          "key": "include-local-networks",
+          "label_zh": "包含本地网络",
+          "label_en": "Include Local Networks",
+          "type": "bool",
+          "hint_zh": "本地网络也走代理",
+          "hint_en": "Route local network through proxy too",
+          "options": []
+        },
+        {
+          "key": "block-quic",
+          "label_zh": "QUIC 处理策略",
+          "label_en": "Block QUIC",
+          "type": "select",
+          "hint_zh": "强制安全值 per-policy：DIRECT 直连保留 QUIC，代理按策略处理",
+          "hint_en": "Forced safe value per-policy: QUIC direct stays, proxied per policy",
+          "options": [
+            {
+              "value": "per-policy",
+              "label_zh": "按策略",
+              "label_en": "Per Policy"
+            }
+          ],
+          "forced": true
+        },
+        {
+          "key": "udp-policy-not-supported-behaviour",
+          "label_zh": "UDP 不支持策略行为",
+          "label_en": "UDP Unsupported Policy",
+          "type": "select",
+          "hint_zh": "",
+          "hint_en": "",
+          "options": [
+            {
+              "value": "REJECT",
+              "label_zh": "拒绝",
+              "label_en": "Reject"
+            }
+          ],
+          "forced": true
+        }
+      ]
+    }
+  ]
+}

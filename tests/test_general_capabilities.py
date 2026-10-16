@@ -6,6 +6,9 @@
 所有凭据/地址均为合成值（回环地址 + 占位用户名），不依赖真实运行库。
 """
 
+import json
+from pathlib import Path
+
 import pytest
 
 from app.default_config import DEFAULT_GENERAL
@@ -434,10 +437,45 @@ class TestSaveValuesEndpoint:
 
 
 def test_i18n_general_keys_complete():
-    """zh/en 均含 forced 徽标、tags 占位与 metadata 缺失提示键（防止新增键覆盖既有键）"""
+    """zh/en 均含 forced 徽标、tags 占位与 metadata 提示键（防止新增键覆盖既有键）"""
     from app.i18n import TRANSLATIONS
     for locale in ("zh", "en"):
         table = TRANSLATIONS[locale]
         assert table.get("general.forced_badge"), locale
         assert table.get("general.tags_placeholder"), locale
         assert table.get("general.meta_missing"), locale
+        assert table.get("general.meta_stale"), locale
+
+
+# JS 行为测试（tests/js/test_general_forced_fields.js）的 metadata fixture：
+# 三个目标的完整 /api/general/fields 响应，由后端 general_groups_for_target
+# 生成后原样提交。本测试锁定 fixture 与后端真实输出一致（含分组/字段/选项
+# 顺序），禁止手写裁剪或分叉；能力表变更时以失败提醒重新生成 fixture。
+GENERAL_META_FIXTURE = Path(__file__).parent / "js" / "fixtures" / "general_fields_meta.json"
+
+
+class TestGeneralMetaFixture:
+    @pytest.mark.parametrize("target", ALL_TARGETS)
+    def test_fixture_matches_backend_groups(self, target):
+        """fixture 三目标内容 == general_groups_for_target 实际完整输出（含顺序）"""
+        fixture = json.loads(GENERAL_META_FIXTURE.read_text(encoding="utf-8"))
+        assert general_groups_for_target(target) == fixture[target.value]
+
+    def test_fixture_covers_all_targets(self):
+        fixture = json.loads(GENERAL_META_FIXTURE.read_text(encoding="utf-8"))
+        assert set(fixture) == {t.value for t in ProfileTarget}
+
+    @pytest.mark.parametrize(("target", "forced_keys"), [
+        (ProfileTarget.MAC_WORKSTATION,
+         {"block-quic", "udp-policy-not-supported-behaviour"}),
+        (ProfileTarget.MAC_GATEWAY,
+         {"block-quic", "udp-policy-not-supported-behaviour", "gateway-restricted-to-lan"}),
+        (ProfileTarget.IOS_MOBILE,
+         {"block-quic", "udp-policy-not-supported-behaviour",
+          "compatibility-mode", "auto-suspend"}),
+    ])
+    def test_fixture_forced_keys_per_target(self, target, forced_keys):
+        """fixture 各目标 forced 键集合锁定：前端 JS 测试据此断言禁用数量"""
+        fixture = json.loads(GENERAL_META_FIXTURE.read_text(encoding="utf-8"))
+        meta = fixture[target.value]
+        assert {f["key"] for g in meta for f in g["fields"] if f.get("forced") is True} == forced_keys
