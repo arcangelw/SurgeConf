@@ -39,11 +39,13 @@ def validated_access_env(name: str) -> str | None:
     raw = os.environ.get(name)
     if raw is None:
         return None
-    value = raw.strip()
+    # 任何 trim 之前先拒绝全部 C0/C1 控制字符（含首尾 CR/LF/TAB/DEL）
+    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in raw):
+        raise ValueError(f"{name}: 控制字符不被允许")
+    # 仅普通空格可 trim（不吞 TAB/CR/LF 等——它们已在上面被拒绝）
+    value = raw.strip(" ")
     if not value:
         return None
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-        raise ValueError(f"{name}: 控制字符不被允许")
     access, sep, host_port = value.partition("@")
     if not sep or not access or any(ch in _ACCESS_FORBIDDEN for ch in access):
         raise ValueError(f"{name}: 需要 access@host:port 格式且 access 不含空白/分隔符")

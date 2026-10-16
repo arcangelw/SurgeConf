@@ -13,10 +13,10 @@ source "$SCRIPT_DIR/launchd_lib.sh"
 umask 077
 
 # 运行目录（默认 Application Support；SURGECONF_DATA_DIR 可整体重定向）
-DATA_DIR="$(sc_resolve_data_dir)"
+DATA_DIR="${SURGECONF_DATA_DIR:-$HOME/Library/Application Support/SurgeConf}"
 LOG_DIR="$HOME/Library/Logs/SurgeConf"
-mkdir -p "$DATA_DIR" "$LOG_DIR"
-chmod 700 "$DATA_DIR" "$LOG_DIR"
+sc_ensure_directory "$DATA_DIR"
+sc_ensure_directory "$LOG_DIR"
 
 # 检查虚拟环境
 if [ ! -d "venv" ]; then

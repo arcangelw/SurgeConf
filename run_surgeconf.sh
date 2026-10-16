@@ -1,6 +1,6 @@
 #!/bin/bash
 # SurgeConf launchd 包装脚本
-# 由 com.surgeconf.plist 调用（plist 由 surgeconf.sh 的统一 install 流程生成）。
+# 由 com.surgeconf.plist 调用（plist 由统一 install 流程生成）。
 # 日志由 launchd StandardOut/ErrorPath 捕获到 ~/Library/Logs/SurgeConf/surgeconf.log。
 
 set -euo pipefail
@@ -15,16 +15,18 @@ source "$PROJECT_DIR/launchd_lib.sh"
 # （plist 亦设置 Umask 63，双保险）
 umask 077
 
-# 运行目录：plist 传入 SURGECONF_DATA_DIR（或默认 Application Support）
-DATA_DIR="$(sc_resolve_data_dir)"
+# 先读固定控制文件（~/Library/Application Support/SurgeConf/launchd.env，
+# 与实际数据目录独立）：获得持久化的 host/port/data dir/控制器凭据。
+sc_read_launchd_env "$(sc_control_env_path)"
+
+# 运行目录：控制文件持久化值或 plist 传入或默认
+DATA_DIR="$(sc_env_value SURGECONF_DATA_DIR)"
+: "${DATA_DIR:=$(sc_control_dir)}"
 LOG_DIR="$HOME/Library/Logs/SurgeConf"
-mkdir -p "$DATA_DIR" "$LOG_DIR"
-chmod 700 "$DATA_DIR" "$LOG_DIR"
+sc_ensure_directory "$DATA_DIR"
+sc_ensure_directory "$LOG_DIR"
 
-# 安全读取持久化配置（含控制器凭据；凭据只存 launchd.env 0600，不进 plist）
-sc_read_launchd_env "$DATA_DIR/launchd.env"
-
-# launchd 捕获日志前预建 0600（拒绝 symlink）
+# launchd 捕获日志前预建 0600（拒绝 symlink/FIFO/socket）
 sc_ensure_log_file "$LOG_DIR/surgeconf.log"
 
 exec "$PROJECT_DIR/venv/bin/python" -m uvicorn app.main:app \

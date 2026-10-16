@@ -18,7 +18,7 @@ def _extract_skip_proxy_items(config: str) -> list[str]:
 async def test_skip_proxy_merge_default_custom_host(db):
     """skip-proxy = 默认 + 自定义 + host 勾选域名，去重；host 未勾选的不含"""
     db.add(SystemConfig(key="skip_proxy_custom",
-                        value='["10.99.0.0/16", " *.example.com "]'))
+                        value='["198.51.100.0/24", " *.example.com "]'))
     from app.models import ConfigProfile
     from sqlalchemy import select
     default_pid = (await db.execute(
@@ -44,7 +44,7 @@ async def test_skip_proxy_merge_default_custom_host(db):
     assert "localhost" in items
     assert "10.0.0.0/8" in items
     # 系统级自定义条目（两侧空格被 strip）
-    assert "10.99.0.0/16" in items
+    assert "198.51.100.0/24" in items
     assert "*.example.com" in items
     # 当前方案中勾选的域名并入
     assert "keep.example.com" in items
@@ -110,9 +110,9 @@ async def test_general_skip_proxy_endpoints(db):
     assert data["custom"] == []
     assert isinstance(data["defaults"], list) and "localhost" in data["defaults"]
 
-    r = await save_skip_proxy(SkipProxyUpdate(items=["  172.20.0.0/16 ", "x.com"]), db=db)
-    assert r["items"] == ["172.20.0.0/16", "x.com"]
+    r = await save_skip_proxy(SkipProxyUpdate(items=["  203.0.113.0/24 ", "x.com"]), db=db)
+    assert r["items"] == ["203.0.113.0/24", "x.com"]
 
     data = await get_skip_proxy(db=db)
-    assert data["custom"] == ["172.20.0.0/16", "x.com"]
+    assert data["custom"] == ["203.0.113.0/24", "x.com"]
 

@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import text
 
 from app.runtime_paths import (resolve_runtime_paths, ensure_runtime_directories,
-                               harden_runtime_permissions)
+                               assert_regular_file, harden_runtime_permissions)
 from app.database import DatabaseRuntime
 
 
@@ -27,6 +27,7 @@ async def test_sqlite_connection_pragmas(tmp_path):
         assert await conn.scalar(text("PRAGMA synchronous")) == 1
         assert await conn.scalar(text("PRAGMA busy_timeout")) == 5000
         assert await conn.scalar(text("PRAGMA foreign_keys")) == 1
+    await runtime.dispose()
 
 
 def _make_paths(tmp_path, monkeypatch):
@@ -96,3 +97,36 @@ def test_harden_rejects_unexpected_entry_type(tmp_path, monkeypatch):
     os.mkfifo(paths.backups / "pipe")
     with pytest.raises(RuntimeError, match="unexpected entry type"):
         harden_runtime_permissions(paths)
+
+
+def test_ensure_directories_fails_closed_on_symlink(tmp_path, monkeypatch):
+    """ensure_runtime_directories 自身（不是事后 harden）拒绝 symlink root"""
+    import os
+    real = tmp_path / "real-data"
+    real.mkdir()
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "link-data"))
+    os.symlink(real, tmp_path / "link-data")
+    paths = resolve_runtime_paths(home=tmp_path / "home")
+    with pytest.raises(RuntimeError, match="not a real directory"):
+        ensure_runtime_directories(paths)
+
+
+def test_assert_regular_file_semantics(tmp_path):
+    """打开前校验：普通文件/不存在通过；symlink/FIFO 拒绝"""
+    import os
+    f = tmp_path / "db.sqlite"
+    f.write_bytes(b"x")
+    assert_regular_file(f)                    # 普通文件 OK
+    assert_regular_file(tmp_path / "missing")  # 不存在 OK（由调用方定创建语义）
+
+    target = tmp_path / "target"
+    target.write_bytes(b"y")
+    link = tmp_path / "link.sqlite"
+    os.symlink(target, link)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        assert_regular_file(link)
+
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        assert_regular_file(fifo)

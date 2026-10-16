@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from secrets import token_hex
 
-from app.runtime_paths import (RuntimePaths, ensure_runtime_directories,
+from app.runtime_paths import (RuntimePaths, assert_regular_file,
+                               refresh_runtime_permissions,
                                resolve_runtime_paths)
 
 # 自动/手动备份统一保留最近 10 份（迁移前备份同样纳入该策略，消除无限累积）
@@ -50,7 +51,11 @@ class BackupInfo:
 
 
 def sqlite_backup(source: Path, target: Path) -> None:
-    """SQLite Backup API 复制（源以只读 URI 打开，正确处理 WAL 页级一致性）。"""
+    """SQLite Backup API 复制（源以只读 URI 打开，正确处理 WAL 页级一致性）。
+
+    打开源之前先做 lstat 校验：symlink/非普通文件 fail closed。
+    """
+    assert_regular_file(source)
     source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     target_conn = sqlite3.connect(target)
     try:
@@ -105,9 +110,10 @@ def backup_database(source: Path, paths: RuntimePaths, schema_tag: str,
 
     ``protected`` 为本次 prune 不可删除的文件名集合（恢复流程保护
     点名备份）。临时文件 → integrity_check → 0600 → ``os.replace``；
+    备份前先安全重建目录并收敛既有产物权限（启动后目录可能被替换）。
     失败不产生半成品，也不影响既有备份。
     """
-    ensure_runtime_directories(paths)
+    refresh_runtime_permissions(paths)
     target = unique_path(paths.backups,
                          f"surge_conf_{_utc_timestamp()}_{_sanitize_tag(schema_tag)}", ".db")
     tmp = paths.backups / f".{target.name}.tmp-{os.getpid()}-{token_hex(4)}"
@@ -175,6 +181,7 @@ def list_backups() -> list[BackupInfo]:
 async def create_backup(reason: str) -> BackupInfo:
     """对 live 库做一致性备份（阻塞的 SQLite 复制卸载到线程池）。"""
     paths = resolve_runtime_paths()
+    assert_regular_file(paths.database)
     if not paths.database.exists():
         raise FileNotFoundError("live 数据库不存在，无法备份")
     published = await asyncio.to_thread(backup_database, paths.database, paths, reason)
@@ -209,7 +216,7 @@ async def restore_backup(name: str) -> None:
                                                  staging_path)
 
     paths = resolve_runtime_paths()
-    ensure_runtime_directories(paths)
+    refresh_runtime_permissions(paths)
     selected = next((item for item in list_backups() if item.name == name), None)
     if selected is None:
         raise LookupError(f"备份不存在: {name}")
@@ -241,7 +248,7 @@ async def reset_database() -> None:
     from app.services.database_migration import PROJECT_ROOT, prepare_database
 
     paths = resolve_runtime_paths()
-    ensure_runtime_directories(paths)
+    refresh_runtime_permissions(paths)
     safety: Path | None = None
     try:
         await database.dispose()

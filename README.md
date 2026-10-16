@@ -255,7 +255,7 @@ SURGE_HOST=0.0.0.0 ./surgeconf.sh enable   # plist 固化局域网监听
    ```
    DOMAIN-SUFFIX,dev.local,DIRECT
    DOMAIN-SUFFIX,staging.internal,DIRECT
-   IP-CIDR,10.10.0.0/16,DIRECT
+   IP-CIDR,198.51.100.0/24,DIRECT
    ```
 
 3. **API 测试环境** — 某些测试 API 需要指定 IP 或 DNS，在 Host 映射中添加。

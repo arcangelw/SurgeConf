@@ -107,11 +107,12 @@ async def lifespan(app: FastAPI):
     configure_private_umask()
     paths = resolve_runtime_paths()
     ensure_runtime_directories(paths)
+    # 顺序：safe ensure → harden(既有产物) → 迁移 → harden(新产物) → bind
+    from app.runtime_paths import harden_runtime_permissions
+    harden_runtime_permissions(paths)
     # 延迟导入：database_migration 顶层依赖本模块的 seed_defaults
     from app.services.database_migration import prepare_database
     result = await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
-    # live 库（含新建与已是 head 的复用路径）在 bind/连接前统一收敛权限
-    from app.runtime_paths import harden_runtime_permissions
     harden_runtime_permissions(paths)
     database.bind(paths.database)
     print(f"[启动] 数据库就绪（来源 {result.source}，"
