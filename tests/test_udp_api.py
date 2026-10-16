@@ -478,14 +478,15 @@ async def test_process_mask_collision_falls_back_on_all_paths(
 
 @pytest.mark.asyncio
 async def test_noncanonical_mac_stock_masked(admin_client, gateway_profile):
-    """绕库直插的 MAC 存量：小写冒号→大写契约掩码；其余非法形态一律 ***"""
+    """绕库直插的 MAC 存量：非法形态 fallback；首行小写候选与掩码形
+    存量 raw 碰撞（AA:BB:**:**:**:FF）也 fallback，完整 raw 全不回显"""
     from app.models import UdpException
 
     rows = [
-        "aa:bb:cc" + ":dd:ee:ff",   # 存量小写：接受，输出大写契约掩码
-        "0G:00:00:00:00:01",   # 非 hex
+        "aa:bb:cc" + ":dd:ee:ff",   # 存量小写：候选为大写掩码形态
+        "0G:00:00:00:00:01",        # 非 hex
         "aa-bb-cc" + "-dd-ee-ff",   # 错误分隔（未规范化的横线存量）
-        "AA:BB:**:**:**:FF",   # 六组但含 **（掩码形字面量）
+        "AA:BB:**:**:**:FF",        # 六组但含 **（掩码形字面量存量）
     ]
     async with admin_client._test_factory() as db:
         for value in rows:
@@ -494,12 +495,30 @@ async def test_noncanonical_mac_stock_masked(admin_client, gateway_profile):
         await db.commit()
     resp = await admin_client.get(_base(gateway_profile))
     masked = [item["match_value_masked"] for item in resp.json()]
-    assert masked.count("AA:BB:**:**:**:FF") == 1
-    # 掩码形字面量与首行合法掩码同形，只能作为首行掩码出现一次；
-    # 其余原值（含小写全形）一律不在响应文本
+    # 首行候选 AA:BB:**:**:**:FF 恰等于第四行 raw：跨记录碰撞 → 全部
+    # fallback（***）；非法形态本就 fallback
+    assert masked.count("***") == len(rows)
+    # 掩码形 raw 与小写/非hex/横线原值一律不在响应文本
+    assert "AA:BB:**:**:**:FF" not in resp.text
     for value in ("aa:bb:cc" + ":dd:ee:ff", "0G:00:00:00:00:01",
                   "aa-bb-cc" + "-dd-ee-ff"):
         assert value not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_lowercase_mac_masked_uppercase_when_no_collision(
+        admin_client, gateway_profile):
+    """无碰撞时存量小写 MAC 按大写契约掩码（02:00:**:**:**:01 形态）"""
+    from app.models import UdpException
+
+    async with admin_client._test_factory() as db:
+        db.add(UdpException(profile_id=gateway_profile.id,
+                            match_type="mac_address",
+                            match_value="aa:bb:cc" + ":dd:ee:ff"))
+        await db.commit()
+    listed = await admin_client.get(_base(gateway_profile))
+    assert listed.json()[0]["match_value_masked"] == "AA:BB:**:**:**:FF"
+    assert "aa:bb:cc" + ":dd:ee:ff" not in listed.text
 
 
 @pytest.mark.asyncio
@@ -645,3 +664,99 @@ def test_runtime_engine_hides_bound_parameters(tmp_path):
     finally:
         import asyncio
         asyncio.run(runtime.dispose())
+
+
+# ===== Fix round 2：跨记录掩码碰撞（对全库敏感值集合 fail closed） =====
+
+@pytest.mark.asyncio
+async def test_process_mask_collides_with_other_record_raw(
+        admin_client, workstation_profiles):
+    """一条记录的掩码候选恰等于另一条完整值（abcdef→ab**ef vs raw=ab**ef）：
+    create/update/list 逐条与整体响应都不回显任一完整 raw"""
+    first, second = workstation_profiles
+    r2 = await admin_client.post(_base(second), json={
+        "match_type": "process", "match_value": "ab**ef"})
+    assert r2.status_code == 201
+    assert r2.json()["match_value_masked"] == "***"  # 自碰撞 fallback
+    assert "ab**ef" not in r2.text
+
+    r1 = await admin_client.post(_base(first), json={
+        "match_type": "process", "match_value": "abcdef"})
+    assert r1.status_code == 201
+    assert r1.json()["match_value_masked"] == "***"  # 候选命中 rec2 raw
+    assert "ab**ef" not in r1.text and "abcdef" not in r1.text
+
+    for profile in (first, second):
+        listed = await admin_client.get(_base(profile))
+        assert "ab**ef" not in listed.text
+        assert "abcdef" not in listed.text
+
+    upd = await admin_client.put(f"{_base(first)}/{r1.json()['id']}",
+                                 json={"enabled": False})
+    assert upd.status_code == 200
+    assert "ab**ef" not in upd.text and "abcdef" not in upd.text
+
+
+@pytest.mark.asyncio
+async def test_mac_candidate_collides_with_stored_raw_variants(
+        admin_client, gateway_profile):
+    """合法 MAC 候选与存量掩码形 raw 碰撞（含小写语义等价）：不回显"""
+    from app.models import UdpException
+
+    async with admin_client._test_factory() as db:
+        db.add(UdpException(profile_id=gateway_profile.id,
+                            match_type="mac_address",
+                            match_value="AA:BB:**:**:**:FF"))
+        db.add(UdpException(profile_id=gateway_profile.id,
+                            match_type="mac_address",
+                            match_value="aa:bb:cc" + ":dd:ee:ff"))
+        await db.commit()
+    created = await admin_client.post(_base(gateway_profile), json={
+        "match_type": "mac_address", "match_value": "AA:BB:CC" + ":DD:EE:FF"})
+    assert created.status_code == 201
+    assert created.json()["match_value_masked"] == "***"
+    listed = await admin_client.get(_base(gateway_profile))
+    assert "AA:BB:**:**:**:FF" not in listed.text
+    assert "aa:bb:cc" + ":dd:ee:ff" not in listed.text
+    assert "AA:BB:CC" + ":DD:EE:FF" not in listed.text
+
+
+@pytest.mark.asyncio
+async def test_mask_collision_across_profiles(admin_client, workstation_profiles):
+    """碰撞检查覆盖全库：另一档案的 raw 也阻止本档案掩码回显"""
+    first, second = workstation_profiles
+    await create_process_exception(admin_client, profile_id=second.id,
+                                   value="ab**ef")
+    resp = await admin_client.post(_base(first), json={
+        "match_type": "process", "match_value": "abcdef"})
+    assert resp.status_code == 201
+    assert resp.json()["match_value_masked"] == "***"
+    assert "ab**ef" not in resp.text
+    listed = await admin_client.get(_base(first))  # 仅 first 的列表
+    assert "ab**ef" not in listed.text
+    assert "abcdef" not in listed.text
+
+
+@pytest.mark.asyncio
+async def test_fallback_placeholder_itself_stored(admin_client, workstation_profiles):
+    """占位 *** 与 [redacted] 都被存为 raw 时，碰撞记录递增到 <redacted:1>；
+    任何 fallback 都不含原值片段"""
+    from app.models import UdpException
+
+    profile, _ = workstation_profiles
+    async with admin_client._test_factory() as db:
+        db.add(UdpException(profile_id=profile.id, match_type="process",
+                            match_value="***"))
+        db.add(UdpException(profile_id=profile.id, match_type="process",
+                            match_value="[redacted]"))
+        await db.commit()
+    # 短值本应 ***，但 *** 已是存储 raw；[redacted] 也是 → <redacted:1>
+    created = await admin_client.post(_base(profile), json={
+        "match_type": "process", "match_value": "ab"})
+    assert created.status_code == 201
+    assert created.json()["match_value_masked"] == "<redacted:1>"
+    listed = await admin_client.get(_base(profile))
+    assert "[redacted]" not in listed.text  # 完整 raw 占位不回显
+    for item in listed.json():
+        assert item["match_value_masked"] not in ("***", "[redacted]")
+        assert item["match_value_masked"] != "ab"

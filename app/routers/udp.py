@@ -24,8 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import ConfigProfile, UdpException
 from app.services.profile_resolution import ProfileNotFound, resolve_profile
-from app.udp_policy import (UdpMatchType, _contains_control_character,
-                            normalize_udp_match)
+from app.udp_policy import (UdpMatchType, _MAC_ADDRESS_PATTERN,
+                            _contains_control_character, normalize_udp_match)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,9 @@ _DUPLICATE_MESSAGE = "已存在相同的 UDP 例外（同档案同类型同匹�
 
 # 其他数据库错误的静态文案（绝不拼接异常文本/语句/参数）
 _DB_UNAVAILABLE = "服务暂时不可用，请稍后重试"
+
+# 掩码碰撞 fallback 的静态占位序列（都不含任何原值片段）
+_FALLBACK_MASKS = ("***", "[redacted]")
 
 # MAC 掩码前必须 fullmatch 的规范存储形态：6 组 2 位十六进制、冒号分隔
 #（接受存量小写；掩码输出以 normalize 契约的大写为准）
@@ -101,36 +104,73 @@ async def _require_exception(db: AsyncSession, profile_id: int,
     return exception
 
 
-def _mask_match_value(match_type: str, value: str) -> str:
-    """匹配值脱敏：固定形态掩码，不泄露长度与内容。
+def _safe_fallback_mask(forbidden: frozenset[str]) -> str:
+    """取第一个不在敏感值集合中的静态占位（永不包含原值片段）。
+
+    先试固定占位序列；极端情况下（占位本身被存为 raw）以
+    ``<redacted:N>`` 递增，集合有限故必然选出安全值。
+    """
+    for mask in _FALLBACK_MASKS:
+        if mask not in forbidden:
+            return mask
+    n = 1
+    while True:
+        mask = f"<redacted:{n}>"
+        if mask not in forbidden:
+            return mask
+        n += 1
+
+
+async def _forbidden_match_values(db: AsyncSession) -> frozenset[str]:
+    """全库 UDP 例外完整匹配值（跨档案）+ MAC 规范等价形式。
+
+    掩码候选不得等于其中任何值（防止一条记录的掩码回显另一条记录的
+    完整敏感值，含大小写/分隔变体的语义等价）。集合本身绝不进入
+    响应或日志。
+    """
+    result = await db.execute(select(UdpException.match_value))
+    values = {row[0] for row in result.all()}
+    for value in tuple(values):
+        if _MAC_ADDRESS_PATTERN.fullmatch(value):
+            values.add(value.upper().replace("-", ":"))
+    return frozenset(values)
+
+
+def _mask_match_value(match_type: str, value: str,
+                      forbidden: frozenset[str]) -> str:
+    """匹配值脱敏：固定形态掩码，并对全库敏感值集合 fail closed。
 
     - mac_address：先 fullmatch 规范 6 组 2 位十六进制（接受存量小写），
-      输出以 normalize 契约的大写为据（``02:00:**:**:**:01`` 形态）；
-      非 hex、横线/点分等错误分隔、含 ``**`` 的六组一律 ``***``
-    - process：仅保留首尾各 2 字符；长度不足 5 统一 ``***``
-    - 任何分支的掩码候选若逐字等于原值（值本身形如 ``ab**cd``），
-      掩码形同虚设，回退 ``***``
+      输出以 normalize 契约的大写为据；非 hex、横线/点分等错误分隔、
+      含 ``**`` 的六组一律 fallback
+    - process：仅保留首尾各 2 字符；长度不足 5 统一 fallback
+    - 候选等于自身、或等于库中任何完整匹配值（含 MAC 规范等价）时
+      fallback：从静态占位序列取第一个未命中集合的值，绝不回退到
+      任何原值片段
     """
+    candidate: str | None = None
     if match_type == UdpMatchType.MAC_ADDRESS.value:
-        if not _MAC_CANONICAL.fullmatch(value):
-            return "***"
-        head0, head1, _, _, _, tail = value.split(":")
-        candidate = f"{head0.upper()}:{head1.upper()}:**:**:**:{tail.upper()}"
-        return candidate if candidate != value else "***"
-    if len(value) < 5:
-        return "***"
-    candidate = f"{value[:2]}**{value[-2:]}"
-    return candidate if candidate != value else "***"
+        if _MAC_CANONICAL.fullmatch(value):
+            head0, head1, _, _, _, tail = value.split(":")
+            candidate = (f"{head0.upper()}:{head1.upper()}"
+                         f":**:**:**:{tail.upper()}")
+    elif len(value) >= 5:
+        candidate = f"{value[:2]}**{value[-2:]}"
+    if (candidate is not None and candidate != value
+            and candidate not in forbidden):
+        return candidate
+    return _safe_fallback_mask(forbidden)
 
 
-def _exception_view(exception: UdpException) -> dict:
+def _exception_view(exception: UdpException,
+                    forbidden: frozenset[str]) -> dict:
     """唯一响应序列化出口：白名单字段 + 掩码值（绝不含 match_value）"""
     return {
         "id": exception.id,
         "profile_id": exception.profile_id,
         "match_type": exception.match_type,
         "match_value_masked": _mask_match_value(
-            exception.match_type, exception.match_value),
+            exception.match_type, exception.match_value, forbidden),
         "display_name": exception.display_name,
         "enabled": exception.enabled,
         "sort_order": exception.sort_order,
@@ -157,11 +197,12 @@ async def list_udp_exceptions(profile_id: int,
                               db: AsyncSession = Depends(get_db)):
     """父档案的例外列表：(sort_order, id) 排序，disabled 也显示"""
     await _require_profile(db, profile_id)
+    forbidden = await _forbidden_match_values(db)
     result = await db.execute(
         select(UdpException)
         .where(UdpException.profile_id == profile_id)
         .order_by(UdpException.sort_order, UdpException.id))
-    return [_exception_view(e) for e in result.scalars().all()]
+    return [_exception_view(e, forbidden) for e in result.scalars().all()]
 
 
 @router.post("/profiles/{profile_id}/udp-exceptions", status_code=201)
@@ -186,7 +227,8 @@ async def create_udp_exception(profile_id: int, data: UdpExceptionCreate,
     db.add(exception)
     await _commit_or_http_error(db)
     await db.refresh(exception)
-    return _exception_view(exception)
+    forbidden = await _forbidden_match_values(db)
+    return _exception_view(exception, forbidden)
 
 
 @router.put("/profiles/{profile_id}/udp-exceptions/{exception_id}")
@@ -225,7 +267,8 @@ async def update_udp_exception(profile_id: int, exception_id: int,
 
     await _commit_or_http_error(db)
     await db.refresh(exception)
-    return _exception_view(exception)
+    forbidden = await _forbidden_match_values(db)
+    return _exception_view(exception, forbidden)
 
 
 @router.delete("/profiles/{profile_id}/udp-exceptions/{exception_id}",
