@@ -63,14 +63,21 @@ R_RFC1918 = Rule(
         "192" + ".168.0.0/16",
     }),
 )
-# 规则 7：MAC 地址（全部检测，不按 locally-administered 整类排除；
-# 仅允许规范指定的合成值）
+# 规则 7：MAC 地址三格式（冒号/连字符/Cisco 点分），全部检测、
+# 不按 locally-administered 整类排除；仅放行规范指定的同一合成 MAC 的
+# 三种等价表示，其余一律报告
 R_MAC = Rule(
     re.compile(
-        r"(?<![0-9A-Fa-f:])"
+        r"(?<![0-9A-Fa-f:.-])"
         r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}"
-        r"(?![0-9A-Fa-f:])"),
-    allow_values=frozenset({"02:00:00:00:00:01"}),
+        r"|[0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5}"
+        r"|[0-9A-Fa-f]{2}(?:\.[0-9A-Fa-f]{2}){5}"
+        r"(?![0-9A-Fa-f:.-])"),
+    allow_values=frozenset({
+        "02:00:00:00:00:01",
+        "02-00-00-00-00-01",
+        "02.00.00.00.00.01",
+    }),
 )
 
 FORBIDDEN = [R_USERS, R_PEM, R_SECRET_ASSIGN, R_CTRL_ENV_ASSIGN,
@@ -83,7 +90,7 @@ RULE_EXEMPTIONS: dict[tuple[str, int], str] = {
     # 合成 MITM 夹具：ca-p12 = <合成 base64>（规则 3）
     ("tests/fixtures/synthetic_profile.conf", 3): "6d0b5eeddc4c7670f03b486dd24836e33b155d17c8ea1e4d5952510cb4cfb103",
     # launchd 行为测试：合成凭据赋值断言行（规则 4）
-    ("tests/test_launchd_scripts.py", 4): "4a62604102192ef7dbb2e87712dfe4797181041818f71d25241913c38fa2a4c7",
+    ("tests/test_launchd_scripts.py", 4): "4050acce99251d4fbaf158cb01e8045efa28771d4ec30fbcdfd9a58da03e056b",
 }
 
 
@@ -190,14 +197,20 @@ class TestRuleSemantics:
         assert self._ok(R_RFC1918, "198.51.100.0/24 203.0.113.9 192.0.2.10")
         assert self._ok(R_RFC1918, "127.0.0.1 0.0.0.0 100.64.0.0/10")
 
-    def test_all_mac_forms_detected(self):
-        assert not self._ok(R_MAC, "a4:83" + ":e7:11:22:33")       # 全局唯一（真实）
-        assert not self._ok(R_MAC, "02:11" + ":22:33:44:55")       # locally administered 也报
+    def test_all_mac_separators_detected(self):
+        # 冒号 / 连字符 / Cisco 点分：真实 MAC 三格式全部报告
+        assert not self._ok(R_MAC, "a4:83" + ":e7:11:22:33")
+        assert not self._ok(R_MAC, "a4-83" + "-e7-11-22-33")
+        assert not self._ok(R_MAC, "a4.83" + ".e7.11.22.33")
+        # locally administered 与全局唯一同样报告
+        assert not self._ok(R_MAC, "02:11" + ":22:33:44:55")
         assert not self._ok(R_MAC, "00:1a" + ":2b:3c:4d:5e")
 
-    def test_designated_synthetic_mac_allowed(self):
+    def test_designated_synthetic_mac_all_three_forms_allowed(self):
+        # 同一合成 MAC 的三种等价表示均放行（UDP 计划文档的连字符形式不误报）
         assert self._ok(R_MAC, "rule MAC-ADDRESS,02:00:00:00:00:01,DIRECT")
-        assert self._ok(R_MAC, "02:00:00:00:00:01")
+        assert self._ok(R_MAC, "02-00-00-00-00-01")
+        assert self._ok(R_MAC, "02.00.00.00.00.01")
 
     def test_non_mac_unaffected(self):
         assert self._ok(R_MAC, "12:34:56 sha256 abcdef 2026-10-16 fe80::1")

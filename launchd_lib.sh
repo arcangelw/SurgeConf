@@ -7,6 +7,8 @@
 # 控制文件固定位于 ~/Library/Application Support/SurgeConf/launchd.env
 # （与实际 SURGECONF_DATA_DIR 独立），持久化 data dir/host/port/凭据；
 # restart 先读固定控制文件，再由其中的 SURGECONF_DATA_DIR 解析运行目录。
+# 固定控制文件缺失时，从现有 plist 安全迁移旧 custom-data 配置（见
+# sc_migrate_legacy_control）。
 #
 # 键更新语义（五个持久化键一致）：
 #   - 调用环境「显式提供」非空值 → 写入并持久化；
@@ -16,6 +18,13 @@
 
 SC_LAUNCHD_LABEL="com.surgeconf"
 
+SC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# C0/C1 判定用 venv Python（Unicode code point 语义，不误伤 UTF-8 中文路径）
+SC_PYTHON="$SC_LIB_DIR/venv/bin/python"
+if [ ! -x "$SC_PYTHON" ]; then
+  SC_PYTHON="$(command -v python3 || echo python3)"
+fi
+
 sc_control_dir() {
   printf '%s\n' "$HOME/Library/Application Support/SurgeConf"
 }
@@ -24,17 +33,46 @@ sc_control_env_path() {
   printf '%s\n' "$(sc_control_dir)/launchd.env"
 }
 
-# 目录安全创建：拒绝 symlink/非目录（fail closed），mkdir -p 后收敛 0700
+# 目录安全创建：锚点（默认 $HOME）以下逐组件拒绝 symlink/非目录，
+# mkdir -p 后收敛 0700。不在锚点下的路径从根起全链校验（系统 symlink
+# 如 /tmp 将被拒绝 —— 调用方应使用物理路径）。
 sc_ensure_directory() {
   local d="$1"
-  if [ -L "$d" ]; then
-    echo "拒绝 symlink 目录路径: $d" >&2
-    return 1
+  local anchor="${2:-$HOME}"
+  case "$d" in
+    "$anchor"|"$anchor"/*) ;;
+    *) anchor="/" ;;
+  esac
+  # 锚点自身必须存在且为非 symlink 目录（根锚点除外）
+  if [ "$anchor" != "/" ]; then
+    if [ -L "$anchor" ] || [ ! -d "$anchor" ]; then
+      echo "锚点目录无效: $anchor" >&2
+      return 1
+    fi
   fi
-  if [ -e "$d" ] && [ ! -d "$d" ]; then
-    echo "路径存在但不是目录: $d" >&2
-    return 1
-  fi
+  # 从锚点以下逐组件校验
+  local rel="${d#"$anchor"}"
+  rel="${rel#/}"
+  local p="$anchor"
+  local comp
+  while [ -n "$rel" ]; do
+    comp="${rel%%/*}"
+    if [ "$comp" = "$rel" ]; then
+      rel=""
+    else
+      rel="${rel#*/}"
+    fi
+    [ -z "$comp" ] && continue
+    p="${p%/}/$comp"
+    if [ -L "$p" ]; then
+      echo "拒绝 symlink 路径组件: $p" >&2
+      return 1
+    fi
+    if [ -e "$p" ] && [ ! -d "$p" ]; then
+      echo "路径组件不是目录: $p" >&2
+      return 1
+    fi
+  done
   mkdir -p "$d" || return $?
   chmod 700 "$d"
 }
@@ -53,17 +91,21 @@ sc_ensure_log_file() {
   touch "$f" && chmod 600 "$f"
 }
 
-# 值中不得出现任何控制字符（C0/C1 全集；bash case 用 [[:cntrl:]]
-# 覆盖 C0 + DEL，另对高位 C1 用 grep 补充）。
+# C0/C1 控制字符与非法 UTF-8 判定：由 venv Python 以 Unicode code point
+# 语义执行（0x00-0x1F、0x7F-0x9F），中文路径/非 ASCII 合法值不误报。
 sc_assert_no_control() {
-  case "$1" in
-    *[[:cntrl:]]*)
-      echo "配置值含控制字符" >&2
-      return 1
-      ;;
-  esac
-  if printf '%s' "$1" | LC_ALL=C grep -q $'[\x80-\x9f]'; then
-    echo "配置值含控制字符" >&2
+  if ! printf '%s' "$1" | "$SC_PYTHON" -c 'import sys
+raw = sys.stdin.buffer.read()
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    sys.exit(1)
+for ch in text:
+    o = ord(ch)
+    if o < 0x20 or 0x7F <= o <= 0x9F:
+        sys.exit(1)
+sys.exit(0)'; then
+    echo "配置值含控制字符或非法 UTF-8" >&2
     return 1
   fi
 }
@@ -85,7 +127,13 @@ sc_env_value() {
   esac
 }
 
-# 将当前环境中的持久化键写入控制文件（原子替换：0600 临时文件 + mv）。
+# mktemp 独占创建（O_EXCL、随机名、0600）安全临时文件；禁止可预测名重定向。
+sc_mktemp_private() {
+  local dir="$1" prefix="$2"
+  mktemp "${dir}/${prefix}.XXXXXX"
+}
+
+# 将当前环境中的持久化键写入控制文件（mktemp 独占 + 原子 mv）。
 # 所有值先做控制字符/换行校验 —— 任一非法即在写盘前失败，不生成文件。
 sc_write_launchd_env() {
   local file="$1"
@@ -104,9 +152,13 @@ sc_write_launchd_env() {
     fi
   done
 
-  local tmp="${file}.tmp.$$"
-  printf '%s' "$out" > "$tmp" && chmod 600 "$tmp" || {
-    rm -f "$tmp"; return 1; }
+  local tmp
+  tmp="$(sc_mktemp_private "$dir" ".launchd.env")" || return $?
+  chmod 600 "$tmp"
+  if ! printf '%s' "$out" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
   mv -f "$tmp" "$file"
   chmod 600 "$file"
 }
@@ -154,14 +206,68 @@ sc_read_launchd_env() {
         ;;
     esac
     sc_assert_no_control "$val" || return $?
-    case "$val" in
-      *$'\r'*)
-        echo "控制文件值含 CR: $key" >&2
-        return 1
-        ;;
-    esac
     sc_set_env "$key" "$val"
   done < "$file"
+}
+
+# 统一配置消费：显式环境值优先于控制文件值，结果 export 到当前 shell。
+# 所有 control file 读取一律经 sc_read_launchd_env（本函数是唯一入口旁的
+# 合并层），禁止 grep/head/cut 等旁路解析。
+sc_resolve_runtime_config() {
+  local in_host in_port in_data in_ctrl in_api
+  local set_host=0 set_port=0 set_data=0 set_ctrl=0 set_api=0
+  if [ "${SURGE_HOST+x}" = x ]; then set_host=1; in_host="${SURGE_HOST-}"; fi
+  if [ "${SURGE_PORT+x}" = x ]; then set_port=1; in_port="${SURGE_PORT-}"; fi
+  if [ "${SURGECONF_DATA_DIR+x}" = x ]; then set_data=1; in_data="${SURGECONF_DATA_DIR-}"; fi
+  if [ "${SURGE_CONTROLLER_ACCESS+x}" = x ]; then set_ctrl=1; in_ctrl="${SURGE_CONTROLLER_ACCESS-}"; fi
+  if [ "${SURGE_HTTP_API+x}" = x ]; then set_api=1; in_api="${SURGE_HTTP_API-}"; fi
+
+  sc_read_launchd_env "$(sc_control_env_path)" || return $?
+
+  if [ "$set_host" = 1 ]; then sc_set_env SURGE_HOST "$in_host"; fi
+  if [ "$set_port" = 1 ]; then sc_set_env SURGE_PORT "$in_port"; fi
+  if [ "$set_data" = 1 ]; then sc_set_env SURGECONF_DATA_DIR "$in_data"; fi
+  if [ "$set_ctrl" = 1 ]; then sc_set_env SURGE_CONTROLLER_ACCESS "$in_ctrl"; fi
+  if [ "$set_api" = 1 ]; then sc_set_env SURGE_HTTP_API "$in_api"; fi
+}
+
+# 旧架构迁移：固定控制文件缺失时，从现有 plist 安全解析
+# SURGECONF_DATA_DIR（plistlib，禁止 shell source/grep XML），若其目录
+# 存在旧 launchd.env 则经统一安全 reader 读取；迁移值作为持久化现值。
+# 必须在「显式值记录」之后调用，调用方随后正常回放显式值。
+sc_migrate_legacy_control() {
+  local plist="$1"
+  local control_env
+  control_env="$(sc_control_env_path)"
+  [ -e "$control_env" ] && return 0
+  [ -f "$plist" ] || return 0
+  if [ -L "$plist" ]; then
+    echo "拒绝 symlink plist: $plist" >&2
+    return 1
+  fi
+
+  local data_dir
+  data_dir="$("$SC_PYTHON" -c '
+import plistlib, sys
+with open(sys.argv[1], "rb") as handle:
+    data = plistlib.load(handle)
+env = data.get("EnvironmentVariables") or {}
+sys.stdout.write(env.get("SURGECONF_DATA_DIR", ""))
+' "$plist" 2>/dev/null)" || data_dir=""
+  [ -n "$data_dir" ] || return 0
+
+  local legacy_env="$data_dir/launchd.env"
+  if [ -e "$legacy_env" ]; then
+    if [ -L "$legacy_env" ]; then
+      echo "拒绝 symlink 的旧控制文件: $legacy_env" >&2
+      return 1
+    fi
+    if [ -f "$legacy_env" ]; then
+      sc_read_launchd_env "$legacy_env" || return $?   # 统一安全 reader
+    fi
+  fi
+  # data dir 迁移值（无论是否存在旧 env，plist 的 data dir 本身要保留）
+  sc_set_env SURGECONF_DATA_DIR "$data_dir"
 }
 
 sc_xml_escape() {
@@ -194,8 +300,11 @@ sc_generate_plist() {
   x_host="$(sc_xml_escape "$host")"
   x_data="$(sc_xml_escape "$data_dir")"
 
-  local tmp="${plist}.tmp.$$"
-  cat > "$tmp" << EOF
+  # mktemp 独占创建（随机名 + 0600），禁止可预测名重定向
+  local tmp
+  tmp="$(sc_mktemp_private "$(dirname "$plist")" "$(basename "$plist")")" || return $?
+  chmod 600 "$tmp"
+  if ! cat > "$tmp" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -228,16 +337,21 @@ sc_generate_plist() {
 </dict>
 </plist>
 EOF
+  then
+    rm -f "$tmp"
+    return 1
+  fi
   mv -f "$tmp" "$plist"
   chmod 600 "$plist"
 }
 
 # 唯一 install/regenerate 流程：enable/start/restart 共用。
 #   1) 已加载（launchctl list "$LABEL" 精确 exit status）则 unload，失败传播；
-#   2) 固定控制文件记录显式值 → 读旧值回放 → 原子落盘（非法值写盘前失败）；
-#   3) 由控制文件解析 data dir/host/port，安全创建目录与日志；
-#   4) 重新生成 plist —— 旧 plist 的 0.0.0.0/仓库 logs 等遗留字段必然重写；
-#   5) launchctl load（失败传播）并以 launchctl list "$LABEL" 确认。
+#   2) 固定控制目录安全创建；控制文件缺失时从旧 plist 迁移 custom-data 配置；
+#   3) 显式值记录 → 读控制文件回放 → mktemp 原子落盘（非法值写盘前失败）；
+#   4) 由控制文件解析 data dir/host/port，逐组件安全创建目录与日志；
+#   5) 重新生成 plist —— 旧 plist 的 0.0.0.0/仓库 logs 等遗留字段必然重写；
+#   6) launchctl load（失败传播）并以 launchctl list "$LABEL" 确认。
 sc_install_launchd() {
   local plist="$1" project_dir="$2" log_file="$3"
   local control_env
@@ -257,6 +371,9 @@ sc_install_launchd() {
   if [ "${SURGECONF_DATA_DIR+x}" = x ]; then set_data=1; in_data="${SURGECONF_DATA_DIR-}"; fi
   if [ "${SURGE_CONTROLLER_ACCESS+x}" = x ]; then set_ctrl=1; in_ctrl="${SURGE_CONTROLLER_ACCESS-}"; fi
   if [ "${SURGE_HTTP_API+x}" = x ]; then set_api=1; in_api="${SURGE_HTTP_API-}"; fi
+
+  # 固定控制文件缺失 → 从旧 plist 安全迁移（显式值随后回放覆盖）
+  sc_migrate_legacy_control "$plist" || return $?
 
   sc_read_launchd_env "$control_env" || return $?      # 旧持久化值（回退来源）
   if [ "$set_host" = 1 ]; then sc_set_env SURGE_HOST "$in_host"; fi

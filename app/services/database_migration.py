@@ -10,7 +10,8 @@ from alembic.script import ScriptDirectory
 
 from app.bootstrap import seed_defaults
 from app.database import Base, DatabaseRuntime
-from app.runtime_paths import RuntimePaths, ensure_runtime_directories, assert_regular_file
+from app.runtime_paths import (RuntimePaths, assert_regular_file, assert_sqlite_database_safe,
+                               ensure_runtime_directories, reserve_private_file)
 from app.services.backups import backup_database, sqlite_backup
 from app.services.data_migrations import DATA_MIGRATIONS, apply_data_migrations
 
@@ -59,7 +60,7 @@ def _head_revision() -> str:
 # ===== 只读检查 =====
 
 def alembic_version(database_path: Path):
-    assert_regular_file(database_path)
+    assert_sqlite_database_safe(database_path)
     """读取 alembic_version；无表/无行返回 None（调用方确保文件存在）"""
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as conn:
         try:
@@ -71,7 +72,7 @@ def alembic_version(database_path: Path):
 
 
 def pending_data_migration_keys(database_path: Path) -> list:
-    assert_regular_file(database_path)
+    assert_sqlite_database_safe(database_path)
     """只读列出尚未记账的业务迁移 key（data_migration_records 缺表视为全部待执行）"""
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as conn:
         try:
@@ -131,7 +132,7 @@ def schema_fingerprints() -> dict[str, dict[str, frozenset[str]]]:
 
 
 def _actual_schema(database_path: Path) -> tuple[set[str], dict[str, set[str]]]:
-    assert_regular_file(database_path)
+    assert_sqlite_database_safe(database_path)
     """实际库的表集合与表→列集合（排除簿记表）"""
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as conn:
         tables = {
@@ -203,12 +204,18 @@ def staging_path(paths: RuntimePaths) -> Path:
 def discard_staging(staging: Path) -> None:
     for suffix in ("", "-wal", "-shm"):
         candidate = staging.with_name(staging.name + suffix)
-        if candidate.exists():
-            candidate.unlink()
+        if os.path.lexists(candidate):
+            # dangling/普通 symlink 一律直接 unlink（不跟随）；其余异常类型 fail closed
+            if candidate.is_symlink():
+                candidate.unlink()
+            elif candidate.exists():
+                candidate.unlink()
+            else:
+                raise RuntimeError(f"staging 路径为异常类型: {candidate}")
 
 
 def _checkpoint_and_remove_sidecars(database_path: Path) -> None:
-    assert_regular_file(database_path)
+    assert_sqlite_database_safe(database_path)
     """关闭引擎后 checkpoint WAL 并删除 -wal/-shm，确保单文件原子替换"""
     conn = sqlite3.connect(database_path)
     try:
@@ -223,7 +230,7 @@ def _checkpoint_and_remove_sidecars(database_path: Path) -> None:
 
 
 def verify_and_publish(staging: Path, target: Path) -> None:
-    assert_regular_file(staging)
+    assert_sqlite_database_safe(staging)
     # 读写连接：ro URI 打开 WAL 库会重建 -shm/-wal 伴生文件，无法保证单文件替换
     conn = sqlite3.connect(staging)
     try:
@@ -243,8 +250,9 @@ def verify_and_publish(staging: Path, target: Path) -> None:
 # ===== schema 推进与 staging 升级 =====
 
 def _sync_schema(database_path: Path) -> None:
-    """把 staging 库推进到 Alembic head（不存在的文件由 Alembic 全新建表）"""
-    if not database_path.exists():
+    """把 staging 库推进到 Alembic head（不存在或 0 字节占位文件由
+    Alembic 全新建表；预占位保留的普通文件不触发 schema 识别分支）"""
+    if not database_path.exists() or database_path.stat().st_size == 0:
         run_alembic_upgrade(database_path)
         return
     if alembic_version(database_path) is None:
@@ -293,6 +301,9 @@ async def rebuild_from_source(source: Path | None, paths: RuntimePaths) -> tuple
     staging = staging_path(paths)
     discard_staging(staging)
     try:
+        # 在已验证 0700 parent 下原子保留 staging 为普通文件（0600），
+        # SQLite 随后打开的是我们已验证的文件；全新路径同样先占位
+        reserve_private_file(staging)
         if source is not None:
             sqlite_backup(source, staging)
         applied = await upgrade_staging(staging)
@@ -309,9 +320,10 @@ async def prepare_database(paths: RuntimePaths, legacy_path: Path) -> MigrationR
     ensure_runtime_directories(paths)
     live = paths.database
     legacy = Path(legacy_path)
-    # 任何 SQLite 打开（含 legacy/backup API 只读源）前：拒绝 symlink/非普通文件
-    assert_regular_file(live)
-    assert_regular_file(legacy)
+    # 任何 SQLite 打开（含 legacy/backup API 只读源）前：最终普通文件 +
+    # 父链无 symlink + 现存 -wal/-shm 伴生无异常（缺失 sidecar 由 SQLite 自建）
+    assert_sqlite_database_safe(live)
+    assert_sqlite_database_safe(legacy)
 
     if not live.exists() and legacy.exists():
         # 路径 2：仅旧仓库库存在 —— 备份未升级副本，staging 上完成后原子发布，旧库保持原样

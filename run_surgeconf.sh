@@ -17,9 +17,11 @@ umask 077
 
 # 先读固定控制文件（~/Library/Application Support/SurgeConf/launchd.env，
 # 与实际数据目录独立）：获得持久化的 host/port/data dir/控制器凭据。
+# 消费统一经 sc_read_launchd_env（0600、普通文件、无 symlink、
+# 重复/未知/控制字符拒绝）。
 sc_read_launchd_env "$(sc_control_env_path)"
 
-# 运行目录：控制文件持久化值或 plist 传入或默认
+# 运行目录：控制文件持久化值或默认
 DATA_DIR="$(sc_env_value SURGECONF_DATA_DIR)"
 : "${DATA_DIR:=$(sc_control_dir)}"
 LOG_DIR="$HOME/Library/Logs/SurgeConf"

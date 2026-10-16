@@ -301,3 +301,16 @@ async def test_lifespan_prepares_database_before_binding_live_runtime(tmp_path, 
     async with fastapi_app.router.lifespan_context(fastapi_app):
         assert bound["path"].exists()
 
+
+
+# ===== Round 3：dangling staging symlink =====
+
+
+def test_discard_staging_removes_dangling_symlink(tmp_path):
+    """staging 为 dangling symlink：直接 unlink（不跟随、不保留）"""
+    import os
+    from app.services.database_migration import discard_staging
+    staging = tmp_path / "surge_conf.db.staging"
+    os.symlink(tmp_path / "does-not-exist", staging)
+    discard_staging(staging)
+    assert not os.path.lexists(staging)   # 不保留 dangling symlink

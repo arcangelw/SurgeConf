@@ -4,7 +4,9 @@ import pytest
 from sqlalchemy import text
 
 from app.runtime_paths import (resolve_runtime_paths, ensure_runtime_directories,
-                               assert_regular_file, harden_runtime_permissions)
+                               assert_regular_file, assert_sqlite_database_safe,
+                               harden_runtime_permissions, refresh_runtime_permissions,
+                               reserve_private_file)
 from app.database import DatabaseRuntime
 
 
@@ -86,7 +88,7 @@ def test_harden_fails_closed_on_symlinked_directory(tmp_path, monkeypatch):
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "link-runtime"))
     os.symlink(real, tmp_path / "link-runtime")
     paths = resolve_runtime_paths(home=tmp_path / "home")
-    with pytest.raises(RuntimeError, match="not a real directory"):
+    with pytest.raises(RuntimeError, match="directory"):
         harden_runtime_permissions(paths)
 
 
@@ -107,7 +109,7 @@ def test_ensure_directories_fails_closed_on_symlink(tmp_path, monkeypatch):
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "link-data"))
     os.symlink(real, tmp_path / "link-data")
     paths = resolve_runtime_paths(home=tmp_path / "home")
-    with pytest.raises(RuntimeError, match="not a real directory"):
+    with pytest.raises(RuntimeError, match="directory"):
         ensure_runtime_directories(paths)
 
 
@@ -130,3 +132,66 @@ def test_assert_regular_file_semantics(tmp_path):
     os.mkfifo(fifo)
     with pytest.raises(RuntimeError, match="not a regular file"):
         assert_regular_file(fifo)
+
+
+# ===== Round 3：no-follow 收口 =====
+
+
+def test_reserve_private_file_semantics(tmp_path):
+    """O_CREAT|O_EXCL|O_NOFOLLOW：新建 0600 普通文件、幂等复用、symlink 拒绝"""
+    import os
+    target = tmp_path / "staging.db"
+    reserve_private_file(target)
+    assert target.is_file()
+    assert target.stat().st_mode & 0o777 == 0o600
+    reserve_private_file(target)          # 已存在普通文件 → 幂等复用
+    assert target.stat().st_mode & 0o777 == 0o600
+
+    os.remove(target)
+    os.symlink(tmp_path / "elsewhere", target)
+    with pytest.raises(RuntimeError):
+        reserve_private_file(target)
+
+
+def test_assert_sqlite_database_safe_sidecars_and_parent(tmp_path):
+    """sidecar symlink 拒绝；父链 symlink 拒绝；主文件缺失放行"""
+    import os
+    db = tmp_path / "live.db"
+    db.write_bytes(b"db")
+    assert_sqlite_database_safe(db)       # 正常通过
+
+    wal = tmp_path / "live.db-wal"
+    os.symlink(tmp_path / "evil", wal)
+    with pytest.raises(RuntimeError, match="regular file"):
+        assert_sqlite_database_safe(db)
+    os.remove(wal)
+
+    # 父链 symlink
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    db2 = real_parent / "live.db"
+    db2.write_bytes(b"db")
+    link_parent = tmp_path / "link-parent"
+    os.symlink(real_parent, link_parent)
+    with pytest.raises(RuntimeError, match="parent chain"):
+        assert_sqlite_database_safe(link_parent / "live.db")
+
+    # 主文件缺失放行（新建路径由 ensure/占位负责）
+    assert_sqlite_database_safe(tmp_path / "missing.db")
+
+
+def test_refresh_fails_closed_after_directory_replacement(tmp_path, monkeypatch):
+    """启动后 backups/exports 被整体替换为 symlink → 操作前 refresh 拒绝"""
+    import os
+    paths = _make_paths(tmp_path, monkeypatch)
+    refresh_runtime_permissions(paths)    # 正常收敛一次
+
+    # 启动后运行目录整体被替换为 symlink → 下一次操作前 refresh 拒绝
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "surge_conf.db").write_bytes(b"stolen")
+    os.symlink(outside, tmp_path / "replaced-runtime")
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "replaced-runtime"))
+    paths2 = resolve_runtime_paths(home=tmp_path / "home")
+    with pytest.raises(RuntimeError):
+        refresh_runtime_permissions(paths2)

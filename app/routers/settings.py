@@ -66,9 +66,12 @@ async def get_backups():
 
 @router.get("/backups/{name}")
 async def download_backup(name: str):
-    """下载备份：name 必须命中现有备份白名单，拒绝任意路径"""
+    """下载备份：name 必须命中现有备份白名单，且最终路径为已验证的
+    非 symlink 普通文件（list_backups 已收敛目录权限并逐项 lstat）"""
+    from app.runtime_paths import assert_regular_file
     for item in list_backups():
         if item.name == name:
+            assert_regular_file(item.path)   # 双重确认（白名单 + 类型）
             return FileResponse(item.path, media_type="application/octet-stream",
                                 filename=item.name)
     raise HTTPException(status_code=404, detail="备份不存在")

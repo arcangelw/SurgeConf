@@ -16,7 +16,8 @@ from pathlib import Path
 from secrets import token_hex
 
 from app.runtime_paths import (RuntimePaths, assert_regular_file,
-                               refresh_runtime_permissions,
+                               assert_sqlite_database_safe,
+                               refresh_runtime_permissions, reserve_private_file,
                                resolve_runtime_paths)
 
 # 自动/手动备份统一保留最近 10 份（迁移前备份同样纳入该策略，消除无限累积）
@@ -53,9 +54,10 @@ class BackupInfo:
 def sqlite_backup(source: Path, target: Path) -> None:
     """SQLite Backup API 复制（源以只读 URI 打开，正确处理 WAL 页级一致性）。
 
-    打开源之前先做 lstat 校验：symlink/非普通文件 fail closed。
+    打开源之前先做全链校验（普通文件 + 父链 + sidecar）：fail closed。
     """
-    assert_regular_file(source)
+    assert_sqlite_database_safe(source)
+    reserve_private_file(target)   # O_CREAT|O_EXCL|O_NOFOLLOW 0600 预占位
     source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     target_conn = sqlite3.connect(target)
     try:
@@ -155,8 +157,13 @@ def prune_backups(paths: RuntimePaths, keep: int = BACKUP_KEEP,
 
 
 def list_backups() -> list[BackupInfo]:
-    """列出全部备份（时间升序）；schema 版本只读解析，不含绝对路径。"""
+    """列出全部备份（时间升序）；schema 版本只读解析，不含绝对路径。
+
+    先安全重建目录并收敛权限（防启动后目录替换），再逐项 lstat：
+    仅白名单命名且为非 symlink 普通文件的条目可进入列表/下载。
+    """
     paths = resolve_runtime_paths()
+    refresh_runtime_permissions(paths)
     if not paths.backups.is_dir():
         return []
     # 延迟导入：database_migration 顶层依赖本模块，避免循环导入
@@ -165,7 +172,7 @@ def list_backups() -> list[BackupInfo]:
     items: list[BackupInfo] = []
     for entry in sorted(paths.backups.iterdir(), key=lambda p: p.name):
         match = _BACKUP_NAME_RE.match(entry.name)
-        if not match or not entry.is_file():
+        if not match or entry.is_symlink() or not entry.is_file():
             continue
         items.append(BackupInfo(
             name=entry.name,
@@ -181,7 +188,7 @@ def list_backups() -> list[BackupInfo]:
 async def create_backup(reason: str) -> BackupInfo:
     """对 live 库做一致性备份（阻塞的 SQLite 复制卸载到线程池）。"""
     paths = resolve_runtime_paths()
-    assert_regular_file(paths.database)
+    assert_sqlite_database_safe(paths.database)
     if not paths.database.exists():
         raise FileNotFoundError("live 数据库不存在，无法备份")
     published = await asyncio.to_thread(backup_database, paths.database, paths, reason)

@@ -513,3 +513,119 @@ def test_real_restart_presists_and_reloads(tmp_path, fake_launchctl):
     calls = log.read_text().strip().splitlines()
     assert f"unload {plist}" in calls            # restart 也走卸载→重载
     assert f"load {plist}" in calls
+
+
+# ===== Round 3：C1/UTF-8、迁移、status 精确判定 =====
+
+
+def test_control_char_check_utf8_safe(tmp_path):
+    """Unicode code point 语义：中文路径/非 ASCII 值不误报；真实 C1 拒绝"""
+    r = run_bash(r"""
+        source "$LIB"
+        sc_assert_no_control "$HOME/项目数据目录" && echo CN_DIR_OK || echo CN_DIR_BAD
+        sc_assert_no_control "密钥@主机.example.com:6160" && echo CN_VAL_OK || echo CN_VAL_BAD
+        sc_assert_no_control "02-00-00-00-00-01" && echo ASCII_OK || echo ASCII_BAD
+        NEL="$(printf '\xc2\x85')"
+        sc_assert_no_control "k@h${NEL}:6160" && echo NEL_BAD || echo NEL_OK
+        C1="$(printf '\xc2\x9f')"
+        sc_assert_no_control "k${C1}@h:6160" && echo C1_BAD || echo C1_OK
+        LF="$(printf 'a\nb')"
+        sc_assert_no_control "$LF" && echo LF_BAD || echo LF_OK
+    """, tmp_path)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "CN_DIR_OK" in out and "CN_DIR_BAD" not in out
+    assert "CN_VAL_OK" in out and "CN_VAL_BAD" not in out
+    assert "ASCII_OK" in out and "ASCII_BAD" not in out
+    assert "NEL_OK" in out and "NEL_BAD" not in out      # U+0085 (NEL) 属 C1
+    assert "C1_OK" in out and "C1_BAD" not in out        # U+009F (C1 末位)
+    assert "LF_OK" in out and "LF_BAD" not in out
+
+
+def test_chinese_custom_data_dir_install_roundtrip(tmp_path, fake_launchctl):
+    """中文 custom data dir 全链：install → unset restart 保持同一目录"""
+    log, env, state = fake_launchctl
+    home, *_ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    custom = home / "数据目录甲"
+
+    r = run_bash(_install_script(), tmp_path,
+                 extra_env={**env, "SURGECONF_DATA_DIR": str(custom)})
+    assert r.returncode == 0, r.stderr
+    assert custom.is_dir()
+
+    r2 = run_bash(_install_script(), tmp_path, extra_env=env)   # 全 unset
+    assert r2.returncode == 0, r2.stderr
+    data = plistlib.loads((home / "Library/LaunchAgents/com.surgeconf.plist").read_bytes())
+    assert data["EnvironmentVariables"]["SURGECONF_DATA_DIR"] == str(custom)
+
+
+def test_migrate_legacy_custom_data_control(tmp_path, fake_launchctl):
+    """旧 plist + custom dir 内旧架构 launchd.env + 全变量 unset →
+    迁移到固定控制文件并保持原 DB 路径与旧配置"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    custom = home / "legacy-custom-data"
+    custom.mkdir(parents=True, exist_ok=True)
+
+    # 旧架构：控制文件在 custom data dir 内；plist 指向 custom + 旧监听 0.0.0.0
+    (custom / "launchd.env").write_text(
+        f"SURGE_HOST=192.0.2.10\nSURGE_PORT=61900\n"
+        f"SURGE_CONTROLLER_ACCESS=legacy-key@192.0.2.10:6160\n")
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.surgeconf</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>SURGE_HOST</key><string>0.0.0.0</string>
+    <key>SURGECONF_DATA_DIR</key><string>{custom}</string>
+  </dict></dict></plist>
+""")
+
+    r = run_script(["restart"], tmp_path, extra_env=env)   # 全 unset 真实入口
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    # 固定控制文件已生成且包含迁移值
+    content = control_env.read_text()
+    assert f"SURGECONF_DATA_DIR={custom}" in content       # 原 DB 路径保持
+    assert "SURGE_HOST=192.0.2.10" in content              # 来自旧架构 env
+    assert "SURGE_PORT=61900" in content
+    assert "SURGE_CONTROLLER_ACCESS=legacy-key@192.0.2.10:6160" in content
+    # plist 重写：监听来自迁移值（不再是 0.0.0.0），data dir 保持 custom
+    data = plistlib.loads(plist.read_bytes())
+    assert data["EnvironmentVariables"]["SURGE_HOST"] == "192.0.2.10"
+    assert data["EnvironmentVariables"]["SURGECONF_DATA_DIR"] == str(custom)
+
+
+def test_status_uses_exact_label_query(tmp_path, fake_launchctl):
+    """status 精确 label 判定：运行中 / 已注册未运行 / 未注册"""
+    log, env, state = fake_launchctl
+    home, _, _, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r0 = run_script(["status"], tmp_path, extra_env=env)
+    assert r0.returncode == 0, r0.stderr
+    assert "未注册" in r0.stdout
+
+    plist.write_text("<plist/>")
+    r1 = run_script(["status"], tmp_path, extra_env=env)
+    assert "已注册但未运行" in r1.stdout
+    calls = [c for c in log.read_text().strip().splitlines()]
+    assert "list com.surgeconf" in calls                  # 精确 label 查询
+    assert not any("|" in c or "grep" in c for c in calls)  # 无子串 grep 管道
+
+    state.write_text("loaded")
+    r2 = run_script(["status"], tmp_path, extra_env=env)
+    assert "运行中" in r2.stdout
+
+
+def test_run_branch_refuses_corrupt_control_file(tmp_path, fake_launchctl):
+    """run 分支控制文件损坏（未知键）→ 经 sc_read_launchd_env 拒绝启动"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    control_env.write_text("EVIL_KEY=x\n")
+
+    r = run_script(["run"], tmp_path, extra_env=env)
+    assert r.returncode != 0
+    assert "未知键" in r.stderr or "未知键" in r.stdout
