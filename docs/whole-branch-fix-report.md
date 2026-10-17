@@ -524,3 +524,68 @@ after-load 场景 INT 完全被吞 rc=0）。
 **验证**：RED——8 failed / 1 passed（fake 加固契约随测试侧先行
 改造直接 GREEN）。GREEN——launchd 专项 **49 passed**；launchd +
 开源安全专项 **126 passed**；全量 pytest **1186 passed**。
+
+### 7. Fix Round 2 — 入口 PID 信号边界 / mv 窗口原子性 / 提交顺序
+
+Commit: `fix: make launchd signal handling atomic`
+
+复审发现的三个 Important 问题与修复（先写失败测试复现）：
+
+**问题 A：trap 只装在 sc_switch_launchd 的子 shell，真实入口 PID
+无保护。** 用户对 `surgeconf.sh`（入口进程）发 TERM/INT 时，入口
+进程在等待子 shell，自身无 trap——默认死亡，退出码 -15；子 shell
+的 trap 与入口进程的生命周期脱钩。
+
+**问题 B：mv 完成与 MOVED/SWITCHED 状态赋值之间存在信号窗口。**
+四个切换 mv（control/plist 旧→备份、候选→正式）任一完成但状态尚未
+置位时信号到达，回滚按旧状态判断——`MOVED=0` 时不恢复备份且
+`sc_discard_candidates` 把**唯一备份删除**（实测 control 场景旧文件
+彻底丢失，FileNotFound）。
+
+**问题 C：提交顺序颠倒。** 原实现 `sc_discard_candidates` 先于
+`SC_COMMITTED=1` 执行，且信号 handler 不查提交标记——确认成功
+瞬间的信号会把**已确认发布的新 job 卸载**并回滚旧文件（实测
+after-confirm 注入下 plist 被换回旧字节）。
+
+修复（`launchd_lib.sh`）：
+
+- **事务在当前进程（入口 PID）执行**：去掉子 shell，`sc_switch_launchd`
+  直接在调用进程（真实入口 `surgeconf.sh` 的 PID）内装 trap 执行
+  事务；事务边界契约：接管 EXIT/HUP/INT/TERM 并在所有出口（成功/
+  失败/信号）拆除恢复默认——本仓库入口均无自定义 trap，不受影响。
+  fake 的 `$PPID` 现在命中的就是入口 PID 本身。
+- **临界区原子化四个 mv + 确认**：`sc_critical_enter` 把四信号改为
+  仅记录 `SC_PENDING_SIGNAL` 并摘除 EXIT 兜底；mv 返回后调用方先
+  完成状态赋值，`sc_critical_leave` 再恢复回滚 handler 并处理
+  pending——回滚读到的永远是已更新状态，不会删唯一备份/留半文件。
+  「确认 list 成功 + 置 `SC_COMMITTED=1`」同样在临界区内完成。
+- **提交顺序修正**：确认成功即置 `SC_COMMITTED=1`（临界区内）→
+  拆事务 trap → `sc_discard_candidates` 清理。`sc_signal_rollback`
+  尊重提交标记：已提交时不回滚、不卸载新 job，仅清理临时备份后以
+  128+signum 退出；拆 trap 后清理窗口的信号最多留下 0600 临时备份，
+  不破坏已发布状态。`sc_exit_rollback` 同样查提交标记，保留原退出
+  码且幂等一次，正常完成不触发。
+
+测试设施（fake 增强）：
+
+- fake mv（PATH 注入，透传 /bin/mv）：`FAKE_MV_SIGNAL=to-backup/
+  to-final` 在「目标匹配的 mv 已完成、返回前」向父进程（入口 PID）
+  一次性发 TERM/INT——精确制造 mv↔赋值窗口；
+- fake launchctl list 新增 after-confirm 注入点（以 load-mark 区分
+  确认与探测），load 成功落 load-mark。
+
+**新增用例（3 个）**：
+
+- TERM@旧control→备份 mv 完成后：唯一备份不被删、旧字节恢复、
+  旧 job 重载、rc=143、无残留（旧实现下 control 永久丢失复现）；
+- INT@候选plist→正式 mv 完成后：同上原子回滚、rc=130；
+- TERM@确认成功瞬间：**新配置保持发布**（plist/control 均为新值、
+  新 job 不被卸载）、rc=143、无残留（旧实现下新 job 被卸载、
+  plist 换回旧字节复现）。
+
+**验证**：RED——2 failed / 1 passed（to-backup 丢备份、after-confirm
+错误回滚；to-final 在旧实现下碰巧通过，作为行为保护）。GREEN——
+launchd 专项 **52 passed**；launchd + 开源安全专项 **129 passed**；
+全量 pytest **1189 passed**。既有信号三时点测试（after-unload/
+before-load/after-load）在新实现下语义升级为「真实入口 PID 持有
+trap」，无需改动即通过。

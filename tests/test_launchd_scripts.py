@@ -45,6 +45,14 @@ case "$1" in
         else
           printf -- '-\t0\t%s\n' "$2"
         fi
+        # after-confirm 注入点：候选 load 已发生（load-mark 存在）后的
+        # 第一次精确查询（即 switch 的确认）时向父进程发信号
+        if [ "${FAKE_LAUNCHCTL_SIGNAL:-}" = "after-confirm" ] && \
+           [ -f "${FAKE_LAUNCHCTL_LOAD_MARK:-/nonexistent}" ] && \
+           [ ! -f "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/nonexistent}" ]; then
+          : > "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/dev/null}" 2>/dev/null
+          kill -"${FAKE_LAUNCHCTL_SIGNAL_KIND:-TERM}" "$PPID" 2>/dev/null
+        fi
         exit 0
       fi
       exit 1
@@ -75,6 +83,8 @@ case "$1" in
     rc="${FAKE_LAUNCHCTL_LOAD_RC:-0}"
     if [ "$rc" = "0" ]; then
       printf '%s' "$plist_arg" > "${FAKE_LAUNCHCTL_STATE:-/dev/null}"
+      # load 标记：供 after-confirm 注入点区分「确认」与「探测」
+      : > "${FAKE_LAUNCHCTL_LOAD_MARK:-/dev/null}" 2>/dev/null
       # after-load 注入点：候选已加载——发信号后以 0 退出
       if _signal_once after-load; then
         exit 0
@@ -108,6 +118,28 @@ esac
 exit 0
 """
 
+FAKE_MV = r"""#!/bin/sh
+# 透传真 mv；FAKE_MV_SIGNAL=to-backup/to-final 时在「目标匹配的 mv 已完成、
+# 返回前」向父进程（被测 bash）一次性发信号——用于制造 mv 与状态赋值
+# 之间的信号窗口
+/bin/mv "$@"
+rc=$?
+for last in "$@"; do :; done
+hit=""
+case "${FAKE_MV_SIGNAL:-}" in
+  to-backup)
+    case "$last" in *.backup.*) hit=1 ;; esac ;;
+  to-final)
+    case "$last" in */launchd.env|*/com.surgeconf.plist) hit=1 ;; esac ;;
+esac
+if [ -n "$hit" ] && [ ! -f "${FAKE_MV_SIGNAL_MARK:-/nonexistent}" ]; then
+  : > "${FAKE_MV_SIGNAL_MARK:-/dev/null}" 2>/dev/null
+  kill -"${FAKE_MV_SIGNAL_KIND:-TERM}" "$PPID" 2>/dev/null
+fi
+exit "$rc"
+"""
+
+
 
 def run_bash(script: str, tmp_path: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
     home = tmp_path / "home"
@@ -137,16 +169,19 @@ def run_script(args: list[str], tmp_path: Path, extra_env: dict | None = None) -
 
 @pytest.fixture
 def fake_launchctl(tmp_path):
-    """PATH 前置 fake launchctl；返回 (调用日志, env 片段, state 文件)
+    """PATH 前置 fake launchctl 与 fake mv；返回 (调用日志, env 片段, state 文件)
 
     env 片段额外携带各类故障注入辅助路径：FAKE_LAUNCHCTL_ONCE_MARK
     （fail-once 标记）、FAKE_LAUNCHCTL_LIST_COUNT（精确查询计数）、
     FAKE_LAUNCHCTL_UNLOAD_COUNT（unload 计数）、FAKE_LAUNCHCTL_SIGNAL_MARK
-    （一次性信号注入标记）。"""
+    （一次性信号注入标记）、FAKE_LAUNCHCTL_LOAD_MARK（load 已发生标记）、
+    FAKE_MV_SIGNAL_MARK（mv 窗口信号标记）。"""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "launchctl").write_text(FAKE_LAUNCHCTL)
     (bindir / "launchctl").chmod(0o755)
+    (bindir / "mv").write_text(FAKE_MV)
+    (bindir / "mv").chmod(0o755)
     log = tmp_path / "launchctl.log"
     log.touch()   # 预创建：零调用的场景（如 prepare 早期拒绝）也能安全读取
     state = tmp_path / "loaded.marker"
@@ -154,13 +189,17 @@ def fake_launchctl(tmp_path):
     list_count = tmp_path / "list-count"
     unload_count = tmp_path / "unload-count"
     signal_mark = tmp_path / "signal.mark"
+    load_mark = tmp_path / "load-happened.mark"
+    mv_signal_mark = tmp_path / "mv-signal.mark"
     env = {"PATH": f"{bindir}:/usr/bin:/bin",
            "FAKE_LAUNCHCTL_LOG": str(log),
            "FAKE_LAUNCHCTL_STATE": str(state),
            "FAKE_LAUNCHCTL_ONCE_MARK": str(once_mark),
            "FAKE_LAUNCHCTL_LIST_COUNT": str(list_count),
            "FAKE_LAUNCHCTL_UNLOAD_COUNT": str(unload_count),
-           "FAKE_LAUNCHCTL_SIGNAL_MARK": str(signal_mark)}
+           "FAKE_LAUNCHCTL_SIGNAL_MARK": str(signal_mark),
+           "FAKE_LAUNCHCTL_LOAD_MARK": str(load_mark),
+           "FAKE_MV_SIGNAL_MARK": str(mv_signal_mark)}
     return log, env, state
 
 
@@ -1354,3 +1393,80 @@ def test_fake_launchctl_load_requires_real_plist(tmp_path, fake_launchctl):
                  tmp_path, extra_env=env)
     assert "RC=1" in r.stdout
     assert not state.exists()
+
+# ===== Slice 4 Fix Round 2：入口 PID trap / mv 窗口原子性 / 提交顺序 =====
+
+
+def test_mv_signal_window_to_backup_is_atomic(tmp_path, fake_launchctl):
+    """TERM 于旧 control→备份 mv 完成后、MOVED 置位前：临界区挂起信号，
+    状态先更新再回滚——唯一备份不被删除，旧字节完整恢复"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_MV_SIGNAL": "to-backup",
+        "FAKE_MV_SIGNAL_KIND": "TERM",
+    })
+    assert r.returncode == 143
+    assert control_env.read_bytes() == before_control   # 备份恢复，未被删除
+    assert plist.read_bytes() == before_plist
+    assert state.exists()                                # 旧 job 重新加载
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_mv_signal_window_to_final_is_atomic(tmp_path, fake_launchctl):
+    """INT 于候选 plist→正式路径 mv 完成后、SWITCHED 置位前：同上原子
+    回滚，不留半文件"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_MV_SIGNAL": "to-final",
+        "FAKE_MV_SIGNAL_KIND": "INT",
+    })
+    assert r.returncode == 130
+    assert control_env.read_bytes() == before_control
+    assert plist.read_bytes() == before_plist
+    assert state.exists()
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_signal_after_confirm_respects_commit(tmp_path, fake_launchctl):
+    """TERM 于确认成功瞬间（committed 置位窗口）：不回滚、不卸载已发布
+    新 job，退出 143，无残留（信号尊重提交标记）"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_SIGNAL": "after-confirm",
+        "FAKE_LAUNCHCTL_SIGNAL_KIND": "TERM",
+    })
+    assert r.returncode == 143
+    assert b"OLD-PLIST" != plist.read_bytes()          # 新配置已发布
+    data = plistlib.loads(plist.read_bytes())
+    assert data["EnvironmentVariables"]["SURGE_PORT"] == "61900"
+    assert "SURGE_PORT=61900" in control_env.read_text()
+    assert state.exists()                               # 新 job 未被卸载
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]

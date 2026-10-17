@@ -34,9 +34,9 @@ SC_PLIST_MOVED=0
 SC_PLIST_SWITCHED=0
 SC_WAS_LOADED=0
 SC_SWITCH_TARGET_PLIST=""
-SC_SWITCH_TARGET_CONTROL=""
 SC_ROLLBACK_DONE=0
 SC_COMMITTED=0
+SC_PENDING_SIGNAL=""
 
 # 复位事务状态（每次 sc_install_launchd 开始时调用）
 sc_switch_state_reset() {
@@ -55,6 +55,7 @@ sc_switch_state_reset() {
   SC_SWITCH_TARGET_CONTROL=""
   SC_ROLLBACK_DONE=0
   SC_COMMITTED=0
+  SC_PENDING_SIGNAL=""
 }
 
 # 清理候选/备份临时文件并清空记录（幂等；成功路径与回滚完成路径调用；
@@ -713,9 +714,12 @@ sc_switch_failed() {
   else
     echo "回滚不完整：请按上方提示人工恢复" >&2
   fi
+  # 失败出口统一拆除事务 trap（回滚已完成，此后信号恢复默认行为）
+  trap - EXIT HUP INT TERM
 }
 
-# EXIT 兜底：未提交即自动回滚（幂等）；不调用 exit 以保留原退出码
+# EXIT 兜底：未提交即自动回滚（幂等一次）；已提交则不回滚；
+# 不调用 exit 以保留原退出码；正常完成（committed+拆 trap）不触发
 sc_exit_rollback() {
   if [ "${SC_COMMITTED:-0}" != 1 ]; then
     sc_rollback_launchd || true
@@ -723,91 +727,142 @@ sc_exit_rollback() {
   return 0
 }
 
-# 信号兜底：自动回滚（幂等）后以 128+signum 退出（保留非零语义）
+# 信号兜底：未提交时自动回滚（幂等一次）后以 128+signum 退出；
+# 已提交则尊重提交——不回滚、不卸载已发布新 job，仅清理临时备份
 sc_signal_rollback() {
-  sc_rollback_launchd || true
+  if [ "${SC_COMMITTED:-0}" = 1 ]; then
+    sc_discard_candidates
+  else
+    sc_rollback_launchd || true
+  fi
   exit "$1"
 }
 
+# 临界区：mv 与 MOVED/SWITCHED 状态赋值必须对信号原子。
+# 进入：四信号改为仅记录 pending、摘除 EXIT 兜底——mv 返回后调用方
+# 先完成状态赋值，再经 sc_critical_leave 恢复回滚 handler 并处理
+# pending（此时回滚读到的是已更新的状态，不会删唯一备份/留半文件）。
+sc_critical_enter() {
+  SC_PENDING_SIGNAL=""
+  trap 'SC_PENDING_SIGNAL=143' TERM
+  trap 'SC_PENDING_SIGNAL=130' INT
+  trap 'SC_PENDING_SIGNAL=129' HUP
+  trap - EXIT
+}
+
+sc_critical_leave() {
+  trap 'sc_signal_rollback 143' TERM
+  trap 'sc_signal_rollback 130' INT
+  trap 'sc_signal_rollback 129' HUP
+  trap 'sc_exit_rollback' EXIT
+  if [ -n "${SC_PENDING_SIGNAL:-}" ]; then
+    sc_signal_rollback "$SC_PENDING_SIGNAL"
+  fi
+}
+
 # 阶段二 switch：unload 旧 job → 同目录原子切换文件 → load 候选 → 精确确认。
-# 整个事务在子 shell 内执行：EXIT/HUP/INT/TERM trap 仅在子 shell 生效
-# （不破坏调用方 trap），从装 trap 到 commit 为保护窗口——信号/非正常
-# 退出自动触发一次幂等回滚并保留非零退出码；正常完成清除 trap 并标记
-# 提交。unload 失败：正式文件未动，仅清理候选。load/确认失败：完整回滚。
+# 事务在**当前进程**（真实入口 PID，如 surgeconf.sh）内执行：trap 是进程级
+# 的，从装 trap 到 commit 为保护窗口，信号由入口 PID 自身捕获（而非仅其
+# 等待的子 shell）。事务边界契约：本函数接管 EXIT/HUP/INT/TERM 并在所有
+# 出口拆除（恢复默认）——调用方（本仓库入口均无自定义 trap）不受影响，
+# 有自定义 trap 的外部调用方不应直接调用。四个 mv 与「确认+置 committed」
+# 均在临界区内：mv 返回 → 状态赋值 → 恢复 handler → 处理 pending 信号。
+# 提交顺序：确认成功即置 SC_COMMITTED=1（信号尊重提交，不卸载新 job）→
+# 拆事务 trap → 清理备份/候选（此窗口的信号最多留下 0600 临时备份，
+# 不破坏已发布状态）。unload 失败：正式文件未动，仅清理候选。
 sc_switch_launchd() {
   local plist="$1"
-  (
-    trap 'sc_exit_rollback' EXIT
-    trap 'sc_signal_rollback 129' HUP
-    trap 'sc_signal_rollback 130' INT
-    trap 'sc_signal_rollback 143' TERM
+  local control_env
+  control_env="$(sc_control_env_path)"
 
-    local control_env
-    control_env="$(sc_control_env_path)"
+  trap 'sc_exit_rollback' EXIT
+  trap 'sc_signal_rollback 129' HUP
+  trap 'sc_signal_rollback 130' INT
+  trap 'sc_signal_rollback 143' TERM
 
-    if [ "$SC_WAS_LOADED" = 1 ]; then
-      local unload_rc=0
-      launchctl unload "$plist" || unload_rc=$?
-      if [ "$unload_rc" != 0 ]; then
-        sc_discard_candidates
-        exit "$unload_rc"
-      fi
+  if [ "$SC_WAS_LOADED" = 1 ]; then
+    local unload_rc=0
+    launchctl unload "$plist" || unload_rc=$?
+    if [ "$unload_rc" != 0 ]; then
+      sc_discard_candidates
+      trap - EXIT HUP INT TERM
+      return "$unload_rc"
     fi
+  fi
 
-    # 原子切换（同目录 rename）：旧文件先挪入随机名备份，候选就位
-    if [ "$SC_OLD_CONTROL_EXISTED" = 1 ]; then
-      SC_BAK_CONTROL="$(sc_mktemp_private "$(dirname "$control_env")" ".launchd.env.backup")" || {
-        sc_switch_failed
-        exit 1
-      }
-      if mv -f "$control_env" "$SC_BAK_CONTROL"; then
-        SC_CONTROL_MOVED=1
-      else
-        sc_switch_failed
-        exit 1
-      fi
-    fi
-    if mv -f "$SC_CAND_CONTROL" "$control_env"; then
-      SC_CONTROL_SWITCHED=1
-    else
+  # 原子切换（同目录 rename）：旧文件先挪入随机名备份，候选就位；
+  # 每个 mv 与状态赋值在临界区内对信号原子
+  if [ "$SC_OLD_CONTROL_EXISTED" = 1 ]; then
+    SC_BAK_CONTROL="$(sc_mktemp_private "$(dirname "$control_env")" ".launchd.env.backup")" || {
       sc_switch_failed
-      exit 1
+      return 1
+    }
+    sc_critical_enter
+    if mv -f "$control_env" "$SC_BAK_CONTROL"; then
+      SC_CONTROL_MOVED=1
     fi
-    if [ "$SC_OLD_PLIST_EXISTED" = 1 ]; then
-      SC_BAK_PLIST="$(sc_mktemp_private "$(dirname "$plist")" ".com.surgeconf.plist.backup")" || {
-        sc_switch_failed
-        exit 1
-      }
-      if mv -f "$plist" "$SC_BAK_PLIST"; then
-        SC_PLIST_MOVED=1
-      else
-        sc_switch_failed
-        exit 1
-      fi
-    fi
-    if mv -f "$SC_CAND_PLIST" "$plist"; then
-      SC_PLIST_SWITCHED=1
-    else
+    sc_critical_leave
+    if [ "$SC_CONTROL_MOVED" != 1 ]; then
       sc_switch_failed
-      exit 1
+      return 1
     fi
+  fi
+  sc_critical_enter
+  if mv -f "$SC_CAND_CONTROL" "$control_env"; then
+    SC_CONTROL_SWITCHED=1
+  fi
+  sc_critical_leave
+  if [ "$SC_CONTROL_SWITCHED" != 1 ]; then
+    sc_switch_failed
+    return 1
+  fi
+  if [ "$SC_OLD_PLIST_EXISTED" = 1 ]; then
+    SC_BAK_PLIST="$(sc_mktemp_private "$(dirname "$plist")" ".com.surgeconf.plist.backup")" || {
+      sc_switch_failed
+      return 1
+    }
+    sc_critical_enter
+    if mv -f "$plist" "$SC_BAK_PLIST"; then
+      SC_PLIST_MOVED=1
+    fi
+    sc_critical_leave
+    if [ "$SC_PLIST_MOVED" != 1 ]; then
+      sc_switch_failed
+      return 1
+    fi
+  fi
+  sc_critical_enter
+  if mv -f "$SC_CAND_PLIST" "$plist"; then
+    SC_PLIST_SWITCHED=1
+  fi
+  sc_critical_leave
+  if [ "$SC_PLIST_SWITCHED" != 1 ]; then
+    sc_switch_failed
+    return 1
+  fi
 
-    local load_rc=0
-    launchctl load "$plist" || load_rc=$?
-    if [ "$load_rc" = 0 ]; then
-      launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1 || load_rc=1
-    fi
-    if [ "$load_rc" != 0 ]; then
-      echo "launchctl load 后未能确认 $SC_LAUNCHD_LABEL" >&2
-      sc_switch_failed
-      exit 1
-    fi
-    # 提交：清理备份/候选残留，标记提交并拆除 trap（EXIT 兜底不再触发）
-    sc_discard_candidates
+  local load_rc=0
+  launchctl load "$plist" || load_rc=$?
+  if [ "$load_rc" != 0 ]; then
+    echo "launchctl load 失败" >&2
+    sc_switch_failed
+    return 1
+  fi
+  # 确认与置 committed 同在临界区：信号挂起至 committed 赋值后处理
+  sc_critical_enter
+  if launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1; then
     SC_COMMITTED=1
-    trap - EXIT HUP INT TERM
-    exit 0
-  )
+  fi
+  sc_critical_leave
+  if [ "${SC_COMMITTED:-0}" != 1 ]; then
+    echo "launchctl load 后未能确认 $SC_LAUNCHD_LABEL" >&2
+    sc_switch_failed
+    return 1
+  fi
+  # 提交：拆事务 trap（此后信号为默认行为），再清理备份/候选残留
+  trap - EXIT HUP INT TERM
+  sc_discard_candidates
+  return 0
 }
 
 # 唯一 install/regenerate 流程：enable/start/restart 共用，事务性两阶段。
