@@ -153,7 +153,7 @@ async def lifespan(app: FastAPI):
 
             # 数据维护：清理孤儿节点（修复旧版本删除订阅时未级联删除节点导致的残留）
             from app.services.subscription import cleanup_orphan_nodes
-            async with database.session_factory() as db:
+            async with database.session() as db:
                 removed = await cleanup_orphan_nodes(db)
             log_event("orphan_cleanup", counts={"removed": removed})
             if removed:

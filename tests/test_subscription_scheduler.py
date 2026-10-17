@@ -83,15 +83,15 @@ class _TrackingSessionContext:
 
 
 class _TrackingDatabase:
-    """duck-typed DatabaseRuntime：会话工厂带计数"""
+    """duck-typed DatabaseRuntime：session() 受控入口带计数"""
 
     def __init__(self, inner):
         self._inner = inner
         self.tracking = _TrackingSessionFactory(inner.session_factory)
 
-    @property
-    def session_factory(self):
-        return self.tracking
+    def session(self):
+        return _TrackingSessionContext(self._inner.session_factory(),
+                                       self.tracking)
 
 
 @pytest_asyncio.fixture
@@ -835,20 +835,14 @@ class _GatedSessionContext:
 
 
 class _GatedDatabase:
-    """duck-typed DatabaseRuntime：session_factory 产出的 session 过闸门"""
+    """duck-typed DatabaseRuntime：session() 产出的会话过闸门"""
 
     def __init__(self, inner, gate):
         self._inner = inner
         self.gate = gate
 
-    @property
-    def session_factory(self):
-        inner, gate = self._inner.session_factory, self.gate
-
-        def factory():
-            return _GatedSessionContext(inner(), gate)
-
-        return factory
+    def session(self):
+        return _GatedSessionContext(self._inner.session_factory(), self.gate)
 
 
 @pytest.mark.asyncio

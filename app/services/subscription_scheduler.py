@@ -114,9 +114,10 @@ class SubscriptionScheduler:
         返回实际执行的同步结果列表。
         """
         now_naive = _utc_naive(now if now is not None else self._clock())
-        session_factory = self._database.session_factory
 
-        async with session_factory() as db:
+        # 受控会话入口：维护（恢复/重置）期间新会话阻塞到重绑，
+        # 在途会话被维护屏障等待（不暴力中断成功同步）
+        async with self._database.session() as db:
             due = list((await db.execute(
                 select(Subscription.id, Subscription.next_update_at)
                 .where(Subscription.enabled == True,  # noqa: E712
@@ -131,7 +132,7 @@ class SubscriptionScheduler:
         results: list[SyncResult] = []
         for sub_id, expected_next in due:
             try:
-                async with session_factory() as db:
+                async with self._database.session() as db:
                     result = await sync_subscription(db, sub_id, now=now_naive,
                                                      scheduled_next=expected_next)
             except asyncio.CancelledError:

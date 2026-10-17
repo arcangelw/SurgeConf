@@ -188,3 +188,116 @@ authority 不复用已关闭实例；成功 / 请求异常 / 栈内 CancelledErr
 
 **验证**：SSRF 专项 **83 passed**；订阅/调度/安全扫描相关 **160
 passed**；全量 pytest **1145 passed**。
+
+## Slice 3 — 数据库维护生命周期串行化与 WAL 状态保全
+
+Commit: `fix: serialize database maintenance and preserve WAL state`
+
+### 1. 问题（原 finding，三条独立复现）
+
+**A. reset 回导旧仓库库。** `reset_database()` 先删除 live 全家文件再调
+`prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")`：live
+不存在且旧仓库库存在时命中其"路径 2 legacy 自动发现"，把**本应保留
+原样的旧仓库库重新导入 live**——重置后 live 不是 fresh 默认数据，
+而是旧库内容（且经备份/迁移链放大为用户可见的数据回滚）。
+
+**B. 发布链先删 live WAL、后做可能失败的 staging 校验。**
+`rebuild_from_source()` 顺序为 `upgrade_staging → _remove_live_sidecars
+(live) → verify_and_publish(staging, live)`：integrity 检查、权限收敛、
+`os.replace` 全部发生在**已删除 live -wal/-shm 之后**。WAL 引入后，
+最近已提交事务可能仅存在于 -wal（尚未 checkpoint 并入 main）——
+任一校验/替换失败即产生「旧 main + 已删未 checkpoint WAL」，**已提交
+数据静默丢失**；同时旧实现声称的"live 字节不变"原子性在删除
+sidecar 那一刻已不成立。
+
+**C. dispose 不关 checkout 连接且维护零互斥。** `engine.dispose()` 只
+关闭池内空闲连接，checkout 中的连接保持打开：恢复/重置期间在途
+API/调度会话可继续写旧文件；且 restore/reset 之间、维护与请求之间
+没有任何互斥。实测（见 §3）**旧连接在 `os.replace` 后提交并非写入
+黑洞**：SQLite 按路径重建 -wal，提交页直接**污染替换后的新库**；
+维护期间新请求还会撞上 `session_factory=None` 抛 500。
+
+### 2. 方案
+
+**维护屏障（`app/database.py`）**：`DatabaseRuntime` 新增同一事件循环
+内的会话/维护互斥原语——
+- `session()` 受控会话入口：原子登记在途计数（`_state_lock` 保护
+  检查+计数），维护期阻塞在 `_sessions_allowed`；未绑定 runtime 抛
+  静态 RuntimeError（而非 AttributeError）。
+- `maintenance()` 维护屏障：`_maintenance_lock` 排他（restore/reset
+  互斥）→ 置维护标志并阻止新会话 → 等待 `_drained`（在途会话归零，
+  **不暴力中断成功同步**）→ 维护区；退出（含异常/取消）finally 可靠
+  放行。维护区内只允许 dispose/bind 与 staging 私有 runtime。
+- 全局 runtime 的生产会话**全部切换到受控入口**：`get_db`（FastAPI
+  依赖）、`security.load_access_settings`、`bootstrap` 孤儿清理、
+  `SubscriptionScheduler.run_due_once`（选择与逐项会话）；staging
+  专用 runtime（`DatabaseRuntime.create`）保留工厂直用。静态守卫测试
+  禁止生产模块再出现 `.session_factory` 直连（豁免 staging）。
+
+**restore/reset 全程屏障化（`app/services/backups.py`）**：整个
+「安全备份 → dispose → staging 重建 → publish → bind/失败恢复」在
+`database.maintenance()` 内：在途受控会话先归零再动文件；新会话
+（API/调度）阻塞到重绑完成——既看不到 `session_factory=None`，也不
+写旧 inode。`reset_database` 改为**显式 fresh 入口**
+`rebuild_from_source(None, paths)`：绝不走 `prepare_database` 的 legacy
+自动发现（行为哨兵测试锁死），不预删 live（原子替换由发布链完成），
+旧仓库库文件字节不动，reset 后 live 仅含 fresh 种子数据。
+
+**发布链重排（`app/services/database_migration.py`）**：拆出
+`verify_staging`（integrity + 伴生收敛 + 0600，**全部可能失败的
+staging 侧准备**）与 `_prepare_live_for_replacement`（live 侧唯一
+动作：`PRAGMA wal_checkpoint(TRUNCATE)` 把已提交 WAL 页安全并入
+main 后才删 sidecar）；`verify_and_publish = verify_staging →
+prepare_live → os.replace`。失败矩阵：
+- integrity/权限失败：staging 侧抛错，live 一个字节不动；
+- checkpoint 失败（TRUNCATE 返回 busy——并发 reader 持 WAL 快照）：
+  fail closed 抛错且**不删 sidecar**，live 保持「main + 可恢复 WAL」；
+- checkpoint 成功后 sidecar 删除/replace 失败：WAL 已并入 main，live
+  逻辑完整（字节因合法 checkpoint 变化，**已提交数据不丢**）；
+- 绝不出现「旧 main + 已删未 checkpoint WAL」。
+同时修正模块内两处"live 字节不变"的过强措辞为"live 保持逻辑完整
+（checkpoint 后字节可能合法变化）"。
+
+### 3. 技术依据（实验/行为核实，非猜测）
+
+- **TRUNCATE checkpoint 语义**：`PRAGMA wal_checkpoint(TRUNCATE)` 返回
+  `(busy, log, checkpointed)`；busy=1 表示存在并发 reader 阻止完成。
+  旧实现不检查返回值——busy 时照样删 -wal。新实现 busy 即拒绝清理。
+- **旧连接 replace 后提交 = 污染新库（实验复现）**：连接 c1 打开
+  WAL 库并提交 → `os.replace` 换掉主文件 → c1 再提交 → 新连接读取
+  路径库：c1 的**全部新旧写入均出现**。机制：SQLite 主库经 fd（旧
+  inode）访问，但 -wal 按路径重建，提交页写入路径侧 WAL 并被后续
+  读者应用。这把 C 从"写黑洞丢数据"升级为"静默污染新库"，证明
+  生产会话必须全部走受控入口（gate 保证 replace 时刻在途受控会话
+  已归零且连接已 dispose）。
+- **SQLAlchemy dispose 语义**：`AsyncEngine.dispose()` 归还池并关闭
+  空闲连接；checkout 中的连接不阻塞 dispose，归还时被丢弃——旧
+  实现的 dispose 不能作为"无并发连接"的证据，必须由屏障等待归零。
+
+### 4. 验证证据
+
+测试文件：`tests/test_database_maintenance.py`（15 个用例，全部 tmp
+sqlite，零真实运行库）：
+
+- **RED（实现前）**：9 failed / 5 passed——legacy 回导（prepare 哨兵
+  捕获自动发现调用）、[checkpoint]/[replace] 注入下 WAL 已提交记录
+  丢失（`wal_only` 计数 0）、在途会话被越过（reset 先于会话结束完成）、
+  维护期新会话不阻塞、restore/reset 不互斥、get_db 撞 `NoneType`
+  500；[integrity]/[permission] 因新注入点不存在而 error。
+- **GREEN（实现后）**：维护专项 **15 passed**；数据库/备份/迁移/调度
+  专项（backups + database_migration + subscription_scheduler +
+  migrations）**157 passed**；全量 pytest **1160 passed**。
+- 覆盖矩阵：legacy 存在时 reset 不回导且旧库字节不变；reset 时序
+  dispose →（pre_reset 备份发布）→ live 原子替换 → 重绑；仅 WAL 已
+  提交记录（前置证明 main 副本无该记录）在 integrity/权限/checkpoint/
+  sidecar/replace 五类故障注入后仍可查且 `integrity_check=ok`；持有
+  在途受控会话时 reset 不越过（live inode 不变）、释放后完成并读到
+  fresh 库；维护期新会话/下一轮调度阻塞到重绑后读新库；在途调度式
+  会话（`run_due_once` 真实同步链路）同理；restore 与 reset 互斥且
+  等待方零文件副作用；维护失败/取消后屏障放行、新会话立即可用；
+  replace 时刻不存在受控在途会话（inode 级断言）；静态守卫禁止生产
+  代码绕过受控入口；维护期 `get_db` 阻塞而非 500、重绑后正常取得
+  会话。
+- 既有行为保留：备份保留策略（最近 10 份 + protected）、备份
+  integrity/0600/原子发布、no-follow 打开、Alembic stamp/upgrade
+  语义、启动三路径与失败回滚全部原样通过（141 → 157 项专项无回归）。

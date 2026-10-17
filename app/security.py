@@ -282,7 +282,7 @@ async def load_access_settings() -> AccessSettings:
     from app.models import SystemConfig
 
     keys = ("installation_role", "admin_access", "admin_password_hash")
-    async with database.session_factory() as db:
+    async with database.session() as db:
         result = await db.execute(select(SystemConfig).where(SystemConfig.key.in_(keys)))
         values = {row.key: (row.value or "") for row in result.scalars().all()}
 

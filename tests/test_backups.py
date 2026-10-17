@@ -182,8 +182,11 @@ async def test_reset_database_rebuilds_and_prunes_backup_history(runtime_db, run
 
 
 @pytest.mark.asyncio
-async def test_reset_disposes_before_deleting_and_rebinds_runtime(
+async def test_reset_disposes_before_replacement_and_rebinds_runtime(
         runtime_db, runtime_paths, monkeypatch):
+    """reset 时序：dispose（引擎关闭）必须先于 live 原子替换；reset
+    不预删 live 文件（发布链 checkpoint + os.replace 完成替换），
+    结束后 runtime 重绑同一 live 路径且旧数据清空。"""
     from app.services import database_migration
 
     order = []
@@ -191,32 +194,37 @@ async def test_reset_disposes_before_deleting_and_rebinds_runtime(
 
     async def traced_dispose():
         order.append("dispose")
-        assert runtime_paths.database.exists(), "dispose 必须发生在任何数据库文件删除之前"
+        assert runtime_paths.database.exists(), \
+            "dispose 时 live 仍须存在（替换由发布链完成，不预删）"
         await original_dispose()
 
     monkeypatch.setattr(runtime_db, "dispose", traced_dispose)
-    original_prepare = database_migration.prepare_database
+    original_replace = database_migration.os.replace
 
-    async def traced_prepare(p, legacy):
-        order.append("prepare")
-        assert not runtime_paths.database.exists(), "prepare 前旧库文件必须已被删除"
-        return await original_prepare(p, legacy)
+    def traced_replace(src, dst):
+        order.append("replace")
+        assert "dispose" in order, "live 替换必须发生在引擎 dispose 之后"
+        return original_replace(src, dst)
 
-    monkeypatch.setattr("app.services.database_migration.prepare_database", traced_prepare)
+    monkeypatch.setattr(database_migration.os, "replace", traced_replace)
 
     await backups.reset_database()
 
-    assert order == ["dispose", "prepare"]
+    # dispose 最先；随后的 replace 依次为 pre_reset 备份发布与 live 替换
+    assert order[0] == "dispose"
+    assert order[-1] == "replace", "live 原子替换必须是最后一步"
+    assert set(order) == {"dispose", "replace"}
     assert runtime_db.path == runtime_paths.database
     assert await _system_config(runtime_db, "marker") is None
 
 
 @pytest.mark.asyncio
 async def test_reset_failure_restores_previous_live_database(runtime_db, runtime_paths, monkeypatch):
-    async def broken_prepare(p, legacy):
+    async def broken_rebuild(source, paths):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("app.services.database_migration.prepare_database", broken_prepare)
+    monkeypatch.setattr(
+        "app.services.database_migration.rebuild_from_source", broken_rebuild)
     with pytest.raises(RuntimeError, match="boom"):
         await backups.reset_database()
 
@@ -225,7 +233,6 @@ async def test_reset_failure_restores_previous_live_database(runtime_db, runtime
 
 
 # ===== 管理端点：confirm 门禁、白名单下载、响应不含绝对路径 =====
-
 
 # ===== Round 4：严格 EXCL 预占、reserved 交付复核、fd 流式下载 =====
 

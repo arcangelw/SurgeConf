@@ -627,10 +627,18 @@ def discard_staging(staging: Path) -> None:
 
 def _checkpoint_and_remove_sidecars(database_path: Path) -> None:
     assert_sqlite_database_safe(database_path)
-    """关闭引擎后 checkpoint WAL 并删除 -wal/-shm，确保单文件原子替换"""
+    """关闭引擎后 checkpoint WAL 并删除 -wal/-shm，确保单文件原子替换。
+
+    TRUNCATE 必须完整完成：返回 busy（并发 reader 持 WAL 快照）时
+    fail closed 抛错且不删 sidecar——live 保持「main + 可恢复 WAL」
+    的逻辑完整状态，绝不允许「未 checkpoint 就删 WAL」。
+    """
     conn = sqlite3.connect(database_path)
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            raise RuntimeError(
+                "WAL checkpoint 未完成（存在并发读取），拒绝清理 sidecar")
         conn.commit()
     finally:
         conn.close()
@@ -640,7 +648,9 @@ def _checkpoint_and_remove_sidecars(database_path: Path) -> None:
             sidecar.unlink()
 
 
-def verify_and_publish(staging: Path, target: Path) -> None:
+def verify_staging(staging: Path) -> None:
+    """staging 侧全部可能失败的准备：integrity 校验、伴生文件收敛、
+    权限 0600。完成前绝不触碰 live。"""
     assert_sqlite_database_safe(staging)
     # 读写连接：ro URI 打开 WAL 库会重建 -shm/-wal 伴生文件，无法保证单文件替换
     conn = sqlite3.connect(staging)
@@ -655,6 +665,29 @@ def verify_and_publish(staging: Path, target: Path) -> None:
         if sidecar.exists():
             sidecar.unlink()
     harden_private_file(staging)
+
+
+def _prepare_live_for_replacement(live: Path) -> None:
+    """无连接维护边界内处理旧 live：WAL 已提交页安全并入 main 后才
+    清理 sidecars，供原子替换。
+
+    - checkpoint 失败（busy/IO）：抛错且不动任何 sidecar，live 保持
+      「main + 可恢复 WAL」逻辑完整；
+    - checkpoint 成功后 sidecar 删除/replace 失败：WAL 已并入 main，
+      live 逻辑完整（字节因合法 checkpoint 变化），异常向上传播；
+    - live 缺失：清理可能残留的孤儿 sidecar（残留会污染新库）。
+    """
+    if live.exists():
+        _checkpoint_and_remove_sidecars(live)
+    else:
+        _remove_live_sidecars(live)
+
+
+def verify_and_publish(staging: Path, target: Path) -> None:
+    """安全发布：staging 全部可能失败的准备（verify_staging）先完成，
+    live 只在 WAL 安全并入 main 后才被动，最后原子替换。"""
+    verify_staging(staging)
+    _prepare_live_for_replacement(target)
     os.replace(staging, target)
 
 
@@ -705,8 +738,13 @@ def _remove_live_sidecars(live: Path) -> None:
 async def rebuild_from_source(source: Path | None, paths: RuntimePaths) -> tuple:
     """从源库（None 为全新）经 staging 完成 Alembic/种子/业务迁移后原子替换 live。
 
-    prepare_database 与备份恢复/重置共用此链；失败丢弃 staging，
-    live 字节不变（原子性不变量）。
+    prepare_database 与备份恢复/重置共用此链。发布顺序保证任何失败
+    （staging 升级/integrity/权限/checkpoint/sidecar/replace）都让
+    live 保持逻辑完整：staging 侧全部可能失败的准备（verify_staging）
+    先完成，live 只在「WAL 已提交页安全并入 main」之后才被动——
+    绝不出现「旧 main + 已删未 checkpoint WAL」；checkpoint 之后 live
+    字节可能因合法 checkpoint 变化，但已提交数据不丢。失败丢弃
+    staging。要求调用方处于无连接维护边界（live 已 dispose）。
     """
     live = paths.database
     staging = staging_path(paths)
@@ -718,7 +756,6 @@ async def rebuild_from_source(source: Path | None, paths: RuntimePaths) -> tuple
         if source is not None:
             sqlite_backup(source, staging, reserved=True)
         applied = await upgrade_staging(staging)
-        _remove_live_sidecars(live)
         verify_and_publish(staging, live)
     except BaseException:
         discard_staging(staging)
@@ -750,7 +787,8 @@ async def prepare_database(paths: RuntimePaths, legacy_path: Path) -> MigrationR
         data_pending = pending_data_migration_keys(live)
         if not schema_pending and not data_pending:
             return MigrationResult("live", (), None)
-        # 存在待执行项：时间戳备份 + staging 上完成后原子替换；失败删除 staging，live 字节不变
+        # 存在待执行项：时间戳备份 + staging 上完成后原子替换；失败删除
+        # staging，live 保持逻辑完整（checkpoint 后字节可能合法变化）
         backup = backup_database(live, paths, current or "pre_alembic")
         applied = await rebuild_from_source(live, paths)
         return MigrationResult("live", applied, backup)

@@ -224,8 +224,11 @@ async def restore_backup(name: str) -> None:
     """以选中备份替换 live：先强制备份当前数据，staging 完成全部
     Alembic/业务迁移/integrity 后原子替换并重绑。
 
-    名字不在 ``BackupInfo.name`` 白名单内直接拒绝；任何失败都
-    重新绑定原 live 库（缺失时从 pre_restore 备份还原）并抛错。
+    整个「安全备份 → dispose → staging → publish → bind/失败恢复」
+    在维护屏障内执行：与 API 请求、自动同步及其他维护互斥；在途
+    受控会话先归零，新会话阻塞到重绑完成。名字不在 ``BackupInfo.name``
+    白名单内直接拒绝；任何失败都重新绑定原 live 库（缺失时从
+    pre_restore 备份还原）并抛错。
     """
     from app.database import database
     from app.services.database_migration import (discard_staging,
@@ -238,46 +241,47 @@ async def restore_backup(name: str) -> None:
     if selected is None:
         raise LookupError(f"备份不存在: {name}")
 
-    # pre_restore 发布触发 prune：保护点名备份，否则满额时最旧的
-    # selected 恰好会被删除，恢复随即失败且点名备份永久丢失
-    safety = backup_database(paths.database, paths, "pre_restore",
-                             protected={selected.name})
-    staging = staging_path(paths)
-    try:
-        # 必须先 await dispose：同步 dispose 无法可靠关闭 aiosqlite 线程连接
-        await database.dispose()
-        await rebuild_from_source(selected.path, paths)
-    except BaseException:
-        discard_staging(staging)
-        _rebind_and_restore_live(paths, safety)
-        raise
-    database.bind(paths.database)
+    async with database.maintenance():
+        # pre_restore 发布触发 prune：保护点名备份，否则满额时最旧的
+        # selected 恰好会被删除，恢复随即失败且点名备份永久丢失
+        safety = backup_database(paths.database, paths, "pre_restore",
+                                 protected={selected.name})
+        staging = staging_path(paths)
+        try:
+            # 必须先 await dispose：同步 dispose 无法可靠关闭 aiosqlite 线程连接
+            await database.dispose()
+            await rebuild_from_source(selected.path, paths)
+        except BaseException:
+            discard_staging(staging)
+            _rebind_and_restore_live(paths, safety)
+            raise
+        database.bind(paths.database)
 
 
 async def reset_database() -> None:
-    """重置：dispose → 强制备份（纳入保留策略）→ 删除 live → Alembic
-    在 staging 全新构建后原子发布 → 重绑。
+    """重置：维护屏障内 dispose → 强制备份（纳入保留策略）→ 全新
+    staging 构建（显式 fresh 入口，绝不走 legacy 自动发现，也不先删
+    live——原子替换由发布链完成）→ 重绑。
 
-    任何失败都先从备份副本还原 live 并重新绑定，再向上传播异常，
-    避免运行时停留在"引擎存活但文件已删"或未绑定状态。
+    保留的旧仓库库文件保持原样不动；reset 后 live 只含 fresh 默认
+    数据。任何失败都先从备份副本还原 live 并重新绑定，再向上传播
+    异常，避免运行时停留在"引擎存活但文件已删"或未绑定状态。
     """
     from app.database import database
-    from app.services.database_migration import PROJECT_ROOT, prepare_database
+    from app.services.database_migration import rebuild_from_source
 
     paths = resolve_runtime_paths()
     refresh_runtime_permissions(paths)
-    safety: Path | None = None
-    try:
-        await database.dispose()
-        if paths.database.exists():
-            safety = backup_database(paths.database, paths, "pre_reset")
-        # WAL 引入后需连同伴生文件一并删除，否则残留 -wal/-shm 会污染重建的新库
-        for suffix in ("", "-wal", "-shm"):
-            candidate = paths.database.with_name(paths.database.name + suffix)
-            if candidate.exists():
-                candidate.unlink()
-        await prepare_database(paths, PROJECT_ROOT / "data" / "surge_conf.db")
-    except BaseException:
-        _rebind_and_restore_live(paths, safety)
-        raise
-    database.bind(paths.database)
+    async with database.maintenance():
+        safety: Path | None = None
+        try:
+            await database.dispose()
+            if paths.database.exists():
+                safety = backup_database(paths.database, paths, "pre_reset")
+            # source=None：全新构建；绝不引用旧仓库库（prepare_database
+            # 的 legacy 自动发现会把保留的旧库重新导入，破坏 reset 语义）
+            await rebuild_from_source(None, paths)
+        except BaseException:
+            _rebind_and_restore_live(paths, safety)
+            raise
+        database.bind(paths.database)
