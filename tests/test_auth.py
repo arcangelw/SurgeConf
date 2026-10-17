@@ -654,3 +654,87 @@ async def test_local_only_static_public_but_auth_hidden(client_from_lan):
     assert (await client_from_lan.get("/login")).status_code == 403
     assert (await client_from_lan.get("/api/auth/session")).status_code == 403
     assert (await client_from_lan.get("/api/auth/login")).status_code == 403
+
+
+# ===== readiness 公开端点（launchd 切换提交门，Slice 4 Fix Round 5） =====
+
+
+@pytest.mark.asyncio
+async def test_readiness_local_only_loopback_204_empty_body(client_loopback,
+                                                            auth_app):
+    """local_only 回环、无任何 cookie：lifespan 完整成功后 204，
+    body 为空（不泄露版本/配置/任何管理数据）；
+    lifespan 成功完成即置位就绪标志"""
+    assert auth_app.state.service_ready is True
+    resp = await client_loopback.get("/api/health/ready")
+    assert resp.status_code == 204
+    assert resp.content == b""
+
+
+@pytest.mark.asyncio
+async def test_readiness_local_only_non_loopback_still_forbidden(client_from_lan):
+    """local_only 非回环：readiness 端点与其他 API 一样 403 拒绝"""
+    resp = await client_from_lan.get("/api/health/ready")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_readiness_lan_mode_no_cookie_or_csrf(auth_app, client_loopback):
+    """lan_authenticated：无 cookie/CSRF 的 GET 即 204——launchd 本机
+    curl 探测的前提；同时其他 API 路径不因此放开（仍 401）"""
+    await _switch_to_lan(client_loopback)
+    fresh = AsyncClient(transport=ASGITransport(app=auth_app,
+                                                client=("192.0.2.30", 4444)),
+                        base_url="http://192.0.2.30")
+    async with fresh:
+        assert (await fresh.get("/api/health/ready")).status_code == 204
+        assert (await fresh.get("/api/health/ready")).content == b""
+        assert (await fresh.get("/api/nodes")).status_code == 401
+        assert (await fresh.get("/api/subscriptions")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_readiness_endpoint_gates_on_lifespan_flag():
+    """端点以 app.state 就绪标志为唯一门：标志缺失/False 一律 503，
+    True 才 204——启动失败/未完成/清理期绝不宣告 ready"""
+    from app.routers import health
+
+    class _State:
+        pass
+
+    class _App:
+        def __init__(self):
+            self.state = _State()
+
+    class _Request:
+        def __init__(self, app):
+            self.app = app
+
+    req = _Request(_App())                      # 未设置标志（lifespan 未完成）
+    assert (await health.health_ready(req)).status_code == 503
+
+    gated = _App()
+    gated.state.service_ready = False           # 显式 False（清理期）
+    assert (await health.health_ready(_Request(gated))).status_code == 503
+
+    ready = _App()
+    ready.state.service_ready = True            # lifespan yield 前置位
+    resp = await health.health_ready(_Request(ready))
+    assert resp.status_code == 204
+    assert resp.body == b""
+
+
+@pytest.mark.asyncio
+async def test_readiness_before_lifespan_completion_is_not_ready(tmp_path,
+                                                                 monkeypatch):
+    """未完成 lifespan（启动失败/尚未启动）的进程不得宣告 ready：
+    fail closed 非 2xx，绝不 204"""
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    from app.main import app as fastapi_app
+    transport = ASGITransport(app=fastapi_app, client=("127.0.0.1", 51234))
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
+        resp = await c.get("/api/health/ready")
+    assert resp.status_code != 204
+    assert 500 <= resp.status_code < 600 or resp.status_code == 404
+    if resp.status_code == 204:
+        pytest.fail("lifespan 未完成时 readiness 不得为 204")

@@ -37,7 +37,11 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 # 公开路径：静态资源、登录页/登录端点与未认证 session 探测；
 # logout 不公开（需有效会话 + CSRF）。它们不读取任何管理数据。
-PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/session"}
+# /api/health/ready 是 launchd 提交门的 readiness 探测（仅回环本机
+# curl 使用，GET 安全方法、只泄露 ready 布尔、无版本/配置）；
+# local_only 下非回环仍在下方分支被 403 拒绝。
+PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/session",
+                "/api/health/ready"}
 
 # ===== 逐档案只读订阅 Token =====
 

@@ -36,6 +36,32 @@ Label/数据目录/端口，第二个 `enable` 会覆盖第一个的 plist）。
 ./surgeconf.sh run      # 前台运行（读取控制文件配置）
 ```
 
+### 切换提交语义（readiness 提交门）
+
+`start/restart/enable` 的 launchd 切换不以 `launchctl list` 的 loaded
+判定提交——loaded 只代表 job 已注册，第一列 `-` 代表进程未运行。
+候选 job 加载后进入有界确认轮询：先等 `launchctl list com.surgeconf`
+首列出现**数字 PID**，再以
+`curl --fail --silent --show-error --noproxy '*'` 直连本机候选实例的
+`/api/health/ready`（204、无 body、无版本/配置；仅在应用 lifespan
+完整成功后可响应；`lan_authenticated` 下无需 cookie/CSRF，
+`local_only` 非回环仍 403）。两者都通过才提交并提示成功；PID 或
+readiness 超时、进程退出（数字 PID 后回到 `-`）一律走既有幂等回滚
+（恢复旧 control/plist 字节并重新加载旧 job）。数据目录指向网络卷、
+WAL 未生效、首次迁移失败等应用层启动故障因此自动触发回滚，不再
+出现「报告成功但服务未运行」。
+
+- 总时限默认 60s（`SC_READINESS_TIMEOUT`，覆盖首次数据库迁移可
+  完成）；轮询间隔 1s（`SC_READINESS_INTERVAL`）、单次 curl 超时
+  2s（`SC_READINESS_CURL_MAX`）。绑定 `0.0.0.0`/`127` 归一探测
+  `127.0.0.1`，`::` 探测 `[::1]`，其他 IPv6 字面量加括号，特定
+  LAN 地址原样直连。
+- 端口越界（0 或 >65535）在 unload 之前直接拒绝，绝不因已知必
+  失败的配置停服。
+- 以上为**代码层自动确认**（fake launchd/curl 全覆盖测试，含信号
+  临界区四窗口回归）；真实 launchd 上的切换 smoke 尚需在物理 Mac
+  上人工执行 `./surgeconf.sh restart` 验证（未观察项）。
+
 ## 2. 数据、备份、导出与日志
 
 | 内容 | 默认路径 | 权限 |

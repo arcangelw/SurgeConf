@@ -103,8 +103,9 @@ RULE_CATEGORIES = (
 RULE_EXEMPTIONS: dict[tuple[str, int], str] = {
     # 合成 MITM 夹具：ca-p12 = <合成 base64>（规则 3）
     ("tests/fixtures/synthetic_profile.conf", 3): "6d0b5eeddc4c7670f03b486dd24836e33b155d17c8ea1e4d5952510cb4cfb103",
-    # launchd 行为测试：合成凭据赋值断言行（规则 4）
-    ("tests/test_launchd_scripts.py", 4): "901bccc14ba2f5d8db77e9ec7fd8f68aa3963654784dfa9f21de30082f7685a9",
+    # launchd 行为测试：合成凭据赋值断言行（规则 4）；Round 5 变更
+    # （fake curl/readiness 提交门用例）复审无新增真实凭据赋值
+    ("tests/test_launchd_scripts.py", 4): "8746d209c213cae9a30e595afa62470ec1580a40301d70ea7522511e6b23e01f",
 }
 
 

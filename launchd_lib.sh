@@ -37,6 +37,7 @@ SC_SWITCH_TARGET_PLIST=""
 SC_ROLLBACK_DONE=0
 SC_COMMITTED=0
 SC_PENDING_SIGNAL=""
+SC_LIST_PROBE=""
 
 # 复位事务状态（每次 sc_install_launchd 开始时调用）
 sc_switch_state_reset() {
@@ -56,6 +57,7 @@ sc_switch_state_reset() {
   SC_ROLLBACK_DONE=0
   SC_COMMITTED=0
   SC_PENDING_SIGNAL=""
+  SC_LIST_PROBE=""
 }
 
 # 清理候选/备份临时文件并清空记录（幂等；成功路径与回滚完成路径调用；
@@ -65,6 +67,7 @@ sc_discard_candidates() {
   if [ -n "$SC_CAND_PLIST" ]; then rm -f "$SC_CAND_PLIST" || true; SC_CAND_PLIST=""; fi
   if [ -n "$SC_BAK_CONTROL" ]; then rm -f "$SC_BAK_CONTROL" || true; SC_BAK_CONTROL=""; fi
   if [ -n "$SC_BAK_PLIST" ]; then rm -f "$SC_BAK_PLIST" || true; SC_BAK_PLIST=""; fi
+  if [ -n "$SC_LIST_PROBE" ]; then rm -f "$SC_LIST_PROBE" || true; SC_LIST_PROBE=""; fi
   return 0
 }
 
@@ -575,10 +578,15 @@ sc_prepare_launchd() {
   : "${port:=61830}"
   : "${data_dir:=$(sc_control_dir)}"
 
-  # 端口预检：非法值（如 SURGE_PORT=abc）在生成任何候选、停机之前失败
+  # 端口预检：非法值（非数字或越界 0/65536+）在生成任何候选、停机
+  # 之前失败——已知必失败的配置绝不触发 unload 停服
   case "$port" in
     ''|*[!0-9]*) echo "端口必须为数字: $port" >&2; return 1 ;;
   esac
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo "端口必须在 1..65535 范围内: $port" >&2
+    return 1
+  fi
 
   # 候选路径：目标目录内 mktemp 独占随机名（0600），与正式切换同文件系统
   local control_dir plist_dir
@@ -588,6 +596,8 @@ sc_prepare_launchd() {
   sc_ensure_directory "$plist_dir" || return $?
   SC_CAND_CONTROL="$(sc_mktemp_private "$control_dir" ".launchd.env.candidate")" || return $?
   SC_CAND_PLIST="$(sc_mktemp_private "$plist_dir" ".com.surgeconf.plist.candidate")" || return $?
+  # PID 探测文件（switch 确认轮询用；信号安全：直接重定向而非命令替换）
+  SC_LIST_PROBE="$(sc_mktemp_private "$control_dir" ".sc-list.probe")" || return $?
 
   # 候选 control：所有值控制字符校验在写盘前（sc_write_launchd_env 内置）
   sc_write_launchd_env "$SC_CAND_CONTROL" || return $?
@@ -760,6 +770,101 @@ sc_critical_leave() {
   fi
 }
 
+# 单次精确 label 查询：结果重定向到探测文件后以 read 解析，设置
+# SC_LIST_PID 为首个 tab 字段（数字 PID 或 "-" 等），返回码表达加载
+# 状态。绝不用命令替换捕获 launchctl 输出——bash 命令替换执行期间
+# 收到信号会污染退出码（128+signum）且 trap 赋值丢失（在替换子
+# 上下文执行），信号保护语义会被破坏；直接重定向则 trap 在当前
+# shell 正确执行、等待恢复后拿到子进程真实退出码。
+sc_list_first_field() {
+  local file="$1" line=""
+  SC_LIST_PID=""
+  [ -n "$file" ] || return 2
+  : > "$file" 2>/dev/null || return 2
+  if ! launchctl list "$SC_LAUNCHD_LABEL" > "$file" 2>/dev/null; then
+    return 3
+  fi
+  IFS= read -r line < "$file" || true
+  SC_LIST_PID="${line%%$'\t'*}"
+  return 0
+}
+
+# readiness 探测 host 归一：绑定地址转为本机可连接地址。
+# 127/127.0.0.1/0.0.0.0（及空）→ 127.0.0.1；:: → [::1]；其他 IPv6
+# 字面量加方括号（curl URL 语法要求）；特定 LAN 地址原样直连。
+sc_readiness_host() {
+  case "$1" in
+    ""|"127"|"127.0.0.1"|"0.0.0.0") printf '127.0.0.1' ;;
+    "::") printf '[::1]' ;;
+    *:*) printf '[%s]' "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# 候选 job 确认轮询（有界，提交门）：
+#   1. `launchctl list <label>` 精确查询 exit 非 0 → job 已不在加载
+#      状态 → 立即失败；
+#   2. 首个 tab 字段非数字（"-" 或空）→ 进程未运行：曾出现数字 PID
+#      又回到非数字视同进程退出立即失败，否则继续等待（首次迁移/
+#      冷启动场景 PID 会延迟出现）；
+#   3. 数字 PID 时 curl 直连候选 readiness 端点：--fail（非 2xx 即
+#      失败）、--noproxy '*'（绝不经任何代理/env 代理配置）、
+#      --max-time 单次短超时；URL 只含归一 host 与端口，无凭据；
+#   4. 总时限（SC_READINESS_TIMEOUT，默认 60s——覆盖首次数据库迁移
+#      可完成；测试可注入缩短）内未收敛即失败。
+# loaded 不等于可服务：应用因数据目录网络卷/WAL/迁移/绑定失败而
+# 反复退出时，本函数超时/退出返回非 0，由调用方走既有幂等回滚。
+sc_wait_candidate_ready() {
+  local host="$1" port="$2"
+  local url_host total interval curl_max deadline pid now saw_pid=0
+  url_host="$(sc_readiness_host "$host")"
+  total="${SC_READINESS_TIMEOUT:-60}"
+  interval="${SC_READINESS_INTERVAL:-1}"
+  curl_max="${SC_READINESS_CURL_MAX:-2}"
+  deadline=$(( $(date +%s) + total ))
+  while :; do
+    if ! sc_list_first_field "$SC_LIST_PROBE"; then
+      echo "候选 job 已不再处于加载状态" >&2
+      return 1
+    fi
+    pid="$SC_LIST_PID"
+    case "$pid" in
+      ''|*[!0-9]*)
+        if [ "$saw_pid" = 1 ]; then
+          echo "候选进程已退出（PID 列回到未运行）" >&2
+          return 1
+        fi
+        ;;
+      *)
+        saw_pid=1
+        if curl --fail --silent --show-error --noproxy '*' \
+             --max-time "$curl_max" \
+             "http://${url_host}:${port}/api/health/ready" >/dev/null 2>&1; then
+          return 0
+        fi
+        ;;
+    esac
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      echo "候选服务就绪确认超时（PID+readiness 未在 ${total}s 内通过）" >&2
+      return 1
+    fi
+    sleep "$interval"
+  done
+}
+
+# 提交临界区内的最终确认：readiness 通过瞬间到 committed 置位之间
+# 的退出/卸载窗口，以最后一次精确 PID 观测收口（数字 PID 才算活着）
+sc_candidate_running() {
+  if ! sc_list_first_field "$SC_LIST_PROBE"; then
+    return 1
+  fi
+  case "$SC_LIST_PID" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
 # 阶段二 switch：unload 旧 job → 同目录原子切换文件 → load 候选 → 精确确认。
 # 事务在**当前进程**（真实入口 PID，如 surgeconf.sh）内执行：trap 是进程级
 # 的，从装 trap 到 commit 为保护窗口，信号由入口 PID 自身捕获（而非仅其
@@ -848,14 +953,28 @@ sc_switch_launchd() {
     sc_switch_failed
     return 1
   fi
-  # 确认与置 committed 同在临界区：信号挂起至 committed 赋值后处理
+  # 候选确认（提交门）：`launchctl list` exit 0 只证明 loaded（第一列
+  # "-" = 未运行）——必须数字 PID 出现且本机直连 readiness 探测通过
+  # 才算候选真正可服务。host/port 取 prepare 已合并导出的运行值。
+  local host port
+  host="$(sc_env_value SURGE_HOST)"
+  port="$(sc_env_value SURGE_PORT)"
+  : "${host:=127.0.0.1}"
+  : "${port:=61830}"
+  if ! sc_wait_candidate_ready "$host" "$port"; then
+    echo "候选服务确认失败（数字 PID + readiness 未通过）" >&2
+    sc_switch_failed
+    return 1
+  fi
+  # 最终确认与置 committed 同在临界区：信号挂起至 committed 赋值后
+  # 处理；readiness 通过后进程退出的窗口以最后一次 PID 观测收口
   sc_critical_enter
-  if launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1; then
+  if sc_candidate_running; then
     SC_COMMITTED=1
   fi
   sc_critical_leave
   if [ "${SC_COMMITTED:-0}" != 1 ]; then
-    echo "launchctl load 后未能确认 $SC_LAUNCHD_LABEL" >&2
+    echo "候选进程在就绪确认后退出" >&2
     sc_switch_failed
     return 1
   fi

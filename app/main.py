@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.bootstrap import lifespan
 from app.pages import router as pages_router
 from app.routers import (auth, subscriptions, nodes, groups, configs, general,
-                         udp)
+                         health, udp)
 from app.routers import settings as settings_router
 from app.security import (COOKIE_NAME, SESSION_MAX_AGE, Decision,
                           load_access_settings, require_admin_request)
@@ -105,6 +105,7 @@ app.include_router(groups.router)
 app.include_router(configs.router)
 app.include_router(udp.router)
 app.include_router(general.router)
+app.include_router(health.router)
 app.include_router(settings_router.router)
 app.include_router(auth.router)
 app.include_router(pages_router)

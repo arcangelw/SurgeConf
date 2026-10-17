@@ -656,6 +656,68 @@ Important（测试证据缺口）：Round 3 的四窗口参数化用例统一预
 
 **131 passed**；全量 pytest **1191 passed**。
 
+### 10. Fix Round 5 — readiness 提交门（loaded ≠ 可服务）
+
+Commit: `fix: commit launchd switch only after readiness`
+
+Important（整分支复审 finding）：`launchctl list` exit 0 只证明 job
+已 loaded，第一列 `-` 代表进程未运行——应用因数据目录网络卷/WAL/
+迁移/端口绑定失败而未真正监听时，切换仍置 SC_COMMITTED 并报告成功。
+
+**应用侧最小 readiness 端点**（`app/routers/health.py`）：
+`GET /api/health/ready` → 204、无 body、无版本/配置；唯一门是
+lifespan 在 yield 前置位、清理边界进入即复位的
+`app.state.service_ready`（启动未完成/失败/清理期一律 503 fail
+closed）。访问矩阵公开该路径（GET 安全方法，无 cookie/CSRF 要求——
+`lan_authenticated` 下 launchd 本机 curl 才能探测；其他 API 路径
+不因此放开）；`local_only` 非回环仍在中间件被 403。
+
+**launchd 确认轮询**（`launchd_lib.sh::sc_wait_candidate_ready`）：
+load 成功后有界 poll——精确 list 首个 tab 字段必须数字 PID（`-`
+继续等待，覆盖首次迁移/冷启动的 PID 延迟；数字后回 `-` 视同进程
+退出立即失败；list exit 非 0 立即失败），PID 数字时以
+`curl --fail --silent --show-error --noproxy '*' --max-time <短超时>`
+直连 `http://<归一host>:<port>/api/health/ready`。host 归一
+（`sc_readiness_host`）：127/0.0.0.0→127.0.0.1、`::`→`[::1]`、
+其他 IPv6 加括号、LAN 地址原样；参数全部引用、URL 无凭据。总时限
+`SC_READINESS_TIMEOUT` 默认 60s，测试可注入缩短。
+
+**信号安全（关键实现细节）**：launchctl 输出解析绝不用命令替换——
+bash 命令替换执行期间收到信号会污染退出码（128+signum）且 trap
+赋值在替换子上下文丢失（实验证实），会破坏临界区 pending 语义；
+改为 prepare 阶段 mktemp 的 PID 探测文件（`SC_LIST_PROBE`，随
+`sc_discard_candidates` 清理）+ `read` 解析。提交临界区保持
+「最终 PID 观测 + SC_COMMITTED 置位」原子，`after-confirm` 信号
+注入点迁移到「readiness 通过后的最终确认」查询（curl-ok 标记门控），
+尊重提交的既有断言原样通过。
+
+**端口严格化**：prepare 预检从「仅数字」收紧为 1..65535——0/65536
+在 unload 之前拒绝，绝不因已知必失败配置停服。数据目录网络卷/WAL
+等应用层故障由「进程起不来 → readiness 超时/退出」触发既有幂等
+回滚，不在 shell 复制 Python 挂载判定。
+
+**测试（RED→GREEN）**：应用侧 5 用例（local_only 回环 204 空 body/
+非回环 403、lan_authenticated 无 cookie 204 且其他 API 仍 401、
+端点 state 标志门缺失/False→503、未完成 lifespan 非 204）；launchd
+侧 9 用例（loaded 无 PID 超时回滚且 curl 零调用、数字 PID+readiness
+恒败回滚且有界多次重试、延迟 PID+延迟 ready 最终提交、PID 出现后
+退出立即回滚——实测 <6s vs 时限 8s、端口 0/65536 unload 前拒绝、
+enable readiness 失败零残留、host 归一五形态、curl argv 契约含
+0.0.0.0→127.0.0.1 归一与无凭据）。fake 基建：launchctl load 成功
+即进程运行（state=running），新增 NORUN/PID_FROM/PID_UNTIL 注入；
+fake curl 默认成功、记录完整 argv、支持延迟成功/持续失败、绝不
+联网。mv 四信号窗口与 after-load/after-unload 等既有用例零回归。
+
+**验证**：launchd/auth/API/安全专项 **255 passed**；全量 pytest
+**1246 passed**（Slice 4 Round 4 基线 1232 + 新增 14）。开源安全
+豁免（launchd 测试文件规则 4）随文件变更复审后更新 SHA-256。
+
+**未验证限制声明**：以上为代码层自动确认（fake launchd/curl 全覆盖，
+含信号临界区与回滚路径）；真实 launchd 上的切换 smoke（KeepAlive
+崩溃循环下的 readiness 超时回滚、真实 curl 对 `/api/health/ready`
+的端到端探测）尚需在物理 Mac 执行 `./surgeconf.sh restart` 人工
+验证。
+
 ## Slice 5 — 拒绝非本地数据库文件系统 + WAL 生效验证
 
 Commit: `fix: reject unsafe database filesystems`

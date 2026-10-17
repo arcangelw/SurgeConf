@@ -177,6 +177,10 @@ async def lifespan(app: FastAPI):
             # 错误码，绝不携带异常消息/类型名，随后交由清理边界收敛
             log_event("startup_failed", error_code="internal_error")
             raise
+        # 就绪标志是 /api/health/ready 的唯一门：只有完整走完
+        # harden/迁移/绑定/维护/调度器的 lifespan 才置位（launchd
+        # 切换事务据此判定候选实例真正可服务后才提交）
+        app.state.service_ready = True
         yield
         log_event("service_shutdown")
     except BaseException:
@@ -184,6 +188,9 @@ async def lifespan(app: FastAPI):
         # finally 收集）不遮蔽它
         raise
     finally:
+        # 清理边界一进入即撤销就绪宣告：shutdown/失败传播期间
+        # readiness 一律 fail closed（503）
+        app.state.service_ready = False
         # 嵌套清理：stop 抛错也继续 dispose，dispose 抛错也继续
         # logging shutdown（handler/FD 最终必然关闭）
         try:
