@@ -23,6 +23,12 @@ case "$1" in
     if [ -n "$2" ]; then
       # 精确 label 查询：输出 PID\tStatus\tLabel，exit status 表达加载状态；
       # state 文件内容为 "running" 时第一列为数字 PID，其余（含空）为 "-"
+      # FAKE_LAUNCHCTL_LIST_FAIL_AT=N：第 N 次精确查询 exit 1（计数文件持久）
+      if [ -n "${FAKE_LAUNCHCTL_LIST_FAIL_AT:-}" ]; then
+        n=$(($(cat "${FAKE_LAUNCHCTL_LIST_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
+        echo "$n" > "${FAKE_LAUNCHCTL_LIST_COUNT:-/dev/null}" 2>/dev/null
+        [ "$n" = "${FAKE_LAUNCHCTL_LIST_FAIL_AT}" ] && exit 1
+      fi
       if [ -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}" ]; then
         if [ "$(cat "${FAKE_LAUNCHCTL_STATE}")" = "running" ]; then
           printf -- '12345\t0\t%s\n' "$2"
@@ -39,11 +45,22 @@ case "$1" in
     exit 0
     ;;
   load)
+    # FAKE_LAUNCHCTL_FAIL_ONCE=load：第一次 load exit 1（标记文件），之后恢复
+    if [ "${FAKE_LAUNCHCTL_FAIL_ONCE:-}" = "load" ] && \
+       [ ! -f "${FAKE_LAUNCHCTL_ONCE_MARK:-/nonexistent}" ]; then
+      : > "${FAKE_LAUNCHCTL_ONCE_MARK:-/dev/null}"
+      exit 1
+    fi
     rc="${FAKE_LAUNCHCTL_LOAD_RC:-0}"
     [ "$rc" = "0" ] && : > "${FAKE_LAUNCHCTL_STATE:-/dev/null}"
     exit "$rc"
     ;;
   unload)
+    if [ "${FAKE_LAUNCHCTL_FAIL_ONCE:-}" = "unload" ] && \
+       [ ! -f "${FAKE_LAUNCHCTL_ONCE_MARK:-/nonexistent}" ]; then
+      : > "${FAKE_LAUNCHCTL_ONCE_MARK:-/dev/null}"
+      exit 1
+    fi
     rc="${FAKE_LAUNCHCTL_UNLOAD_RC:-0}"
     [ "$rc" = "0" ] && rm -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}"
     exit "$rc"
@@ -81,16 +98,24 @@ def run_script(args: list[str], tmp_path: Path, extra_env: dict | None = None) -
 
 @pytest.fixture
 def fake_launchctl(tmp_path):
-    """PATH 前置 fake launchctl；返回 (调用日志, env 片段, state 文件)"""
+    """PATH 前置 fake launchctl；返回 (调用日志, env 片段, state 文件)
+
+    env 片段额外携带 FAKE_LAUNCHCTL_ONCE_MARK（fail-once 标记）与
+    FAKE_LAUNCHCTL_LIST_COUNT（精确查询计数），供故障注入测试使用。"""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "launchctl").write_text(FAKE_LAUNCHCTL)
     (bindir / "launchctl").chmod(0o755)
     log = tmp_path / "launchctl.log"
+    log.touch()   # 预创建：零调用的场景（如 prepare 早期拒绝）也能安全读取
     state = tmp_path / "loaded.marker"
+    once_mark = tmp_path / "fail-once.mark"
+    list_count = tmp_path / "list-count"
     env = {"PATH": f"{bindir}:/usr/bin:/bin",
            "FAKE_LAUNCHCTL_LOG": str(log),
-           "FAKE_LAUNCHCTL_STATE": str(state)}
+           "FAKE_LAUNCHCTL_STATE": str(state),
+           "FAKE_LAUNCHCTL_ONCE_MARK": str(once_mark),
+           "FAKE_LAUNCHCTL_LIST_COUNT": str(list_count)}
     return log, env, state
 
 
@@ -782,3 +807,279 @@ def test_console_and_structured_log_paths_are_distinct(tmp_path):
     assert data["StandardOutPath"].endswith("surgeconf-console.log")
     assert data["StandardErrorPath"] == data["StandardOutPath"]
     assert not data["StandardOutPath"].endswith("/surgeconf.log")
+
+# ===== Slice 4：事务性 restart（prepare → switch，失败不卸载/可回滚） =====
+
+
+def _seed_running_service(tmp_path):
+    """手写旧 control/plist 字节（返回原始字节对，供不变性断言）"""
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    control_env.write_text("SURGE_HOST=192.0.2.10\nSURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST-BYTES-9f2c")
+    return (home, control_dir, control_env, plist,
+            control_env.read_bytes(), plist.read_bytes())
+
+
+def test_restart_invalid_port_never_unloads_or_touches_files(tmp_path, fake_launchctl):
+    """运行中服务 + SURGE_PORT=abc：候选校验在 unload 前失败——
+    绝不调用 unload，旧 control/plist 字节与 loaded 状态全部不变"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+
+    r = run_script(["restart"], tmp_path, extra_env={**env, "SURGE_PORT": "abc"})
+    assert r.returncode != 0
+    calls = log.read_text().strip().splitlines()
+    assert calls == ["list com.surgeconf"]          # 仅状态探测，绝不 unload
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()                            # loaded 状态不变
+
+
+def test_restart_control_char_value_never_unloads(tmp_path, fake_launchctl):
+    """显式 host 含控制字符（注入第二个键）：候选写盘前失败，
+    不 unload、旧 control/plist 字节与 loaded 状态不变"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+
+    r = run_script(["restart"], tmp_path,
+                   extra_env={**env, "SURGE_HOST": "127.0.0.1\nSURGE_HOST=0.0.0.0"})
+    assert r.returncode != 0
+    calls = log.read_text().strip().splitlines()
+    assert not any(c.startswith("unload") for c in calls)
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()
+
+
+def test_restart_uncreatable_data_dir_never_unloads(tmp_path, fake_launchctl):
+    """data dir 路径被普通文件阻挡：目录创建失败发生在 unload 之前，
+    正式文件字节不变且无候选残留"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    blocker = home / "blocker"
+    blocker.write_text("not a dir")
+
+    r = run_script(["restart"], tmp_path,
+                   extra_env={**env, "SURGECONF_DATA_DIR": f"{blocker}/sub"})
+    assert r.returncode != 0
+    calls = log.read_text().strip().splitlines()
+    assert not any(c.startswith("unload") for c in calls)
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+
+
+def test_restart_symlink_plist_rejected_before_unload(tmp_path, fake_launchctl):
+    """旧 plist 是 symlink：prepare 阶段拒绝——不 unload、不跟随、不替换"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, _ = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    victim = home / "victim.plist"
+    victim.write_bytes(b"VICTIM")
+    plist.unlink()
+    plist.symlink_to(victim)
+
+    r = run_script(["restart"], tmp_path, extra_env=env)
+    assert r.returncode != 0
+    calls = log.read_text().strip().splitlines()
+    assert not any(c.startswith("unload") for c in calls)
+    assert plist.is_symlink()
+    assert victim.read_bytes() == b"VICTIM"
+    assert state.exists()
+
+
+def test_restart_load_failure_rolls_back_and_reloads_old_job(tmp_path, fake_launchctl):
+    """候选 load 失败（fail-once）：回滚恢复旧 control/plist 字节、
+    旧 job 重新加载并确认、无候选/备份残留、整体明确非零"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r = run_script(["restart"], tmp_path, extra_env={**env, "SURGE_PORT": "61900"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    old_control, old_plist = control_env.read_bytes(), plist.read_bytes()
+    log.write_text("")
+
+    r2 = run_script(["restart"], tmp_path,
+                    extra_env={**env, "FAKE_LAUNCHCTL_FAIL_ONCE": "load"})
+    assert r2.returncode != 0
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()                        # 回滚后旧 job 重新加载
+    calls = log.read_text().strip().splitlines()
+    assert sum(1 for c in calls if c.startswith("load ")) == 2   # 候选失败 + 回滚成功
+    assert "回滚" in (r2.stdout + r2.stderr)
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+
+
+def test_restart_confirm_failure_rolls_back(tmp_path, fake_launchctl):
+    """load 成功但精确 list 确认失败（第 2 次查询注入失败）：
+    停止候选 job、恢复旧文件并重新加载，整体非零"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r = run_script(["restart"], tmp_path, extra_env={**env, "SURGE_PORT": "61900"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    old_control, old_plist = control_env.read_bytes(), plist.read_bytes()
+    log.write_text("")
+
+    r2 = run_script(["restart"], tmp_path,
+                    extra_env={**env, "FAKE_LAUNCHCTL_LIST_FAIL_AT": "2"})
+    assert r2.returncode != 0
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()
+    calls = log.read_text().strip().splitlines()
+    assert sum(1 for c in calls if c.startswith("load ")) == 2
+    assert "回滚" in (r2.stdout + r2.stderr)
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+
+
+def test_restart_unload_failure_keeps_files_and_job(tmp_path, fake_launchctl):
+    """unload 失败：正式文件未被切换（字节不变）、候选/备份清理、job 保持 loaded"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    env["FAKE_LAUNCHCTL_UNLOAD_RC"] = "1"
+
+    r = run_script(["restart"], tmp_path, extra_env=env)
+    assert r.returncode != 0
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()                        # fake unload 失败不删 state
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+
+
+def test_restart_not_loaded_skips_unload_and_switches(tmp_path, fake_launchctl):
+    """旧 job 未加载（如 stop 后）：不调用 unload，直接切换并加载成功"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"STALE")
+
+    r = run_script(["restart"], tmp_path, extra_env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = log.read_text().strip().splitlines()
+    assert not any(c.startswith("unload") for c in calls)
+    assert plist.read_bytes() != b"STALE"        # plist 已重生成
+    assert state.exists()
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert control_env.stat().st_mode & 0o777 == 0o600
+
+
+def test_restart_rollback_reload_failure_keeps_old_files(tmp_path, fake_launchctl):
+    """回滚后的重新 load 也失败（恒败）：明确非零、旧文件已恢复并保留、
+    输出人工恢复指引，不伪装成功"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r = run_script(["restart"], tmp_path, extra_env={**env, "SURGE_PORT": "61900"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    old_control, old_plist = control_env.read_bytes(), plist.read_bytes()
+    log.write_text("")
+
+    r2 = run_script(["restart"], tmp_path,
+                    extra_env={**env, "FAKE_LAUNCHCTL_LOAD_RC": "1"})
+    assert r2.returncode != 0
+    assert control_env.read_bytes() == old_control   # 旧文件已恢复且保留
+    assert plist.read_bytes() == old_plist
+    assert "人工" in (r2.stdout + r2.stderr)
+    assert not state.exists()                        # 回滚 load 失败：job 未加载
+    calls = log.read_text().strip().splitlines()
+    assert sum(1 for c in calls if c.startswith("load ")) == 2   # 两次 load 均失败
+
+
+def test_enable_first_time_load_failure_leaves_no_artifacts(tmp_path, fake_launchctl):
+    """首次 enable 且 load 失败：不留半发布 control/plist/job"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    env["FAKE_LAUNCHCTL_LOAD_RC"] = "1"
+
+    r = run_script(["enable"], tmp_path, extra_env=env)
+    assert r.returncode != 0
+    assert not control_env.exists()
+    assert not plist.exists()
+    assert not state.exists()
+    assert [p.name for p in plist.parent.iterdir()] == []
+
+
+def _valid_plist_dict():
+    return {
+        "Label": "com.surgeconf",
+        "ProgramArguments": ["/proj/run_surgeconf.sh"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "Umask": 63,
+        "StandardOutPath": "/x/logs/surgeconf-console.log",
+        "StandardErrorPath": "/x/logs/surgeconf-console.log",
+        "EnvironmentVariables": {
+            "SURGE_HOST": "127.0.0.1",
+            "SURGE_PORT": "61830",
+            "SURGECONF_DATA_DIR": "/x/data",
+        },
+    }
+
+
+def test_verify_plist_candidate_contract(tmp_path):
+    """候选 plist 结构验证：合法产物通过；未知顶层键/错 Label/凭据键/
+    缺环境键/C1 控制字符/坏 XML 一律拒绝（纵深防御，防生成器回归）"""
+    home, *_ = _paths(tmp_path)
+    r = run_bash(r"""
+        source "$LIB"
+        sc_generate_plist "$HOME/good.plist" "/proj" \
+          "$HOME/Library/Logs/SurgeConf/surgeconf-console.log" \
+          "127.0.0.1" "61830" "$HOME/data" \
+        && sc_verify_plist_candidate "$HOME/good.plist" \
+        && echo VERIFY_OK
+    """, tmp_path)
+    assert "VERIFY_OK" in r.stdout, r.stderr
+
+    unknown_top = _valid_plist_dict()
+    unknown_top["Mystery"] = True
+    wrong_label = _valid_plist_dict()
+    wrong_label["Label"] = "other.label"
+    credential_env = _valid_plist_dict()
+    credential_env["EnvironmentVariables"]["SURGE_CONTROLLER_ACCESS"] = "k@h:1"
+    missing_env = _valid_plist_dict()
+    del missing_env["EnvironmentVariables"]["SURGE_PORT"]
+    control_char = _valid_plist_dict()
+    control_char["EnvironmentVariables"]["SURGE_HOST"] = "127.0.0.1\x85"
+    bad = {
+        "bad-unknown-top": plistlib.dumps(unknown_top),
+        "bad-wrong-label": plistlib.dumps(wrong_label),
+        "bad-credential-env": plistlib.dumps(credential_env),
+        "bad-missing-env": plistlib.dumps(missing_env),
+        "bad-control-char": plistlib.dumps(control_char),
+        "bad-garbage": b"not-a-plist-at-all",
+    }
+    for name, blob in bad.items():
+        (home / f"{name}.plist").write_bytes(blob)
+
+    names = " ".join(f"$HOME/{n}.plist" for n in bad)
+    r2 = run_bash(
+        'source "$LIB"\n'
+        f'for f in {names}; do\n'
+        '  if sc_verify_plist_candidate "$f"; then echo "BAD_ACCEPTED:$f"; fi\n'
+        'done', tmp_path)
+    assert "BAD_ACCEPTED" not in r2.stdout

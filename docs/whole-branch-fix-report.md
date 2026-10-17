@@ -360,3 +360,97 @@ positional arguments`；bind 失败恢复（restore/reset）`RuntimeError:
 database runtime is not bound`（数据未恢复、runtime 不可用）。GREEN——
 维护专项 **21 passed**；数据库/备份/迁移/调度/auth/API 专项 **273
 passed**；全量 pytest **1166 passed**。
+
+## Slice 4 — launchd restart/enable 事务化（prepare → switch）
+
+Commit: `fix: make launchd restart transactional`
+
+### 1. 问题（原 finding）
+
+`launchd_lib.sh::sc_install_launchd` 的顺序是「先 unload，后配置」：
+已加载的 job 在读取/合并/校验任何配置之前就被卸载停机。复现
+`SURGE_PORT=abc ./surgeconf.sh restart`（服务运行中）：
+
+1. `launchctl unload` 先停掉正在运行的服务；
+2. `sc_write_launchd_env` 把 `SURGE_PORT=abc` **持久化**进控制文件
+   （写盘校验只查控制字符，不查端口语义）；
+3. `sc_generate_plist` 才发现端口非法，返回失败。
+
+结果：服务已停、控制文件已坏（下次 restart 也起不来）、无任何回滚。
+load 或 `launchctl list` 确认失败同样只传播错误码，磁盘上留下与
+launchd 状态不一致的新文件；首次 enable 失败会留下半发布的
+control/plist/job。旧 plist 为 symlink 时还会被直接覆盖（无检查）。
+
+### 2. 方案（两阶段事务 + 状态机回滚）
+
+**阶段一 prepare（不停机）**：所有可能因配置/生成失败的步骤前置——
+
+- 记录旧状态：旧 control/plist 存在性（symlink 先于存在性检查，
+  plist 为 symlink 直接拒绝）、`launchctl list` 精确判定旧 loaded；
+- 显式 env 捕获 → 旧架构迁移 → 读旧控制文件 → 回放合并 →
+  **端口预检**（`abc` 等非法值在生成任何候选之前失败）；
+- 候选 control 与候选 plist 均写入**目标目录内 mktemp 随机名 0600
+  文件**（与正式路径同文件系统，rename 原子；可预测名/symlink 跟随
+  均不存在：mktemp O_EXCL 独占，mv/rm 只作用于链接本身）；
+- 新增 `sc_verify_plist_candidate`：venv Python plistlib 解析候选，
+  顶层键白名单 + Label 精确匹配 + `EnvironmentVariables` 键集合
+  （凭据键必被拒绝）+ 值控制字符（C0/C1）+ `Umask=63` + Program
+  形态。argv 只传候选路径与 label，输出不含任何配置值。
+
+**阶段二 switch（提交点）**：unload 旧 job（失败则正式文件未动，
+仅清理候选）→ 同目录 rename 原子切换（旧文件先挪入随机名备份，
+候选就位）→ `launchctl load` → `launchctl list` 精确确认。
+
+**回滚（load/确认失败触发）**：尽力 unload 候选 job → 按
+`SWITCHED/MOVED` 状态机精确恢复——未动过的文件不碰、挪走的
+rename 回原字节、原先不存在的删除新文件（覆盖「旧不存在」情形）→
+旧先前 loaded 则重新 load 并以精确 list 确认 → 清理全部候选/备份。
+回滚 load 也失败：输出人工恢复指引（`launchctl load` 命令）、
+保留已恢复的旧文件、明确非零，绝不伪装成功。备份恢复失败的
+极端场景同样保留随机名备份文件供人工处置。
+
+语义保持：restart 未提供键保留持久值、显式空值清除回默认、
+凭据只存 0600 控制文件、plist 永远只含定位三键、Umask 63、
+0600/0700 权限收敛、`set -u` 安全、无 `eval`。
+
+### 3. 技术依据
+
+- **rename(2) 原子性**：候选/备份与正式路径同目录，`mv` 退化为
+  rename，读者要么看到旧文件要么看到新文件，无部分写状态；
+- **launchctl 语义**：`unload <path>` 按路径卸载（异路径加载的
+  job 卸载失败即传播失败，不产生半卸载状态）；`launchctl list
+  <label>` 精确 exit status 是加载判定，第一列 PID 才是运行中；
+- **plistlib**：stdlib XML plist 解析对坏结构/坏 XML 抛异常；
+  C1 区（0x7F–0x9F）中 NEL(0x85) 可通过 XML 解析，须在值级显式
+  拒绝（与 `sc_assert_no_control` 同区间，纵深防御）。
+
+### 4. 验证证据
+
+测试文件：`tests/test_launchd_scripts.py`（新增 11 个用例，全部
+fake launchctl PATH 注入，零真实 launchd 操作）。fake launchctl
+扩展 `FAKE_LAUNCHCTL_FAIL_ONCE`（load/unload 各支持一次失败）与
+`FAKE_LAUNCHCTL_LIST_FAIL_AT`（第 N 次精确查询失败）两类注入。
+
+- **RED（实现前）**：9 failed / 2 passed——非法端口（unload 已发生、
+  控制文件已持久化坏值）、控制字符注入（unload 已发生）、data dir
+  阻挡（unload 已发生）、symlink plist（旧实现竟然 returncode=0
+  直接覆盖）、load 失败回滚（state 丢失、无第二次 load）、确认失败
+  回滚（仅 1 次 load、无回滚消息）、回滚 load 恒败（无人工指引）、
+  enable 半发布（control/plist 残留）、验证函数（不存在，127）；
+  unload 失败与未 loaded 两例为行为保护（新旧实现均通过）。
+- **GREEN（实现后）**：launchd 专项 + 开源安全专项 **117 passed**；
+  全量 pytest **1177 passed**。
+- 覆盖矩阵：非法显式值（端口/控制字符/不可创建目录/symlink plist）
+  全部在 unload 前失败且正式文件字节与 loaded 状态零改动、无候选
+  残留；load 失败（fail-once）→ 旧字节恢复 + 旧 job 重新加载确认 +
+  两次 load + 回滚消息 + 目录无残留；确认失败（第 2 次查询注入）→
+  同上完整回滚；unload 失败 → 字节不变、候选清理、job 保持 loaded；
+  未 loaded → 不调 unload 直接切换成功；回滚 load 恒败 → 非零 +
+  旧文件保留 + 人工指引 + 两次 load 均失败；首次 enable 失败 →
+  无 control/plist/job 半发布；候选验证函数契约（未知顶层键/错
+  Label/凭据键/缺环境键/C1 控制字符/坏 XML 拒绝，合法产物通过）。
+- 既有行为保留：键更新语义（unset 保留/显式空清除）、凭据不进
+  plist、迁移、status 精确判定、console/结构化日志分离等 29 项
+  原用例全部通过（106 → 117 项专项无回归）。
+- 开源安全豁免登记随测试文件变更更新（新增行为审查：仅合成占位
+  凭据的 dict 索引赋值一处，无真实数据）。
