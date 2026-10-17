@@ -31,7 +31,8 @@ from app.services.backups import unique_path
 from app.services.config_validation import (InvalidConfiguration, is_final_rule,
                                             validate_rule_order)
 from app.services.generator import generate_surge_config
-from app.default_config import HOST_DNS_PRESETS, DEFAULT_RULE_SOURCES
+from app.default_config import (DEFAULT_FINAL_ACTION, HOST_DNS_PRESETS,
+                                DEFAULT_RULE_SOURCES)
 
 router = APIRouter(prefix="/api/configs", tags=["配置管理"])
 
@@ -46,7 +47,7 @@ class ConfigProfileCreate(BaseModel):
     target: Optional[ProfileTarget] = None
     udp_security_mode: Optional[UdpSecurityMode] = None
     locale: Optional[str] = "zh"
-    final_action: Optional[str] = "手动选择"
+    final_action: Optional[str] = DEFAULT_FINAL_ACTION
     general: Optional[dict] = None
     dns: Optional[dict] = None
     url_rewrites: Optional[list] = None
@@ -179,10 +180,10 @@ async def create_profile(data: ConfigProfileCreate, db: AsyncSession = Depends(g
     # 显式 null 不等于省略：区分「未提供」（用目标默认模式）与「显式非法值」
     if data.udp_security_mode is None and "udp_security_mode" in data.model_fields_set:
         raise HTTPException(422, "udp_security_mode 不允许显式 null：省略该字段以使用目标默认模式")
-    # final_action 显式 null 不等于省略：未提供用模型默认（手动选择）
+    # final_action 显式 null 不等于省略：未提供使用统一默认兜底组
     if data.final_action is None and "final_action" in data.model_fields_set:
         raise HTTPException(422, "final_action 不允许显式 null：省略该字段以使用默认兜底策略")
-    final_action = data.final_action or "手动选择"
+    final_action = data.final_action or DEFAULT_FINAL_ACTION
     mode = data.udp_security_mode or default_udp_mode(data.target)
     try:
         validate_target_mode(data.target, mode)

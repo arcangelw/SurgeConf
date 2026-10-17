@@ -4,6 +4,9 @@
 # 仅当 SURGE_CONTROLLER_ACCESS / SURGE_HTTP_API 环境变量非空时由生成器注入，
 # 或由用户在配置方案的 General 表单中显式填写。
 
+DEFAULT_FINAL_ACTION = "兜底"
+
+
 # 完整的中英文名称映射表
 # 数据库中统一存储中文名（左侧），生成英文配置时替换为右侧
 LOCALE_NAMES = {

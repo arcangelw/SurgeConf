@@ -17,7 +17,7 @@ from app.runtime_paths import (configure_private_umask,
                                resolve_runtime_paths)
 from app.models import RegionGroup, ServiceGroup, RuleSource, ConfigProfile, CustomRule, HostMapping, SystemConfig
 from app.default_config import (
-    DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
+    DEFAULT_FINAL_ACTION, DEFAULT_REGION_GROUPS, DEFAULT_SERVICE_GROUPS,
     DEFAULT_RULE_SOURCES, DEFAULT_GENERAL,
     DEFAULT_URL_REWRITES, DEFAULT_HEADER_REWRITES,
     DEFAULT_MITM, DEFAULT_PRE_RULES, DEFAULT_GENERAL_RULES,
@@ -57,7 +57,7 @@ async def seed_defaults(session_factory) -> None:
                 description="基于原始 Surge.conf 的默认配置",
                 is_default=True,
                 locale="zh",
-                final_action="兜底",
+                final_action=DEFAULT_FINAL_ACTION,
                 target=seed_target.value,
                 udp_security_mode=default_udp_mode(seed_target).value,
                 general=dict(DEFAULT_GENERAL),

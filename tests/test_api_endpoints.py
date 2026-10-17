@@ -707,16 +707,16 @@ async def test_update_custom_rule_to_final_rejected(client):
 
 @pytest.mark.asyncio
 async def test_create_profile_persists_requested_final_action(client):
-    """请求 final_action 必须落库并直通生成 FINAL；省略用模型默认"""
+    """请求 final_action 必须落库并直通生成 FINAL；省略默认使用兜底组"""
     pid = await _create(client, "自定义兜底档", final_action="自动选择")
     assert (await _detail(client, pid))["final_action"] == "自动选择"
     content = (await client.get(f"/api/configs/generate?profile_id={pid}")).text
     assert "FINAL,自动选择,dns-failed" in content
 
     pid2 = await _create(client, "默认兜底档")
-    assert (await _detail(client, pid2))["final_action"] == "手动选择"
+    assert (await _detail(client, pid2))["final_action"] == "兜底"
     content2 = (await client.get(f"/api/configs/generate?profile_id={pid2}")).text
-    assert "FINAL,手动选择,dns-failed" in content2
+    assert "FINAL,兜底,dns-failed" in content2
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,8 @@ General 字段能力由唯一能力矩阵（`app/profile_targets.py`）派生，
 
 规则能力同样按目标过滤：`ios_mobile` 产物不输出任何 Mac 进程规则（`PROCESS-*` 前缀族）与 `MAC-ADDRESS` 规则——检测为结构化括号感知（覆盖 `AND`/`OR`/`NOT` 嵌套，payload 子串如域名不受影响），全局与档案作用域同口径；Mac 两目标不受影响。`FINAL` 为生成器专属终结规则：最终 `[Rule]` 恰一条 FINAL，策略只来自档案的兜底策略（`final_action`），pre/general 自定义规则保存与生成两端均拒绝 FINAL。
 
+新建档案省略 `final_action` 时统一使用 `兜底`，生成 `FINAL,兜底,dns-failed`；已有档案保持其显式选择，不由升级静默改写。
+
 ## UDP 安全模式与阶段边界
 
 | 模式 | 语义 | 允许的目标 |

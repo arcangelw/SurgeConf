@@ -4,6 +4,7 @@ from sqlalchemy import (CheckConstraint, Column, Integer, String, Boolean, Text,
 from sqlalchemy.orm import validates
 from sqlalchemy.sql import func
 from app.database import Base
+from app.default_config import DEFAULT_FINAL_ACTION
 
 # 自动更新间隔合法范围（秒）：300 秒 – 7 天；单一事实来源，
 # Pydantic 路由校验与 ORM 赋值校验共用
@@ -124,7 +125,7 @@ class ConfigProfile(Base):
                                server_default="scoped",
                                comment="UDP 安全模式: strict/scoped/compatible（iOS 不允许 scoped）")
     locale = Column(String(10), default="zh", comment="语言: zh/en")
-    final_action = Column(String(100), default="手动选择", comment="兜底规则策略: 手动选择/自动选择/代理/大陆直连等")
+    final_action = Column(String(100), default=DEFAULT_FINAL_ACTION, comment="兜底规则策略: 兜底/手动选择/自动选择/代理/大陆直连等")
     general = Column(JSON, default=dict, comment="General段自定义配置")
     dns = Column(JSON, default=dict, comment="DNS配置")
     url_rewrites = Column(JSON, default=list, comment="URL重写规则")
