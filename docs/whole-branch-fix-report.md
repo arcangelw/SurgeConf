@@ -73,6 +73,7 @@ Commit: `fix: bind subscription fetches to validated public addresses`
 - 因此「连接 URL = 已验证 IP + Host header = 原 host + SNI =
   原 host」同时满足 IP 绑定与 HTTPS Host/SNI/证书正确性。
 
+
 ### 4. 验证证据
 
 测试文件：`tests/test_subscription_fetch_ssrf.py`（70 个用例，
@@ -96,3 +97,58 @@ Commit: `fix: bind subscription fetches to validated public addresses`
   错误映射沿用安全码且异常文本无目标；日志无 URL/host/query；
   纯本地 smoke（`test_smoke_local_fake_transport_redirect_and_ip_binding`）
   证明 redirect 全流程 + 连接 IP 绑定 + Host/SNI 正确。
+
+### 5. Fix Round 1 — authority 隔离 / cookie 禁用 / IDNA A-label 单一来源
+
+Commit: `fix: isolate subscription redirect authorities`
+
+复审发现的两个 Important 问题与修复（均先写失败测试复现）：
+
+**问题 A：跨逻辑 authority 复用连接与 Cookie 泄漏。** 上一版整个
+抓取共用一个 `AsyncClient`：(1) httpcore 连接池按 origin（scheme,
+host, port）复用，而我们的连接 URL host 是已验证 IP——`a.example`
+与 `b.example` 解析到同一公网 IP 且端口相同时 origin 完全相同，
+第二跳会**复用第一跳的 TCP/TLS 连接**（第二跳的 `sni_hostname`
+不再参与握手，TLS 会话属于第一跳的 host）；(2) 已实测复现：同一
+client 上第一响应的 `Set-Cookie` 会自动进入后续请求（按请求 URL
+的 host=IP 匹配），同 IP 不同逻辑域即发生 Cookie 跨 authority 泄漏。
+
+修复：
+- **authority（scheme, host, port）变化即 `aclose()` 旧 client 并
+  新建**（`_new_fetch_client` 工厂）：连接池与 cookie jar 都不跨
+  逻辑 authority；同 authority（如相对路径重定向）复用同一 client。
+  生产路径各 authority 自带独立 `AsyncHTTPTransport`/httpcore 池；
+  测试注入的 `MockTransport` 无连接状态、`aclose` no-op，可跨
+  client 重建复用。
+- **Cookie 显式禁用**：每个响应后 `client.cookies.clear()`——订阅
+  抓取无会话语义，即使同 authority 的相对路径跳转也不携带 Cookie。
+  （注：`AsyncClient(cookies=NoCookieJar子类)` 方案无效——httpx
+  构造时会用 `Cookies(cookies)` 重新包装，覆写方法丢失；清空 public
+  jar 是已验证有效的最小手段。）
+
+**问题 B：urllib/httpx 双解析漂移与 IDN。** 上一版静态校验用
+`urllib.parse.urlparse`（`hostname` 对 IDN 返回 Unicode），逻辑 URL
+用 `httpx.URL`（`host` 属性会把 `xn--` 解码回 Unicode，且不同输入
+形态行为不一致）——Unicode host 会流入 resolver / Host header /
+SNI（TLS SNI 与 HTTP/1.1 header 均要求 ASCII A-label）。
+
+修复：**单一解析源 `httpx.URL`**，host 一律取
+`u.raw_host.decode("ascii")`（实测恒为小写 ASCII：IDN→IDNA
+A-label，IPv6→去括号，IPv4 原样；IDNA 编码失败在构造时抛
+InvalidURL → `UnsafeSubscriptionTarget`）；resolver、Host header、
+`sni_hostname` 三处统一使用该 A-label；端口范围 1–65535 显式校验
+（httpx.URL 保留 99999 这类端口不报错，原 urllib 的 port 属性会抛
+ValueError，单一来源后需自查）。redirect Location 在 wire 上恒为
+ASCII（IDN 即 A-label/punycode 形态），与 Unicode 初始 URL 殊途同归
+到同一 `httpx.URL` 归一化路径。
+
+新增用例（8 个，全 fake resolver + MockTransport）：
+cross-authority 同 IP 重建 client（构造/关闭顺序 `new→close→new→
+close`）且第一跳 Set-Cookie 不进第二跳；同 authority 单 client 复用；
+同 authority 内 Cookie 也禁用；IDN 初始 URL 走 A-label
+（resolver/Host/SNI 断言）；IDN A-label Location 第二跳同链路；
+IDN 解析私网整主机拒绝；非默认端口参与 authority 判定；注入
+transport 跨重建可用。
+
+验证：SSRF 专项 78 passed；订阅/调度/安全扫描相关 161 passed；
+全量 pytest **1140 passed**。

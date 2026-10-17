@@ -6,7 +6,6 @@ import logging
 import asyncio
 import ipaddress
 import socket
-import urllib.parse
 import httpx
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -315,22 +314,35 @@ def _is_global_public_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address"
             and not ip.is_reserved and not ip.is_unspecified)
 
 
-def _parse_fetch_target(url: str) -> tuple[str, str, int]:
-    """静态校验：仅 http/https、禁 userinfo、host 必填、端口合法。
+def _parse_fetch_target(u: httpx.URL) -> tuple[str, str, int]:
+    """静态校验（单一解析源 httpx.URL）：仅 http/https、禁 userinfo、
+    host 必填、端口合法。
 
-    返回 (scheme, host, port)；host 为小写、IPv6 去括号形式，此阶段
-    不触碰网络。
+    host 取 ``u.raw_host.decode("ascii")``：IDN 域名恒为 IDNA A-label
+    （与 DNS 解析、Host header、TLS SNI 的 ASCII 要求一致），IP 字面量
+    为去括号小写形式；此阶段不触碰网络。端口越界在 httpx.URL 构造时
+    即抛 InvalidURL（由 _safe_httpx_url 统一转换）。
     """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    scheme = u.scheme
+    if scheme not in ("http", "https"):
         raise UnsafeSubscriptionTarget("不支持的订阅协议")
-    host = (parsed.hostname or "").lower()
+    host = u.raw_host.decode("ascii") if u.raw_host else ""
     if not host:
         raise UnsafeSubscriptionTarget("订阅 URL 缺少主机")
-    if parsed.username or parsed.password:
+    if u.userinfo:
         raise UnsafeSubscriptionTarget("订阅 URL 不允许携带凭据")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    return parsed.scheme, host, port
+    port = u.port or (443 if scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise UnsafeSubscriptionTarget("订阅 URL 端口非法")
+    return scheme, host, port
+
+
+def _new_fetch_client(transport) -> httpx.AsyncClient:
+    """按逻辑 authority 建独立 client：独立连接池（绝不跨 authority
+    复用连接/TLS 会话，即使两 host 解析到同一 IP）与独立 cookie jar；
+    trust_env=False 忽略环境代理；重定向一律手动处理。"""
+    return httpx.AsyncClient(timeout=30, trust_env=False,
+                             follow_redirects=False, transport=transport)
 
 
 async def _resolve_host(host: str, port: int) -> list[str]:
@@ -423,9 +435,14 @@ async def fetch_subscription(url: str, *,
 
     SSRF 防护（初始与每跳重定向均执行）：
     - 仅 http/https、禁 userinfo；
+    - 单一解析源 httpx.URL（IDN 恒用 IDNA A-label，与 DNS/Host/SNI
+      的 ASCII 要求一致）；
     - 异步解析全部 A/AAAA：任一地址非全局单播公网（loopback/私网/
       link-local/multicast/reserved/IPv4-mapped IPv6 等）→ 整主机拒绝；
-    - 连接只使用已验证 IP，Host header 与 HTTPS SNI 保留原域名；
+    - 连接只使用已验证 IP，Host header 与 HTTPS SNI 保留原 host；
+    - 逻辑 authority（scheme, host, port）变化即关闭旧 client 另建：
+      连接池与 cookie 均不跨 authority（同 IP 的不同 host 也不复用
+      连接）；响应 Set-Cookie 即弃，任何后续请求都不携带；
     - trust_env=False：忽略 HTTP(S)_PROXY 等环境代理；
     - 手动跟随 ≤5 次 301/302/303/307/308，Location 相对当前逻辑 URL
       解析，每跳目标重新走全部校验。
@@ -433,21 +450,31 @@ async def fetch_subscription(url: str, *,
     失败异常沿用 safe_sync_error 安全分类；本函数不记录任何
     URL/host/query。
     """
-    scheme, host, port = _parse_fetch_target(url)
     logical = _safe_httpx_url(url)
-    async with httpx.AsyncClient(timeout=30, trust_env=False,
-                                 follow_redirects=False,
-                                 transport=_transport) as client:
+    scheme, host, port = _parse_fetch_target(logical)
+    client: httpx.AsyncClient | None = None
+    authority: tuple[str, str, int] | None = None
+    try:
         for _hop in range(_FETCH_MAX_REDIRECTS + 1):
+            # authority（scheme, host, port）变化即关闭旧 client 另建：
+            # 连接池与 cookie jar 都不跨逻辑 authority（同 authority 复用）
+            if authority != (scheme, host, port):
+                if client is not None:
+                    await client.aclose()
+                client = _new_fetch_client(_transport)
+                authority = (scheme, host, port)
             addresses = await _validated_target_addresses(host, port)
             resp = await _request_bound_to_addresses(
                 client, scheme, host, port, logical, addresses)
+            # 订阅抓取无会话语义：响应 Set-Cookie 即弃，绝不进入任何
+            # 后续请求（含同 authority 的相对路径跳转）
+            client.cookies.clear()
             if resp.status_code in _FETCH_REDIRECT_STATUSES:
                 location = resp.headers.get("location")
                 if not location:
                     break  # 无 Location 的 3xx 按终态响应处理
                 logical = logical.join(_safe_httpx_url(location))
-                scheme, host, port = _parse_fetch_target(str(logical))
+                scheme, host, port = _parse_fetch_target(logical)
                 continue
             resp.raise_for_status()
             return parse_subscription_content(resp.text)
@@ -455,6 +482,9 @@ async def fetch_subscription(url: str, *,
             raise httpx.TooManyRedirects("subscription redirect limit exceeded")
         resp.raise_for_status()
         return parse_subscription_content(resp.text)
+    finally:
+        if client is not None:
+            await client.aclose()
 
 
 # ===== 同步结果安全 DTO 与错误分类 =====

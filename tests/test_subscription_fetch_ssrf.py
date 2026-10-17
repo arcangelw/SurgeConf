@@ -475,3 +475,158 @@ async def test_smoke_local_fake_transport_redirect_and_ip_binding(monkeypatch):
     assert rec.requests[1].url.path == "/next"
     assert rec.requests[1].url.query == b"sid=1"
     assert len(calls) == 2  # 初始 + 每跳各一次
+
+
+# ===== Fix Round 1：authority 隔离 / cookie 禁用 / IDNA A-label 单一来源 =====
+
+IDN_HOST_UNICODE = "例子.com"
+IDN_HOST_ALABEL = "xn--fsqu00a.com"                # 例子.com 的 IDNA A-label
+IDN2_HOST_ALABEL = "xn--fet810g.xn--fsqu00a.net"   # 导航.例子.net（wire 形态）
+
+
+def install_client_spy(monkeypatch):
+    """记录 AsyncClient 构造与 aclose 顺序（证明 authority 连接边界）"""
+    events: list[tuple] = []
+    real_client = httpx.AsyncClient
+
+    class SpyClient(real_client):
+        def __init__(self, *args, **kwargs):
+            events.append(("new", kwargs.get("trust_env"),
+                           kwargs.get("follow_redirects")))
+            super().__init__(*args, **kwargs)
+
+        async def aclose(self):
+            events.append(("close",))
+            await super().aclose()
+
+    monkeypatch.setattr(subscription_service.httpx, "AsyncClient", SpyClient)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_cross_authority_same_ip_rebuilds_client_no_cookie_leak(
+        monkeypatch):
+    """a.example→b.example 且解析到同一公网 IP：
+    不同逻辑 authority 不得复用同一 client/连接池（重建并先关闭旧
+    client），第一跳 Set-Cookie 不得进入第二跳请求。"""
+    calls = []
+    install_resolver(monkeypatch, {
+        "a.example.com": [PUBLIC_V4],
+        "b.example.com": [PUBLIC_V4],   # 同一公网 IP
+    }, calls=calls)
+    events = install_client_spy(monkeypatch)
+    rec = Recorder([
+        httpx.Response(302, headers={
+            "Location": "https://b.example.com/next",
+            "Set-Cookie": "sid=FIRST; Path=/"}),
+        ok_response(),
+    ])
+    nodes = await fetch_subscription("https://a.example.com/feed",
+                                     _transport=httpx.MockTransport(rec))
+    # 两个 authority → 两个独立 client，且旧的在第二跳请求前被关闭
+    # 两 authority 各一 client，退出时 finally 关闭最后一个
+    assert [e[0] for e in events] == ["new", "close", "new", "close"]
+    assert all(e[1] is False for e in events if e[0] == "new")  # trust_env
+    # 连接 URL 均绑定同一已验证 IP，Host/SNI 各自为逻辑 authority
+    assert [r.url.host for r in rec.requests] == [PUBLIC_V4, PUBLIC_V4]
+    assert [r.headers["Host"] for r in rec.requests] == \
+        ["a.example.com", "b.example.com"]
+    assert [r.extensions.get("sni_hostname") for r in rec.requests] == \
+        ["a.example.com", "b.example.com"]
+    # Cookie 隔离：第一跳 Set-Cookie 不进第二跳
+    assert "Cookie" not in rec.requests[1].headers
+
+
+@pytest.mark.asyncio
+async def test_same_authority_reuses_single_client(monkeypatch):
+    """同 authority（相对路径重定向）复用同一 client（不重建）"""
+    install_resolver(monkeypatch, {"sub.example.com": [PUBLIC_V4]})
+    events = install_client_spy(monkeypatch)
+    nodes, rec = await fetch(HTTPS_URL, [redirect("/next"), ok_response()])
+    assert [e[0] for e in events] == ["new", "close"]  # 只构造一次
+
+
+@pytest.mark.asyncio
+async def test_cookies_disabled_even_within_same_authority(monkeypatch):
+    """订阅抓取无会话语义：即使同 authority，响应 Cookie 也不进后续请求"""
+    install_resolver(monkeypatch, {"sub.example.com": [PUBLIC_V4]})
+    rec = Recorder([
+        httpx.Response(302, headers={"Location": "/next",
+                                     "Set-Cookie": "sid=LEAK; Path=/"}),
+        ok_response(),
+    ])
+    nodes = await fetch_subscription(HTTPS_URL,
+                                     _transport=httpx.MockTransport(rec))
+    assert "Cookie" not in rec.requests[1].headers
+
+
+@pytest.mark.asyncio
+async def test_idn_initial_url_uses_ascii_a_label(monkeypatch):
+    """Unicode IDN 初始 URL：resolver/Host/SNI 统一用 IDNA A-label
+    （单一来源 httpx.URL.raw_host），连接仍绑定已验证 IP"""
+    calls = []
+    install_resolver(monkeypatch, {IDN_HOST_ALABEL: [PUBLIC_V4]},
+                     calls=calls)
+    _, rec = await fetch(f"https://{IDN_HOST_UNICODE}/feed", [ok_response()])
+    assert [h for h, _ in calls] == [IDN_HOST_ALABEL]  # resolver 收 A-label
+    req = rec.requests[0]
+    assert req.url.host == PUBLIC_V4
+    assert req.headers["Host"] == IDN_HOST_ALABEL
+    assert req.extensions.get("sni_hostname") == IDN_HOST_ALABEL
+
+
+@pytest.mark.asyncio
+async def test_idn_redirect_location_uses_ascii_a_label(monkeypatch):
+    """redirect Location 的 IDN host（HTTP header 恒 ASCII，wire 上即
+    A-label/punycode）：第二跳同样走 A-label 校验链且 resolver/Host/
+    SNI 一致。Unicode 输入由初始 URL 用例覆盖（httpx.URL 构造即
+    IDNA 化，Location 解析同源）。"""
+    calls = []
+    install_resolver(monkeypatch, {
+        "sub.example.com": [PUBLIC_V4],
+        IDN2_HOST_ALABEL: [PUBLIC_V4_ALT],
+    }, calls=calls)
+    nodes, rec = await fetch(HTTPS_URL, [
+        redirect(f"https://{IDN2_HOST_ALABEL}/next"), ok_response()])
+    assert [h for h, _ in calls] == ["sub.example.com", IDN2_HOST_ALABEL]
+    req2 = rec.requests[1]
+    assert req2.url.host == PUBLIC_V4_ALT
+    assert req2.headers["Host"] == IDN2_HOST_ALABEL
+    assert req2.extensions.get("sni_hostname") == IDN2_HOST_ALABEL
+
+
+@pytest.mark.asyncio
+async def test_idn_host_resolving_private_rejected(monkeypatch):
+    """IDN 域名解析出私网地址同样整主机拒绝（A-label 路径不弱化校验）"""
+    install_resolver(monkeypatch, {IDN_HOST_ALABEL: [IP_192_A]})
+    with pytest.raises(UnsafeSubscriptionTarget):
+        await fetch_subscription(f"https://{IDN_HOST_UNICODE}/feed",
+                                 _transport=forbidden_transport())
+
+
+@pytest.mark.asyncio
+async def test_nonstandard_port_cross_authority_rebuilds(monkeypatch):
+    """非默认端口参与 authority 判定：同端口不同 host 仍隔离"""
+    install_resolver(monkeypatch, {"a.example.com": [PUBLIC_V4],
+                                   "b.example.com": [PUBLIC_V4]})
+    events = install_client_spy(monkeypatch)
+    nodes, rec = await fetch(
+        "https://a.example.com:8443/feed",
+        [redirect("https://b.example.com:8443/next"), ok_response()])
+    assert [e[0] for e in events] == ["new", "close", "new", "close"]
+    assert [r.headers["Host"] for r in rec.requests] == \
+        ["a.example.com:8443", "b.example.com:8443"]
+
+
+@pytest.mark.asyncio
+async def test_injected_transport_survives_client_rebuilds(monkeypatch):
+    """注入的 fake transport 跨 client 重建仍可用（MockTransport 无
+    连接状态，aclose 为 no-op；生产路径各 authority 自建独立池）"""
+    install_resolver(monkeypatch, {"a.example.com": [PUBLIC_V4],
+                                   "b.example.com": [PUBLIC_V4_ALT]})
+    install_client_spy(monkeypatch)
+    nodes, rec = await fetch(
+        "https://a.example.com/feed",
+        [redirect("https://b.example.com/next"), ok_response()])
+    assert [r.url.host for r in rec.requests] == [PUBLIC_V4, PUBLIC_V4_ALT]
+    assert nodes[0]["server"] == "1.1.1.1"
