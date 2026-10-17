@@ -443,3 +443,138 @@ async def test_get_db_blocks_instead_of_unbound_500(
         assert value is None, "重绑后 get_db 会话必须读到 fresh 库"
     finally:
         await gen.aclose()
+
+
+# ===== Fix Round 1：嵌套受控会话、bind 失败恢复、真实 reader busy =====
+
+
+@pytest.mark.asyncio
+async def test_load_access_settings_reuses_caller_session_under_gate(
+        runtime_db, monkeypatch):
+    """update_access 场景：外层受控会话在途、维护已关闸时，传入 db
+    的 load_access_settings 直接用外层会话完成——不再入闸开第二个
+    受控会话（否则与维护屏障循环等待死锁）。"""
+    from app.security import load_access_settings
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    _pause_upgrade(monkeypatch, entered, release)
+    # 端点真实形态：get_db 会话先在途，维护随后关闸等待其归零
+    async with runtime_db.session() as req_db:
+        reset_task = asyncio.create_task(backups.reset_database())
+        for _ in range(1000):
+            if runtime_db._maintenance:
+                break
+            await asyncio.sleep(0)
+        assert runtime_db._maintenance, "reset 应已关闸等待在途会话归零"
+
+        settings = await asyncio.wait_for(
+            load_access_settings(req_db), timeout=3)
+        assert settings.installation_role in ("work_computer", "home_gateway")
+        assert settings.password_configured is False
+
+        release.set()
+
+    await asyncio.wait_for(reset_task, timeout=10)
+
+
+def _flaky_bind_after_publish(monkeypatch, runtime, fail_times=1):
+    """注入 bind 前 fail_times 次失败；返回计数器。"""
+    real_bind = runtime.bind
+    counter = {"n": 0}
+
+    def flaky_bind(path):
+        counter["n"] += 1
+        if counter["n"] <= fail_times:
+            raise RuntimeError("bind boom")
+        return real_bind(path)
+
+    monkeypatch.setattr(runtime, "bind", flaky_bind)
+    return counter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["restore", "reset"])
+async def test_publish_then_bind_failure_recovers_previous_live(
+        runtime_db, runtime_paths, monkeypatch, operation):
+    """publish 成功但 bind 失败：从 safety 经独立 reserved staging +
+    integrity + 权限 + 原子 replace 恢复旧 live 一致内容并重绑（含仅
+    WAL 已提交记录）；异常仍传播（不伪装成功），屏障随后放行。"""
+    live = runtime_paths.database
+    info = await backups.create_backup("manual") if operation == "restore" else None
+    conn = _write_wal_only_record(live)
+    try:
+        _assert_record_only_in_wal(live)
+        _flaky_bind_after_publish(monkeypatch, runtime_db, fail_times=1)
+
+        if operation == "restore":
+            with pytest.raises(RuntimeError, match="bind boom"):
+                await backups.restore_backup(info.name)
+        else:
+            with pytest.raises(RuntimeError, match="bind boom"):
+                await backups.reset_database()
+
+        # 旧 live 一致内容已恢复：marker 与仅 WAL 已提交记录均可读
+        assert await _system_config_value(runtime_db, "marker") is not None
+        assert sqlite_scalar(live, (
+            "SELECT count(*) FROM system_config WHERE key='wal_only'")) == 1
+        assert sqlite_scalar(live, "PRAGMA integrity_check") == "ok"
+        # runtime 已重绑、屏障已放行
+        assert runtime_db.engine is not None
+        assert runtime_db._maintenance is False
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["restore", "reset"])
+async def test_bind_always_failing_keeps_failure_visible(
+        runtime_db, runtime_paths, monkeypatch, operation):
+    """bind 恒败（恢复/二次 bind 也失败）：原异常保留传播，runtime 保持
+    未绑定——绝不伪装成功。"""
+    info = await backups.create_backup("manual") if operation == "restore" else None
+    _flaky_bind_after_publish(monkeypatch, runtime_db, fail_times=10**6)
+
+    if operation == "restore":
+        with pytest.raises(RuntimeError, match="bind boom"):
+            await backups.restore_backup(info.name)
+    else:
+        with pytest.raises(RuntimeError, match="bind boom"):
+            await backups.reset_database()
+
+    assert runtime_db.engine is None, "恢复失败后不得伪装已绑定"
+    assert runtime_db._maintenance is False, "屏障必须放行（等待无意义）"
+    with pytest.raises(RuntimeError, match="not bound"):
+        async with runtime_db.session() as db:
+            await db.execute(select(SystemConfig).limit(1))
+
+
+@pytest.mark.asyncio
+async def test_real_reader_blocks_checkpoint_fail_closed(
+        runtime_db, runtime_paths):
+    """真实 sqlite3 reader 持读快照（BEGIN + SELECT 未结束）：restore 的
+    TRUNCATE checkpoint 等待 busy 后 fail closed——拒绝清理 sidecar、
+    restore 失败、仅 WAL 已提交记录仍可查（真实并发语义，非 mock）。"""
+    live = runtime_paths.database
+    info = await backups.create_backup("manual")
+    conn = _write_wal_only_record(live)
+    try:
+        _assert_record_only_in_wal(live)
+        reader = sqlite3.connect(f"file:{live}?mode=ro", uri=True)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM system_config").fetchone()
+
+            with pytest.raises(RuntimeError, match="checkpoint"):
+                await backups.restore_backup(info.name)
+
+            # sidecar 未被清理，WAL 已提交记录从 WAL 恢复可读
+            assert (live.parent / (live.name + "-wal")).exists()
+            assert sqlite_scalar(live, (
+                "SELECT count(*) FROM system_config WHERE key='wal_only'")) == 1
+            assert sqlite_scalar(live, "PRAGMA integrity_check") == "ok"
+            # runtime 已重绑原 live（发布链失败路径）
+            assert await _system_config_value(runtime_db, "marker") is not None
+        finally:
+            reader.close()
+    finally:
+        conn.close()

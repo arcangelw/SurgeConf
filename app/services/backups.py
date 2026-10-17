@@ -208,16 +208,39 @@ async def create_backup(reason: str) -> BackupInfo:
     raise RuntimeError("备份已发布但未出现在备份列表中")
 
 
-def _rebind_and_restore_live(paths: RuntimePaths, safety: Path | None) -> None:
-    """失败路径：live 缺失时从安全备份还原，随后重新绑定 live 运行时。"""
+async def _recover_live_and_rebind(paths: RuntimePaths, safety: Path | None,
+                                   staging: Path, *,
+                                   live_replaced: bool) -> None:
+    """维护屏障内失败恢复 + 重绑（restore/reset 全部失败路径共用）。
+
+    - 发布链失败（``live_replaced=False``）：rebuild 的不变量保证 live
+      未被替换且逻辑完整——live 存在即直接重绑（最小动作，不受同一
+      环境故障影响，如外部 reader 持读快照导致 checkpoint busy）；
+      live 缺失且 safety 存在时经 safety 重建后重绑；
+    - publish 成功但 bind 失败（``live_replaced=True``，live 已是新
+      内容）：必须从 safety（dispose 前一致性快照）经独立 reserved
+      staging + integrity + 权限 + 原子 replace 恢复旧 live 一致内容
+      （不直接写 live、不残留旧 sidecar）后重绑；safety 缺失（首次
+      reset 前 live 不存在，无旧内容可恢复）时 live 即最终内容，
+      直接重试重绑。
+
+    恢复/重绑自身失败向上传播（由调用方链回原异常，绝不伪装成功）。
+    """
     # 函数内导入保证测试 patch app.database.database 生效（security.py 先例）
     from app.database import database
+    from app.services.database_migration import (rebuild_from_source,
+                                                 discard_staging)
 
-    if not paths.database.exists() and safety is not None and safety.exists():
-        sqlite_backup(safety, paths.database)
-        harden_private_file(paths.database)
-    if paths.database.exists():
-        database.bind(paths.database)
+    discard_staging(staging)
+    live = paths.database
+    if live_replaced or not live.exists():
+        if safety is not None and safety.exists():
+            await rebuild_from_source(safety, paths)
+        elif not live.exists():
+            raise RuntimeError("live 数据库缺失且无可恢复的安全备份")
+    if not live.exists():
+        raise RuntimeError("live 数据库缺失且无可恢复的安全备份")
+    database.bind(live)
 
 
 async def restore_backup(name: str) -> None:
@@ -227,12 +250,11 @@ async def restore_backup(name: str) -> None:
     整个「安全备份 → dispose → staging → publish → bind/失败恢复」
     在维护屏障内执行：与 API 请求、自动同步及其他维护互斥；在途
     受控会话先归零，新会话阻塞到重绑完成。名字不在 ``BackupInfo.name``
-    白名单内直接拒绝；任何失败都重新绑定原 live 库（缺失时从
-    pre_restore 备份还原）并抛错。
+    白名单内直接拒绝；任何失败（含 bind 失败）都恢复旧 live 一致
+    内容并重绑后抛错——恢复失败时原异常保留传播，绝不伪装成功。
     """
     from app.database import database
-    from app.services.database_migration import (discard_staging,
-                                                 rebuild_from_source,
+    from app.services.database_migration import (rebuild_from_source,
                                                  staging_path)
 
     paths = resolve_runtime_paths()
@@ -251,11 +273,25 @@ async def restore_backup(name: str) -> None:
             # 必须先 await dispose：同步 dispose 无法可靠关闭 aiosqlite 线程连接
             await database.dispose()
             await rebuild_from_source(selected.path, paths)
-        except BaseException:
-            discard_staging(staging)
-            _rebind_and_restore_live(paths, safety)
-            raise
-        database.bind(paths.database)
+        except BaseException as publish_exc:
+            # 发布链失败：live 未被替换（rebuild 不变量），最小恢复
+            try:
+                await _recover_live_and_rebind(paths, safety, staging,
+                                               live_replaced=False)
+            except BaseException as recover_exc:
+                raise publish_exc from recover_exc
+            raise publish_exc
+        try:
+            database.bind(paths.database)
+        except BaseException as bind_exc:
+            # publish 已成功（live 已被替换为新内容）：必须经 safety
+            # 恢复旧 live 一致内容并重绑；恢复失败链回原异常（不伪装成功）
+            try:
+                await _recover_live_and_rebind(paths, safety, staging,
+                                               live_replaced=True)
+            except BaseException as recover_exc:
+                raise bind_exc from recover_exc
+            raise bind_exc
 
 
 async def reset_database() -> None:
@@ -264,16 +300,17 @@ async def reset_database() -> None:
     live——原子替换由发布链完成）→ 重绑。
 
     保留的旧仓库库文件保持原样不动；reset 后 live 只含 fresh 默认
-    数据。任何失败都先从备份副本还原 live 并重新绑定，再向上传播
-    异常，避免运行时停留在"引擎存活但文件已删"或未绑定状态。
+    数据。任何失败（含 bind 失败）都恢复旧 live 一致内容并重绑后再
+    向上传播异常——恢复失败时原异常保留传播，绝不伪装成功。
     """
     from app.database import database
-    from app.services.database_migration import rebuild_from_source
+    from app.services.database_migration import rebuild_from_source, staging_path
 
     paths = resolve_runtime_paths()
     refresh_runtime_permissions(paths)
     async with database.maintenance():
         safety: Path | None = None
+        staging = staging_path(paths)
         try:
             await database.dispose()
             if paths.database.exists():
@@ -281,7 +318,22 @@ async def reset_database() -> None:
             # source=None：全新构建；绝不引用旧仓库库（prepare_database
             # 的 legacy 自动发现会把保留的旧库重新导入，破坏 reset 语义）
             await rebuild_from_source(None, paths)
-        except BaseException:
-            _rebind_and_restore_live(paths, safety)
-            raise
-        database.bind(paths.database)
+        except BaseException as publish_exc:
+            # 发布链失败：live 未被替换（rebuild 不变量），最小恢复
+            try:
+                await _recover_live_and_rebind(paths, safety, staging,
+                                               live_replaced=False)
+            except BaseException as recover_exc:
+                raise publish_exc from recover_exc
+            raise publish_exc
+        try:
+            database.bind(paths.database)
+        except BaseException as bind_exc:
+            # publish 已成功（live 已被替换为新内容）：必须经 safety
+            # 恢复旧 live 一致内容并重绑；恢复失败链回原异常（不伪装成功）
+            try:
+                await _recover_live_and_rebind(paths, safety, staging,
+                                               live_replaced=True)
+            except BaseException as recover_exc:
+                raise bind_exc from recover_exc
+            raise bind_exc

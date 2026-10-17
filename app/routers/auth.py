@@ -123,7 +123,7 @@ async def update_access(body: AccessUpdate, request: Request, response: Response
         return JSONResponse(status_code=403,
                             content={"detail": "CSRF token missing or invalid"})
 
-    settings = await load_access_settings()
+    settings = await load_access_settings(db)
 
     if settings.password_configured:
         if not body.current_password or not await _verify_password_off_loop(

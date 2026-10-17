@@ -301,3 +301,62 @@ sqlite，零真实运行库）：
 - 既有行为保留：备份保留策略（最近 10 份 + protected）、备份
   integrity/0600/原子发布、no-follow 打开、Alembic stamp/upgrade
   语义、启动三路径与失败回滚全部原样通过（141 → 157 项专项无回归）。
+
+### 5. Fix Round 1 — 嵌套受控会话死锁与 bind 失败恢复缺口
+
+Commit: `fix: close database maintenance recovery gaps`
+
+复审发现的两个 Important 问题与修复（均先写失败测试复现）：
+
+**问题 A：`PUT /api/settings/access` 外层会话内二次入闸死锁。** 端点由
+`get_db` 持有受控会话（active=1），内部 `load_access_settings()` 又开
+一个受控会话：维护屏障关闸时形成循环等待——屏障等外层归零，外层等
+内层会话放行（`_sessions_allowed` 只在维护结束后 set），请求挂死。
+
+修复：`load_access_settings(db=None)` 支持复用调用方会话；已持有
+`get_db` 会话的唯一调用方 `update_access` 传入 `db`（同事务读，还消除
+了读写分叉）；无会话调用方（中间件 `main.py`、登录页 `pages.py`、
+`login`、`session_info`）省略参数自行受控获取。生产受控会话全部
+调用点复查：`get_db`（端点入口）、`load_access_settings` 默认分支
+（无外层会话）、`bootstrap` 孤儿清理（启动期）、调度器选择/逐项
+会话（串行不嵌套）——`update_access` 是唯一嵌套点，已消除。
+
+**问题 B：publish 成功后 bind 失败处于恢复盲区。** `database.bind`
+在 try 块外：publish 已替换 live 后 bind 抛错 → 异常直接传播、屏障
+放行，runtime 停留在未绑定（后续请求 500），且 live 已是新内容而
+调用方收到失败——语义撕裂。旧恢复 helper `_rebind_and_restore_live`
+只在 live 缺失时用 `sqlite_backup` **直写** live（无 integrity/权限/
+sidecar 处理），其余路径仅 bind。
+
+修复：`database.bind` 进 try；`_recover_live_and_rebind` 统一全部失败
+路径（发布链失败与 bind 失败同链）：safety 存在时一律从 safety（
+dispose 前一致性快照，唯一确定一致的恢复源）经**独立 reserved
+staging + integrity + 权限 + 原子 replace** 恢复旧 live 一致内容后
+重绑（不直接写 live、不残留旧 sidecar）；safety 缺失（首次 reset 前
+live 不存在）时 live 存在即重绑、缺失即抛错。恢复/二次 bind 失败用
+`raise 原异常 from 恢复异常` 链回（原异常语义保留、绝不伪装成功）。
+维护闸门（maintenance 屏障）覆盖恢复+重绑全程，完成后才放行。
+
+**新增用例（6 个，全部 tmp sqlite）**：
+- 外层受控会话在途 + 屏障已关闸（轮询 `_maintenance` 确定性置位，
+  非计时碰撞）时 `load_access_settings(req_db)` 直接完成（错误实现
+  二次入闸则 3s 超时暴露死锁）；
+- restore/reset × bind 失败一次：旧数据（marker）与仅 WAL 已提交
+  记录（wal_only，前置证明仅在 WAL）均从 safety 恢复可读、
+  integrity ok、runtime 重绑（`engine` 非 None）、屏障放行
+  （`_maintenance` False）、原异常 `bind boom` 传播；
+- restore/reset × bind 恒败：原异常保留传播、runtime 保持未绑定
+  （`engine is None`，不伪装成功）、屏障放行、新会话得到静态
+  `not bound` RuntimeError 而非 AttributeError；
+- **真实 reader busy smoke（非 mock）**：真实 sqlite3 只读连接
+  `BEGIN` + `SELECT` 持读快照 → restore 的 `wal_checkpoint(TRUNCATE)`
+  等待 busy_timeout 后返回 busy → fail closed：restore 失败、
+  `-wal` 未被清理、仅 WAL 已提交记录仍可读、runtime 重绑原 live。
+  证明绕过屏障的外部连接（运维工具/遗留路径）持读时发布链宁可
+  失败也不产生「未 checkpoint 就删 WAL」。
+
+**验证**：RED——死锁测试 `TypeError: load_access_settings() takes 0
+positional arguments`；bind 失败恢复（restore/reset）`RuntimeError:
+database runtime is not bound`（数据未恢复、runtime 不可用）。GREEN——
+维护专项 **21 passed**；数据库/备份/迁移/调度/auth/API 专项 **273
+passed**；全量 pytest **1166 passed**。

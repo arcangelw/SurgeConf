@@ -272,19 +272,31 @@ class AccessSettings:
         return bool(self.password_hash)
 
 
-async def load_access_settings() -> AccessSettings:
+async def load_access_settings(db=None) -> AccessSettings:
     """从 system_config 读取访问设置；缺失/非法键收敛到 fail-closed 默认值。
 
-    函数内导入以保证测试对 ``app.database.database`` 的 patch 生效。
+    已持有受控会话的调用方（如 ``PUT /api/settings/access`` 由 get_db
+    提供会话）必须传入 ``db`` 复用同一会话：维护屏障关闸时外层会话
+    在途，此处若再入闸开第二个受控会话，会与屏障形成循环等待
+    （外层等内层、屏障等外层）。无会话调用方（中间件/页面/登录/
+    会话信息）省略 ``db``，自行经受控入口获取。
     """
     from sqlalchemy import select
     from app.database import database
     from app.models import SystemConfig
 
     keys = ("installation_role", "admin_access", "admin_password_hash")
-    async with database.session() as db:
-        result = await db.execute(select(SystemConfig).where(SystemConfig.key.in_(keys)))
-        values = {row.key: (row.value or "") for row in result.scalars().all()}
+
+    async def _read_values(session):
+        result = await session.execute(
+            select(SystemConfig).where(SystemConfig.key.in_(keys)))
+        return {row.key: (row.value or "") for row in result.scalars().all()}
+
+    if db is not None:
+        values = await _read_values(db)
+    else:
+        async with database.session() as session:
+            values = await _read_values(session)
 
     role = values.get("installation_role") or DEFAULT_INSTALLATION_ROLE
     access = values.get("admin_access") or DEFAULT_ADMIN_ACCESS
