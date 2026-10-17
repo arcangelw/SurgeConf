@@ -35,6 +35,8 @@ SC_PLIST_SWITCHED=0
 SC_WAS_LOADED=0
 SC_SWITCH_TARGET_PLIST=""
 SC_SWITCH_TARGET_CONTROL=""
+SC_ROLLBACK_DONE=0
+SC_COMMITTED=0
 
 # 复位事务状态（每次 sc_install_launchd 开始时调用）
 sc_switch_state_reset() {
@@ -51,15 +53,17 @@ sc_switch_state_reset() {
   SC_WAS_LOADED=0
   SC_SWITCH_TARGET_PLIST=""
   SC_SWITCH_TARGET_CONTROL=""
+  SC_ROLLBACK_DONE=0
+  SC_COMMITTED=0
 }
 
-# 清理候选/备份临时文件（成功路径与回滚完成路径调用；恒返回 0，
-# 不掩盖主操作的失败语义）
+# 清理候选/备份临时文件并清空记录（幂等；成功路径与回滚完成路径调用；
+# 恒返回 0，不掩盖主操作的失败语义。备份恢复失败路径不调用本函数）
 sc_discard_candidates() {
-  if [ -n "$SC_CAND_CONTROL" ]; then rm -f "$SC_CAND_CONTROL" || true; fi
-  if [ -n "$SC_CAND_PLIST" ]; then rm -f "$SC_CAND_PLIST" || true; fi
-  if [ -n "$SC_BAK_CONTROL" ]; then rm -f "$SC_BAK_CONTROL" || true; fi
-  if [ -n "$SC_BAK_PLIST" ]; then rm -f "$SC_BAK_PLIST" || true; fi
+  if [ -n "$SC_CAND_CONTROL" ]; then rm -f "$SC_CAND_CONTROL" || true; SC_CAND_CONTROL=""; fi
+  if [ -n "$SC_CAND_PLIST" ]; then rm -f "$SC_CAND_PLIST" || true; SC_CAND_PLIST=""; fi
+  if [ -n "$SC_BAK_CONTROL" ]; then rm -f "$SC_BAK_CONTROL" || true; SC_BAK_CONTROL=""; fi
+  if [ -n "$SC_BAK_PLIST" ]; then rm -f "$SC_BAK_PLIST" || true; SC_BAK_PLIST=""; fi
   return 0
 }
 
@@ -597,41 +601,90 @@ sc_prepare_launchd() {
   sc_verify_plist_candidate "$SC_CAND_PLIST" || return $?
 }
 
-# 回滚：停止可能已加载的候选 job → 按切换状态机精确恢复旧文件
-# （未动过的不碰、挪走的 rename 回、原先不存在的删除新文件）→
-# 旧 job 原已加载则重新 load 并以精确 list 确认 → 清理候选/备份残留。
-# 回滚 load 也失败：明确返回非零并保留已恢复的旧文件供人工恢复。
+# 回滚（幂等，至多完整执行一次——信号/EXIT/显式路径共用）：
+#   1. 停止可能已加载的候选 job；unload 失败不可忽略——同 label 候选
+#      仍活着时任何自动 load 都不可信，标记回滚不完整；
+#   2. 磁盘恢复以 MOVED 为准：挪进备份的旧文件必须恢复（候选 mv 失败、
+#      尚未 SWITCHED 时同样恢复）；仅当未 MOVED 且候选已就位（原先不
+#      存在）才删除新文件；都未发生则不碰。恢复 mv 失败保留 0600 备份
+#      并输出不含敏感值的人工恢复指令；
+#   3. 旧 job 原已加载且候选确认已停止时，重新 load 并以精确 list 确认；
+#   4. 清理候选/备份残留。
+# 回滚 load 失败或候选存活：明确非零 + 人工指引，绝不伪装成功。
 sc_rollback_launchd() {
+  # 幂等保护：信号 trap / EXIT 兜底 / 显式失败路径至多触发一次完整回滚
+  if [ "${SC_ROLLBACK_DONE:-0}" = 1 ]; then
+    return 0
+  fi
+  SC_ROLLBACK_DONE=1
   local plist="$SC_SWITCH_TARGET_PLIST"
   local control_env="$SC_SWITCH_TARGET_CONTROL"
+  # 无事务目标（trap 于事务外触发）：无事可回滚
+  if [ -z "$plist" ] && [ -z "$control_env" ]; then
+    return 0
+  fi
   local restore_failed=0
+  local candidate_alive=0
 
-  # 停止可能已加载的候选 job（尽力而为，不掩盖恢复阶段错误）
-  launchctl unload "$plist" >/dev/null 2>&1 || true
-
-  if [ "$SC_CONTROL_SWITCHED" = 1 ]; then
-    if [ "$SC_CONTROL_MOVED" = 1 ]; then
-      mv -f "$SC_BAK_CONTROL" "$control_env" || restore_failed=1
-    else
-      rm -f "$control_env" || restore_failed=1
+  # 停止可能已加载的候选 job；unload 失败不可忽略（不可 || true 吞掉），
+  # 但需区分「候选仍加载」与「路径本来未加载」：精确 label 查询仍成功
+  # 才认定候选存活（此时同 label 冲突使任何自动 load 都不可信）
+  if ! launchctl unload "$plist" >/dev/null 2>&1; then
+    if launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1; then
+      candidate_alive=1
     fi
   fi
-  if [ "$SC_PLIST_SWITCHED" = 1 ]; then
-    if [ "$SC_PLIST_MOVED" = 1 ]; then
-      mv -f "$SC_BAK_PLIST" "$plist" || restore_failed=1
+
+  # 磁盘恢复以 MOVED 为准：旧字节在备份里的必须 rename 回正式路径，
+  # 恢复成功后才清空备份记录（对应备份文件已被消耗）
+  if [ "$SC_CONTROL_MOVED" = 1 ]; then
+    if mv -f "$SC_BAK_CONTROL" "$control_env"; then
+      SC_BAK_CONTROL=""
     else
-      rm -f "$plist" || restore_failed=1
+      restore_failed=1
     fi
+  elif [ "$SC_CONTROL_SWITCHED" = 1 ]; then
+    rm -f "$control_env" || restore_failed=1
+  fi
+  if [ "$SC_PLIST_MOVED" = 1 ]; then
+    if mv -f "$SC_BAK_PLIST" "$plist"; then
+      SC_BAK_PLIST=""
+    else
+      restore_failed=1
+    fi
+  elif [ "$SC_PLIST_SWITCHED" = 1 ]; then
+    rm -f "$plist" || restore_failed=1
   fi
   if [ "$restore_failed" = 1 ]; then
-    # 备份保留供人工恢复；未被切换的候选清理（已切换的候选即当前正式文件）
+    # 未被切换的候选清理；已切换的候选即当前正式文件（不动）；
+    # 备份保留 0600 供人工恢复，指令仅含路径、不含任何配置值
     if [ "$SC_CONTROL_SWITCHED" != 1 ] && [ -n "$SC_CAND_CONTROL" ]; then
       rm -f "$SC_CAND_CONTROL" || true
+      SC_CAND_CONTROL=""
     fi
     if [ "$SC_PLIST_SWITCHED" != 1 ] && [ -n "$SC_CAND_PLIST" ]; then
       rm -f "$SC_CAND_PLIST" || true
+      SC_CAND_PLIST=""
     fi
-    echo "回滚失败：备份保留于 ${SC_BAK_CONTROL:-（无）} 与 ${SC_BAK_PLIST:-（无）}，请人工恢复" >&2
+    echo "回滚失败：旧文件备份保留（0600），请人工执行以下恢复命令：" >&2
+    if [ -n "$SC_BAK_CONTROL" ]; then
+      echo "  mv \"$SC_BAK_CONTROL\" \"$control_env\"" >&2
+    fi
+    if [ -n "$SC_BAK_PLIST" ]; then
+      echo "  mv \"$SC_BAK_PLIST\" \"$plist\"" >&2
+    fi
+    return 1
+  fi
+
+  # 候选 job 可能仍处于加载状态：磁盘已恢复，但不得伪称 job 状态恢复，
+  # 也不得在同 label 候选仍活着时假装加载旧 job
+  if [ "$candidate_alive" = 1 ]; then
+    sc_discard_candidates
+    echo "回滚不完整：候选 job 可能仍处于加载状态（unload 失败），磁盘配置已恢复。请人工执行：" >&2
+    echo "  launchctl unload \"$plist\"   # 确认候选 job 完全停止" >&2
+    if [ "$SC_WAS_LOADED" = 1 ]; then
+      echo "  launchctl load \"$plist\"    # 恢复原运行状态" >&2
+    fi
     return 1
   fi
 
@@ -662,71 +715,99 @@ sc_switch_failed() {
   fi
 }
 
+# EXIT 兜底：未提交即自动回滚（幂等）；不调用 exit 以保留原退出码
+sc_exit_rollback() {
+  if [ "${SC_COMMITTED:-0}" != 1 ]; then
+    sc_rollback_launchd || true
+  fi
+  return 0
+}
+
+# 信号兜底：自动回滚（幂等）后以 128+signum 退出（保留非零语义）
+sc_signal_rollback() {
+  sc_rollback_launchd || true
+  exit "$1"
+}
+
 # 阶段二 switch：unload 旧 job → 同目录原子切换文件 → load 候选 → 精确确认。
-# unload 失败：正式文件未动，仅清理候选。load/确认失败：完整回滚。
+# 整个事务在子 shell 内执行：EXIT/HUP/INT/TERM trap 仅在子 shell 生效
+# （不破坏调用方 trap），从装 trap 到 commit 为保护窗口——信号/非正常
+# 退出自动触发一次幂等回滚并保留非零退出码；正常完成清除 trap 并标记
+# 提交。unload 失败：正式文件未动，仅清理候选。load/确认失败：完整回滚。
 sc_switch_launchd() {
   local plist="$1"
-  local control_env
-  control_env="$(sc_control_env_path)"
+  (
+    trap 'sc_exit_rollback' EXIT
+    trap 'sc_signal_rollback 129' HUP
+    trap 'sc_signal_rollback 130' INT
+    trap 'sc_signal_rollback 143' TERM
 
-  if [ "$SC_WAS_LOADED" = 1 ]; then
-    local unload_rc=0
-    launchctl unload "$plist" || unload_rc=$?
-    if [ "$unload_rc" != 0 ]; then
-      sc_discard_candidates
-      return "$unload_rc"
+    local control_env
+    control_env="$(sc_control_env_path)"
+
+    if [ "$SC_WAS_LOADED" = 1 ]; then
+      local unload_rc=0
+      launchctl unload "$plist" || unload_rc=$?
+      if [ "$unload_rc" != 0 ]; then
+        sc_discard_candidates
+        exit "$unload_rc"
+      fi
     fi
-  fi
 
-  # 原子切换（同目录 rename）：旧文件先挪入随机名备份，候选就位
-  if [ "$SC_OLD_CONTROL_EXISTED" = 1 ]; then
-    SC_BAK_CONTROL="$(sc_mktemp_private "$(dirname "$control_env")" ".launchd.env.backup")" || {
-      sc_switch_failed
-      return 1
-    }
-    if mv -f "$control_env" "$SC_BAK_CONTROL"; then
-      SC_CONTROL_MOVED=1
+    # 原子切换（同目录 rename）：旧文件先挪入随机名备份，候选就位
+    if [ "$SC_OLD_CONTROL_EXISTED" = 1 ]; then
+      SC_BAK_CONTROL="$(sc_mktemp_private "$(dirname "$control_env")" ".launchd.env.backup")" || {
+        sc_switch_failed
+        exit 1
+      }
+      if mv -f "$control_env" "$SC_BAK_CONTROL"; then
+        SC_CONTROL_MOVED=1
+      else
+        sc_switch_failed
+        exit 1
+      fi
+    fi
+    if mv -f "$SC_CAND_CONTROL" "$control_env"; then
+      SC_CONTROL_SWITCHED=1
     else
       sc_switch_failed
-      return 1
+      exit 1
     fi
-  fi
-  if mv -f "$SC_CAND_CONTROL" "$control_env"; then
-    SC_CONTROL_SWITCHED=1
-  else
-    sc_switch_failed
-    return 1
-  fi
-  if [ "$SC_OLD_PLIST_EXISTED" = 1 ]; then
-    SC_BAK_PLIST="$(sc_mktemp_private "$(dirname "$plist")" ".com.surgeconf.plist.backup")" || {
-      sc_switch_failed
-      return 1
-    }
-    if mv -f "$plist" "$SC_BAK_PLIST"; then
-      SC_PLIST_MOVED=1
+    if [ "$SC_OLD_PLIST_EXISTED" = 1 ]; then
+      SC_BAK_PLIST="$(sc_mktemp_private "$(dirname "$plist")" ".com.surgeconf.plist.backup")" || {
+        sc_switch_failed
+        exit 1
+      }
+      if mv -f "$plist" "$SC_BAK_PLIST"; then
+        SC_PLIST_MOVED=1
+      else
+        sc_switch_failed
+        exit 1
+      fi
+    fi
+    if mv -f "$SC_CAND_PLIST" "$plist"; then
+      SC_PLIST_SWITCHED=1
     else
       sc_switch_failed
-      return 1
+      exit 1
     fi
-  fi
-  if mv -f "$SC_CAND_PLIST" "$plist"; then
-    SC_PLIST_SWITCHED=1
-  else
-    sc_switch_failed
-    return 1
-  fi
 
-  local load_rc=0
-  launchctl load "$plist" || load_rc=$?
-  if [ "$load_rc" = 0 ]; then
-    launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1 || load_rc=1
-  fi
-  if [ "$load_rc" != 0 ]; then
-    echo "launchctl load 后未能确认 $SC_LAUNCHD_LABEL" >&2
-    sc_switch_failed
-    return 1
-  fi
-  sc_discard_candidates   # 成功：清理切换中消耗剩余的备份/候选残留
+    local load_rc=0
+    launchctl load "$plist" || load_rc=$?
+    if [ "$load_rc" = 0 ]; then
+      launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1 || load_rc=1
+    fi
+    if [ "$load_rc" != 0 ]; then
+      echo "launchctl load 后未能确认 $SC_LAUNCHD_LABEL" >&2
+      sc_switch_failed
+      exit 1
+    fi
+    # 提交：清理备份/候选残留，标记提交并拆除 trap（EXIT 兜底不再触发）
+    sc_discard_candidates
+    SC_COMMITTED=1
+    trap - EXIT HUP INT TERM
+    exit 0
+  )
 }
 
 # 唯一 install/regenerate 流程：enable/start/restart 共用，事务性两阶段。

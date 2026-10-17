@@ -18,6 +18,16 @@ LIB = PROJECT_ROOT / "launchd_lib.sh"
 
 FAKE_LAUNCHCTL = r"""#!/bin/sh
 echo "$@" >> "${FAKE_LAUNCHCTL_LOG:-/dev/null}"
+
+# 一次性信号注入：向父进程（被测 bash）发信号并落标记；仅发一次
+_signal_once() {
+  [ "${FAKE_LAUNCHCTL_SIGNAL:-}" = "$1" ] || return 1
+  [ -f "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/nonexistent}" ] && return 1
+  : > "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/dev/null}" 2>/dev/null
+  kill -"${FAKE_LAUNCHCTL_SIGNAL_KIND:-TERM}" "$PPID" 2>/dev/null
+  return 0
+}
+
 case "$1" in
   list)
     if [ -n "$2" ]; then
@@ -45,24 +55,53 @@ case "$1" in
     exit 0
     ;;
   load)
+    # before-load 注入点：文件已切换、load 未执行——发信号后以 0 退出
+    if _signal_once before-load; then
+      exit 0
+    fi
     # FAKE_LAUNCHCTL_FAIL_ONCE=load：第一次 load exit 1（标记文件），之后恢复
     if [ "${FAKE_LAUNCHCTL_FAIL_ONCE:-}" = "load" ] && \
        [ ! -f "${FAKE_LAUNCHCTL_ONCE_MARK:-/nonexistent}" ]; then
-      : > "${FAKE_LAUNCHCTL_ONCE_MARK:-/dev/null}"
+      : > "${FAKE_LAUNCHCTL_ONCE_MARK:-/nonexistent}"
+      exit 1
+    fi
+    # 加固：plist 必须存在、非 symlink、普通文件且可读，否则拒绝
+    # （不得在旧 plist 缺失/不可读时假成功）；成功时把 loaded 路径记入 state
+    plist_arg="$2"
+    if [ -z "$plist_arg" ] || [ ! -e "$plist_arg" ] || [ -L "$plist_arg" ] || \
+       [ ! -f "$plist_arg" ] || [ ! -r "$plist_arg" ]; then
       exit 1
     fi
     rc="${FAKE_LAUNCHCTL_LOAD_RC:-0}"
-    [ "$rc" = "0" ] && : > "${FAKE_LAUNCHCTL_STATE:-/dev/null}"
+    if [ "$rc" = "0" ]; then
+      printf '%s' "$plist_arg" > "${FAKE_LAUNCHCTL_STATE:-/dev/null}"
+      # after-load 注入点：候选已加载——发信号后以 0 退出
+      if _signal_once after-load; then
+        exit 0
+      fi
+    fi
     exit "$rc"
     ;;
   unload)
+    # FAKE_LAUNCHCTL_UNLOAD_FAIL_AT=N：第 N 次 unload exit 1（一次性计数）
+    if [ -n "${FAKE_LAUNCHCTL_UNLOAD_FAIL_AT:-}" ]; then
+      n=$(($(cat "${FAKE_LAUNCHCTL_UNLOAD_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
+      echo "$n" > "${FAKE_LAUNCHCTL_UNLOAD_COUNT:-/dev/null}" 2>/dev/null
+      [ "$n" = "${FAKE_LAUNCHCTL_UNLOAD_FAIL_AT}" ] && exit 1
+    fi
     if [ "${FAKE_LAUNCHCTL_FAIL_ONCE:-}" = "unload" ] && \
        [ ! -f "${FAKE_LAUNCHCTL_ONCE_MARK:-/nonexistent}" ]; then
-      : > "${FAKE_LAUNCHCTL_ONCE_MARK:-/dev/null}"
+      : > "${FAKE_LAUNCHCTL_ONCE_MARK:-/nonexistent}"
       exit 1
     fi
     rc="${FAKE_LAUNCHCTL_UNLOAD_RC:-0}"
-    [ "$rc" = "0" ] && rm -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}"
+    if [ "$rc" = "0" ]; then
+      rm -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}"
+      # after-unload 注入点：旧 job 已卸载、文件未切换——发信号后以 0 退出
+      if _signal_once after-unload; then
+        exit 0
+      fi
+    fi
     exit "$rc"
     ;;
 esac
@@ -100,8 +139,10 @@ def run_script(args: list[str], tmp_path: Path, extra_env: dict | None = None) -
 def fake_launchctl(tmp_path):
     """PATH 前置 fake launchctl；返回 (调用日志, env 片段, state 文件)
 
-    env 片段额外携带 FAKE_LAUNCHCTL_ONCE_MARK（fail-once 标记）与
-    FAKE_LAUNCHCTL_LIST_COUNT（精确查询计数），供故障注入测试使用。"""
+    env 片段额外携带各类故障注入辅助路径：FAKE_LAUNCHCTL_ONCE_MARK
+    （fail-once 标记）、FAKE_LAUNCHCTL_LIST_COUNT（精确查询计数）、
+    FAKE_LAUNCHCTL_UNLOAD_COUNT（unload 计数）、FAKE_LAUNCHCTL_SIGNAL_MARK
+    （一次性信号注入标记）。"""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "launchctl").write_text(FAKE_LAUNCHCTL)
@@ -111,11 +152,15 @@ def fake_launchctl(tmp_path):
     state = tmp_path / "loaded.marker"
     once_mark = tmp_path / "fail-once.mark"
     list_count = tmp_path / "list-count"
+    unload_count = tmp_path / "unload-count"
+    signal_mark = tmp_path / "signal.mark"
     env = {"PATH": f"{bindir}:/usr/bin:/bin",
            "FAKE_LAUNCHCTL_LOG": str(log),
            "FAKE_LAUNCHCTL_STATE": str(state),
            "FAKE_LAUNCHCTL_ONCE_MARK": str(once_mark),
-           "FAKE_LAUNCHCTL_LIST_COUNT": str(list_count)}
+           "FAKE_LAUNCHCTL_LIST_COUNT": str(list_count),
+           "FAKE_LAUNCHCTL_UNLOAD_COUNT": str(unload_count),
+           "FAKE_LAUNCHCTL_SIGNAL_MARK": str(signal_mark)}
     return log, env, state
 
 
@@ -1083,3 +1128,229 @@ def test_verify_plist_candidate_contract(tmp_path):
         '  if sc_verify_plist_candidate "$f"; then echo "BAD_ACCEPTED:$f"; fi\n'
         'done', tmp_path)
     assert "BAD_ACCEPTED" not in r2.stdout
+
+# ===== Slice 4 Fix Round 1：回滚恢复条件/候选存活/信号保护 =====
+
+
+def test_control_candidate_mv_failure_restores_moved_backup(tmp_path, fake_launchctl):
+    """control 候选 mv 失败（候选意外丢失）：旧文件已挪入备份（MOVED）——
+    回滚必须以 MOVED 为准恢复备份字节，而非仅看 SWITCHED"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_bash(r"""
+        source "$LIB"
+        sc_prepare_launchd "$HOME/Library/LaunchAgents/com.surgeconf.plist" "/proj" \
+            "$HOME/Library/Logs/SurgeConf/surgeconf-console.log" || exit 9
+        rm -f "$SC_CAND_CONTROL"
+        sc_switch_launchd "$HOME/Library/LaunchAgents/com.surgeconf.plist"
+        echo "SWITCH_RC=$?"
+    """, tmp_path, extra_env=env)
+    assert "SWITCH_RC=1" in r.stdout, r.stdout + r.stderr
+    assert control_env.read_bytes() == before_control   # 备份字节恢复
+    assert plist.read_bytes() == before_plist
+    assert state.exists()                                # 旧 job 重新加载
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_plist_candidate_mv_failure_restores_moved_backup(tmp_path, fake_launchctl):
+    """plist 候选 mv 失败：control 已切换（备份消耗）+ plist 备份已挪出——
+    两个文件都必须按 MOVED 精确恢复旧字节"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_bash(r"""
+        source "$LIB"
+        sc_prepare_launchd "$HOME/Library/LaunchAgents/com.surgeconf.plist" "/proj" \
+            "$HOME/Library/Logs/SurgeConf/surgeconf-console.log" || exit 9
+        rm -f "$SC_CAND_PLIST"
+        sc_switch_launchd "$HOME/Library/LaunchAgents/com.surgeconf.plist"
+        echo "SWITCH_RC=$?"
+    """, tmp_path, extra_env=env)
+    assert "SWITCH_RC=1" in r.stdout, r.stdout + r.stderr
+    assert control_env.read_bytes() == before_control
+    assert plist.read_bytes() == before_plist
+    assert state.exists()
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_rollback_restore_mv_failure_preserves_0600_backup(tmp_path, fake_launchctl):
+    """备份恢复 mv 失败（目录只读）：保留 0600 备份并输出不含敏感值的
+    人工恢复指令，非零退出"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    control_env.write_text("SURGE_PORT=61900\n")
+    bak = control_dir / ".launchd.env.backup.test01"
+    bak.write_bytes(control_env.read_bytes())
+    bak.chmod(0o600)
+    control_env.unlink()   # 模拟旧文件已挪走、正式位置空缺
+
+    r = run_bash(rf"""
+        source "$LIB"
+        sc_switch_state_reset
+        SC_SWITCH_TARGET_CONTROL="$HOME/Library/Application Support/SurgeConf/launchd.env"
+        SC_SWITCH_TARGET_PLIST="$HOME/Library/LaunchAgents/com.surgeconf.plist"
+        SC_OLD_CONTROL_EXISTED=1
+        SC_CONTROL_MOVED=1
+        SC_CONTROL_SWITCHED=1
+        SC_BAK_CONTROL="{bak}"
+        chmod 500 "$HOME/Library/Application Support/SurgeConf"
+        sc_rollback_launchd
+        echo "ROLLBACK_RC=$?"
+        chmod 700 "$HOME/Library/Application Support/SurgeConf"
+        [ -f "{bak}" ] && echo BAK_KEPT
+        stat -f "%Lp" "{bak}"
+    """, tmp_path, extra_env=env)
+    out = r.stdout + r.stderr
+    assert "ROLLBACK_RC=1" in r.stdout
+    assert "BAK_KEPT" in r.stdout
+    assert bak.read_bytes() == b"SURGE_PORT=61900\n"
+    assert bak.stat().st_mode & 0o777 == 0o600
+    assert 'mv "' in out                      # 人工恢复指令（仅路径，无敏感值）
+
+
+def test_confirm_failure_with_rollback_unload_failure_is_incomplete(tmp_path, fake_launchctl):
+    """确认失败 + 回滚 unload 失败：磁盘恢复旧文件，但不得伪称 job 已恢复——
+    输出人工 unload+load 指引、明确回滚不完整、非零"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    r = run_script(["restart"], tmp_path, extra_env={**env, "SURGE_PORT": "61900"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    old_control, old_plist = control_env.read_bytes(), plist.read_bytes()
+    log.write_text("")
+
+    r2 = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_LIST_FAIL_AT": "2",      # 第 2 次精确查询（确认）失败
+        "FAKE_LAUNCHCTL_UNLOAD_FAIL_AT": "2",    # 第 2 次 unload（回滚）失败
+    })
+    assert r2.returncode != 0
+    assert control_env.read_bytes() == old_control    # 磁盘已恢复
+    assert plist.read_bytes() == old_plist
+    assert state.exists()                             # 候选 job 可能仍 loaded
+    out = r2.stdout + r2.stderr
+    assert "launchctl unload" in out                  # 人工指引
+    assert "launchctl load" in out
+    assert "不完整" in out
+
+
+def test_enable_rollback_unload_failure_warns_candidate_alive(tmp_path, fake_launchctl):
+    """未加载场景 enable 候选 load 成功但确认失败 + 回滚 unload 失败：
+    磁盘恢复（删除新文件），且明确候选 job 可能仍处于加载状态
+    （人工 unload 指引），非零"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r = run_script(["enable"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_LIST_FAIL_AT": "2",      # 第 2 次精确查询（确认）失败
+        "FAKE_LAUNCHCTL_UNLOAD_FAIL_AT": "1",    # 第 1 次 unload（回滚）失败
+    })
+    assert r.returncode != 0
+    assert not control_env.exists()                   # 磁盘恢复（原先不存在）
+    assert not plist.exists()
+    out = r.stdout + r.stderr
+    assert "launchctl unload" in out
+    assert "仍" in out and "加载" in out
+
+
+def test_signal_after_unload_rolls_back_and_keeps_exit_code(tmp_path, fake_launchctl):
+    """TERM 于 unload 后、文件切换前到达：trap 保护自动回滚（此处无需
+    文件操作）、旧 job 重新加载，退出码保留 143"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_SIGNAL": "after-unload",
+        "FAKE_LAUNCHCTL_SIGNAL_KIND": "TERM",
+    })
+    assert r.returncode == 143
+    assert control_env.read_bytes() == before_control
+    assert plist.read_bytes() == before_plist
+    assert state.exists()                             # 旧 job 重新加载
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_signal_before_load_rolls_back_moved_files(tmp_path, fake_launchctl):
+    """TERM 于旧文件 moved/候选就位后、load 前：trap 回滚按 MOVED 恢复
+    旧字节并重新加载，退出码 143"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_SIGNAL": "before-load",
+    })
+    assert r.returncode == 143
+    assert control_env.read_bytes() == before_control
+    assert plist.read_bytes() == before_plist
+    assert state.exists()
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_signal_after_load_rolls_back_and_reloads(tmp_path, fake_launchctl):
+    """INT 于候选 load 后、确认前：trap 回滚停候选 job、恢复旧文件、
+    重新加载旧 job，退出码 130"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+    control_env.write_text("SURGE_PORT=61900\n")
+    plist.write_bytes(b"OLD-PLIST")
+    before_control = control_env.read_bytes()
+    before_plist = plist.read_bytes()
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_SIGNAL": "after-load",
+        "FAKE_LAUNCHCTL_SIGNAL_KIND": "INT",
+    })
+    assert r.returncode == 130
+    assert control_env.read_bytes() == before_control
+    assert plist.read_bytes() == before_plist
+    assert state.exists()
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+def test_fake_launchctl_load_requires_real_plist(tmp_path, fake_launchctl):
+    """fake launchctl 加固契约：load 缺失 plist 必须拒绝，
+    不得假成功（保证回滚重新 load 的可信度）"""
+    log, env, state = fake_launchctl
+    env["HOME"] = str(tmp_path / "home")
+    r = run_bash('launchctl load "$HOME/missing.plist"\necho "RC=$?"',
+                 tmp_path, extra_env=env)
+    assert "RC=1" in r.stdout
+    assert not state.exists()

@@ -454,3 +454,73 @@ fake launchctl PATH 注入，零真实 launchd 操作）。fake launchctl
   原用例全部通过（106 → 117 项专项无回归）。
 - 开源安全豁免登记随测试文件变更更新（新增行为审查：仅合成占位
   凭据的 dict 索引赋值一处，无真实数据）。
+
+### 6. Fix Round 1 — 回滚恢复条件/候选存活判定/切换窗口信号保护
+
+Commit: `fix: guarantee launchd rollback recovery`
+
+复审发现的四个 Important 问题与修复（均先写失败测试复现）：
+
+**问题 A：回滚恢复条件以 SWITCHED 为准，遗漏「已挪备份、候选 mv
+失败」窗口。** 旧文件 `mv` 进随机名备份（MOVED=1）后候选 mv 失败
+（SWITCHED=0）时，回滚不恢复备份，且 `sc_discard_candidates` 把备份
+一并删除——**旧配置字节永久丢失**。备份恢复 mv 失败时仅输出备份
+路径、无具体恢复指令。
+
+**问题 B：回滚 unload 失败被 `|| true` 吞掉。** 候选 load 成功但
+list 确认失败、回滚 unload 又失败时，同 label 候选可能仍在
+launchd 中，旧实现照常重新 load 旧 job 并输出「已回滚」——伪称
+job 状态恢复；enable 场景（旧未加载）同样不提示候选可能仍 loaded。
+
+**问题 C：切换窗口无信号保护。** 从 unload 到提交之间收到
+TERM/INT，bash 直接死亡，可能停在「旧文件已挪走、候选已就位、
+旧 job 已停」的半切换态（测试实测 TERM 后 returncode -15、
+after-load 场景 INT 完全被吞 rc=0）。
+
+**问题 D：fake launchctl load 对缺失/非普通 plist 假成功。** 回滚
+「重新加载」在旧 plist 不存在时仍被记为成功，掩盖真实 launchd 会
+失败的事实。
+
+修复（`launchd_lib.sh`）：
+
+- **回滚以 MOVED 为准**：挪进备份的旧文件无条件 rename 回正式
+  路径（含候选 mv 失败、尚未 SWITCHED 的窗口）；仅未 MOVED 且候选
+  已就位（原先不存在）才删除新文件；恢复成功才清空备份记录。
+  恢复 mv 失败保留 0600 备份，输出逐条 `mv "<备份>" "<目标>"`
+  人工指令（仅路径，不含任何配置值），明确非零。
+- **候选存活判定**：回滚 unload 失败不可忽略——再用精确
+  `launchctl list <label>` 区分「候选仍加载」（list 成功 → 同
+  label 冲突使自动重载不可信，标记不完整，输出人工 unload+load
+  指引；旧未加载场景亦明确候选可能仍 loaded）与「路径本来未加载」
+  （list 失败 → 视为干净，避免真实 launchctl 对未加载路径报错的
+  保守误报）。
+- **子 shell + trap 事务保护**：`sc_switch_launchd` 主体整体放入
+  `( )`，EXIT/HUP/INT/TERM trap 只在子 shell 生效（不破坏调用方
+  trap）。信号到达 → `sc_signal_rollback` 幂等回滚一次后以
+  128+signum 退出；EXIT 兜底在未提交（`SC_COMMITTED`）时自动幂等
+  回滚且不改写原退出码；正常提交先标记 commit 再拆 trap。
+  幂等性由 `SC_ROLLBACK_DONE` + 状态清零双重保证；无 `eval`
+  （trap 仅调用固定函数名）。
+- **fake launchctl 加固**：load 必须检查 plist 存在/非 symlink/
+  普通文件/可读，否则 exit 1；成功时把 loaded 路径写入 state。
+  新增一次性信号注入（after-unload / before-load / after-load 三
+  个时点，可配 TERM/INT）与 unload 计数失败（`UNLOAD_FAIL_AT=N`）。
+
+**新增用例（9 个，全部 fake launchctl，零真实 launchd）**：
+- control/plist 候选 mv 失败（prepare 后删候选模拟）：备份按 MOVED
+  恢复旧字节、旧 job 重新加载、无残留（旧实现下旧文件丢失，
+  FileNotFound 复现）；
+- 备份恢复 mv 失败（目录 chmod 500）：RC=1、0600 备份保留且字节
+  完整、输出含 `mv "` 人工指令；
+- 确认失败 + 回滚 unload 失败：磁盘恢复但输出「不完整」+ 人工
+  unload/load 指引、非零（旧实现输出「已回滚」伪装完整）；
+- enable（旧未加载）候选 load 成功确认失败 + 回滚 unload 失败：
+  磁盘恢复 + 明确候选可能仍处于加载状态；
+- 信号三时点：TERM@after-unload（无文件操作回滚+重载，rc=143）、
+  TERM@before-load（MOVED 恢复+重载，rc=143）、INT@after-load（停
+  候选+恢复+重载，rc=130）——旧实现实测 -15/0；
+- fake load 加固契约：缺失 plist 拒绝、不建 state。
+
+**验证**：RED——8 failed / 1 passed（fake 加固契约随测试侧先行
+改造直接 GREEN）。GREEN——launchd 专项 **49 passed**；launchd +
+开源安全专项 **126 passed**；全量 pytest **1186 passed**。
