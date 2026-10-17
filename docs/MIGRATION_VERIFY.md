@@ -244,6 +244,7 @@ cd <SurgeConf 目录> && git pull && ./venv/bin/python -m pip install -r require
 | 现象 | 处置 |
 |---|---|
 | claudeusercontent 规则未补齐 | 先看启动日志有无异常栈；仍缺则手动插入（重启服务后生效）：`sqlite3 "$DB" "INSERT INTO custom_rules (profile_id, rule_text, position, sort_order, enabled, comment) VALUES (NULL,'DOMAIN-SUFFIX,claudeusercontent.com,AI服务','pre',95,1,'Claude Artifacts 用户内容 CDN 归组 AI 服务');"`。**托管 STUN 规则不落库，缺失时勿手工插行**——检查该档案 `udp_security_mode`（strict/scoped 才注入）并重新生成 |
+| Surge 增强模式下全部订阅提示 `invalid_content` | Surge 的 Fake IP DNS 会把订阅域名映射到 `198.18.0.0/15`。升级到包含 Fake IP 兼容修复的版本并重启后重新同步：抓取器只允许“原 URL 为域名且解析结果全部属于该范围”的地址组，并继续绑定原始 Host/SNI；直接填写 Fake IP、旧式数字 IP、Fake IP 与公网混合结果及其他非全局地址仍按 SSRF 策略拒绝。同步失败期间旧节点不会被删除，**不要**把订阅 URL 改写为 IP 来绕过校验。 |
 | ipv6-vif 仍旧值 | 迁移只归一 auto/native/off/disable 四个旧值，`always` 视为用户选择不动；确认库值后手工 UPDATE 为 disabled |
 | DNS 未升级 | 迁移只精确匹配旧默认串；该设备曾自定义 DNS 则有意跳过（不算失败），需要新默认时手工改或删键重启 |
 | STUN 仍通 | 确认该档案 UDP 模式非 compatible；确认 Surge 重载了新生成配置（SurgeConf 生成 ≠ Surge 已加载）；确认增强模式开启 |

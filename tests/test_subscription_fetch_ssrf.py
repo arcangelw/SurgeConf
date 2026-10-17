@@ -6,8 +6,8 @@
 
 覆盖：
 - 初始与每跳：loopback/private/link-local/multicast/reserved/IPv4-mapped
-  IPv6/非全局地址整主机拒绝（多 A/AAAA 任一非全局即拒绝）；
-- ``sub.localhost`` 等域名解析回环拒绝；数字/十六进制 IPv4 变体走同一校验；
+  IPv6/非全局地址整主机拒绝；唯一例外是域名全部解析为 Surge Fake IP，
+  Fake IP 字面量或与公网地址混合仍拒绝；
 - 公网 URL 30x 到私网/回环：拒绝且绝不发第二跳请求；
 - 每跳重新解析；连接绑定第一次已验证 IP（DNS rebinding 无窗口）；
 - 多全局地址依序尝试、失败换下一个、绝不退回按域名连接；
@@ -39,6 +39,8 @@ from app.services.subscription import (UnsafeSubscriptionTarget,
 PUBLIC_V4 = "93.184.216.34"
 PUBLIC_V4_ALT = "1.1.1.1"
 PUBLIC_V6 = "2606:2800:220:1:248:1893:25c8:1946"
+# Surge 增强模式 RFC 2544 映射地址（仅 fake transport，不做真实连接）
+SURGE_FAKE_IP = "198.18.0.1"
 HTTPS_URL = "https://sub.example.com/feed"
 
 # RFC1918 私网字面量分段构造：避免源码命中仓库安全扫描规则 6
@@ -224,6 +226,75 @@ async def test_rejects_url_host_resolving_to_non_global(monkeypatch, bad):
     install_resolver(monkeypatch, {"sub.example.com": [bad]})
     with pytest.raises(UnsafeSubscriptionTarget):
         await fetch_subscription(HTTPS_URL, _transport_factory=forbidden_factory())
+
+
+@pytest.mark.asyncio
+async def test_allows_surge_fake_ip_for_domain_under_enhanced_mode(monkeypatch):
+    """Surge 增强模式域名只返回 Fake IP 时仍按原 Host/SNI 拉取订阅。"""
+    install_resolver(monkeypatch, {"sub.example.com": [SURGE_FAKE_IP]})
+
+    nodes, transport = await fetch(HTTPS_URL, [ok_response()])
+
+    assert len(nodes) == 1
+    request = transport.requests[0]
+    assert request.url.host == SURGE_FAKE_IP
+    assert request.headers["Host"] == "sub.example.com"
+    assert request.extensions.get("sni_hostname") == "sub.example.com"
+
+
+@pytest.mark.asyncio
+async def test_rejects_surge_fake_ip_literal(monkeypatch):
+    """Fake IP 兼容仅适用于域名解析结果，URL 直接填写该地址仍拒绝。"""
+    calls = []
+    install_resolver(monkeypatch, {}, calls=calls)
+
+    with pytest.raises(UnsafeSubscriptionTarget):
+        await fetch_subscription(
+            f"https://{SURGE_FAKE_IP}/feed",
+            _transport_factory=forbidden_factory(),
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("numeric_host", [
+    "3323068417",
+    "0xc6120001",
+    "0306.0022.0000.0001",
+])
+async def test_rejects_legacy_numeric_surge_fake_ip_literal(
+        monkeypatch, numeric_host):
+    """旧式数字 IPv4 表示仍是字面量，不能借域名 Fake IP 例外绕过。"""
+    calls = []
+    install_resolver(
+        monkeypatch,
+        {numeric_host: [SURGE_FAKE_IP]},
+        calls=calls,
+    )
+
+    with pytest.raises(UnsafeSubscriptionTarget):
+        await fetch_subscription(
+            f"https://{numeric_host}/feed",
+            _transport_factory=forbidden_factory(),
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_rejects_mixed_surge_fake_ip_and_public_address(monkeypatch):
+    """Fake IP 与公网地址混合时继续 fail closed，防止混合解析绕过。"""
+    install_resolver(
+        monkeypatch,
+        {"sub.example.com": [SURGE_FAKE_IP, PUBLIC_V4]},
+    )
+
+    with pytest.raises(UnsafeSubscriptionTarget):
+        await fetch_subscription(
+            HTTPS_URL,
+            _transport_factory=forbidden_factory(),
+        )
 
 
 @pytest.mark.asyncio

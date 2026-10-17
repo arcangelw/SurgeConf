@@ -280,6 +280,7 @@ def parse_subscription_content(content: str) -> list[dict]:
 
 _FETCH_MAX_REDIRECTS = 5
 _FETCH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_SURGE_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 class UnsafeSubscriptionTarget(ValueError):
@@ -312,6 +313,12 @@ def _is_global_public_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address"
         return False
     return (ip.is_global and not ip.is_multicast
             and not ip.is_reserved and not ip.is_unspecified)
+
+
+def _is_surge_fake_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address"
+                      ) -> bool:
+    """Surge 增强模式用于域名映射的 RFC 2544 Fake IP 地址。"""
+    return ip.version == 4 and ip in _SURGE_FAKE_IP_NETWORK
 
 
 def _parse_fetch_target(u: httpx.URL) -> tuple[str, str, int]:
@@ -360,16 +367,31 @@ async def _resolve_host(host: str, port: int) -> list[str]:
     return [info[4][0] for info in infos]
 
 
-def _validated_connect_addresses(addresses) -> list[str]:
-    """候选地址整体校验：任一非全局 → 整主机拒绝；返回去重连接序列。"""
+def _validated_connect_addresses(
+        addresses, *, allow_surge_fake_ip: bool = False) -> list[str]:
+    """校验并去重连接地址。
+
+    公网地址照常允许。Surge Fake IP 仅允许来自域名解析路径，且不能和
+    公网地址混合；其他任一非全局地址仍使整个主机 fail closed。
+    """
     verified: list[str] = []
+    saw_public = False
+    saw_surge_fake = False
     for raw in addresses:
         try:
             ip = ipaddress.ip_address(raw)
         except ValueError:
             raise UnsafeSubscriptionTarget("不允许的地址: 非公网全局地址")
-        if not _is_global_public_ip(ip):
+        if _is_surge_fake_ip(ip):
+            if not allow_surge_fake_ip:
+                raise UnsafeSubscriptionTarget("不允许的地址: 非公网全局地址")
+            saw_surge_fake = True
+        elif _is_global_public_ip(ip):
+            saw_public = True
+        else:
             raise UnsafeSubscriptionTarget("不允许的地址: 非公网全局地址")
+        if saw_public and saw_surge_fake:
+            raise UnsafeSubscriptionTarget("不允许的地址: 混合解析结果")
         if raw not in verified:
             verified.append(raw)
     if not verified:
@@ -377,17 +399,35 @@ def _validated_connect_addresses(addresses) -> list[str]:
     return verified
 
 
-async def _validated_target_addresses(host: str, port: int) -> list[str]:
-    """host → 可连接的全局地址列表。
-
-    IP 字面量直接校验（不触发 DNS）；域名解析全部 A/AAAA 后整体验证，
-    多地址中任一非全局即整主机拒绝。
-    """
+def _numeric_host_addresses(host: str, port: int) -> list[str] | None:
+    """识别系统支持的全部数字 IP 形式，且绝不触发 DNS。"""
     try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return _validated_connect_addresses(await _resolve_host(host, port))
-    return _validated_connect_addresses([host])
+        infos = socket.getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+            flags=socket.AI_NUMERICHOST,
+        )
+    except socket.gaierror:
+        return None
+    return [info[4][0] for info in infos]
+
+
+async def _validated_target_addresses(host: str, port: int) -> list[str]:
+    """host → 已验证连接地址列表。
+
+    标准及旧式数字 IP 字面量始终执行严格公网校验且不触发 DNS。真正的
+    域名解析通常要求全部为公网地址；Surge 增强模式返回的
+    198.18.0.0/15 Fake IP 可单独成组通过，以便连接继续由 Surge 按
+    原始 Host/SNI 映射，混合结果仍拒绝。
+    """
+    numeric_addresses = _numeric_host_addresses(host, port)
+    if numeric_addresses is not None:
+        return _validated_connect_addresses(numeric_addresses)
+    return _validated_connect_addresses(
+        await _resolve_host(host, port),
+        allow_surge_fake_ip=True,
+    )
 
 
 def _host_header_value(host: str, port: int, scheme: str) -> str:
@@ -436,8 +476,10 @@ async def fetch_subscription(url: str, *,
     - 仅 http/https、禁 userinfo；
     - 单一解析源 httpx.URL（IDN 恒用 IDNA A-label，与 DNS/Host/SNI
       的 ASCII 要求一致）；
-    - 异步解析全部 A/AAAA：任一地址非全局单播公网（loopback/私网/
-      link-local/multicast/reserved/IPv4-mapped IPv6 等）→ 整主机拒绝；
+    - 异步解析全部 A/AAAA：通常要求全部为全局单播公网地址；仅当 URL
+      使用域名且解析结果全部位于 Surge Fake IP 198.18.0.0/15 时允许
+      该组地址，Fake IP 字面量、Fake IP 与公网混合、loopback/私网/
+      link-local/multicast/reserved/IPv4-mapped IPv6 等仍拒绝；
     - 连接只使用已验证 IP，Host header 与 HTTPS SNI 保留原 host；
     - 逻辑 authority（scheme, host, port）变化即关闭旧 client 另建：
       连接池与 cookie 均不跨 authority（同 IP 的不同 host 也不复用
