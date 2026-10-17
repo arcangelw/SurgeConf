@@ -23,7 +23,7 @@ def test_data_dir_override_is_private(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sqlite_connection_pragmas(tmp_path):
-    runtime = DatabaseRuntime.create(tmp_path / "runtime.db")
+    runtime = await DatabaseRuntime.create(tmp_path / "runtime.db")
     async with runtime.engine.connect() as conn:
         assert (await conn.scalar(text("PRAGMA journal_mode"))).lower() == "wal"
         assert await conn.scalar(text("PRAGMA synchronous")) == 1

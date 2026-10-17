@@ -457,11 +457,11 @@ async def test_lifespan_prepares_database_before_binding_live_runtime(tmp_path, 
     original_bind = global_database.bind
     bound = {}
 
-    def checked_bind(path):
+    async def checked_bind(path):
         assert Path(path).exists(), "bind 前必须完成 prepare_database"
         assert sqlite_scalar(Path(path), "SELECT version_num FROM alembic_version") \
             == database_migration._head_revision()
-        original_bind(path)
+        await original_bind(path)
         bound["path"] = Path(path)
 
     monkeypatch.setattr(global_database, "bind", checked_bind)

@@ -325,7 +325,11 @@ async def client(tmp_path, monkeypatch):
     from app.database import DatabaseRuntime, get_db
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
-    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.database_migration import prepare_database
+    paths = resolve_runtime_paths()
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
+    test_runtime = await DatabaseRuntime.create(paths.database)
 
     async def override_get_db():
         async with test_runtime.session_factory() as session:

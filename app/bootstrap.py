@@ -144,7 +144,7 @@ async def lifespan(app: FastAPI):
             result = await prepare_database(
                 paths, PROJECT_ROOT / "data" / "surge_conf.db")
             harden_runtime_permissions(paths)
-            database.bind(paths.database)
+            await database.bind(paths.database)
             log_event("database_ready",
                       counts={"applied_migrations": len(result.applied_migrations)})
             print(f"[启动] 数据库就绪（来源 {result.source}，"

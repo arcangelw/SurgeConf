@@ -112,8 +112,10 @@ def _darwin_statfs_info(path: Path) -> MountInfo:
     """macOS 权威探针：libc ``statfs64`` 读取挂载标志与类型名。
 
     返回码非 0，或缓冲区校验失败（``f_fstypename`` 空/不可解码、
-    ``f_mntonname`` 不以 ``/`` 开头——结构布局不符的典型特征）时抛
-    RuntimeError fail closed，绝不把读错的标志当成权威结果。
+    ``f_mntonname`` 首字节不是 ``/``——结构布局不符的典型特征）时抛
+    RuntimeError fail closed，绝不把读错的标志当成权威结果。挂载点
+    名保持原始字节校验（``/Volumes/数据`` 等 UTF-8 卷名合法，不做
+    ASCII 解码）；文件系统类型名按内核约定为 ASCII。
     """
     buf = _StatFs64()
     rc = _darwin_statfs64(os.fsencode(str(path)), buf)
@@ -122,10 +124,10 @@ def _darwin_statfs_info(path: Path) -> MountInfo:
         raise RuntimeError(f"statfs64 probe failed with errno {errno}")
     try:
         fs_type = buf.f_fstypename.split(b"\0", 1)[0].decode("ascii")
-        mountpoint = buf.f_mntonname.split(b"\0", 1)[0].decode("ascii")
     except UnicodeDecodeError as exc:
         raise RuntimeError("statfs64 returned malformed buffer") from exc
-    if not fs_type or not mountpoint.startswith("/"):
+    mountpoint = buf.f_mntonname.split(b"\0", 1)[0]
+    if not fs_type or not mountpoint.startswith(b"/"):
         raise RuntimeError("statfs64 returned malformed buffer")
     flags = (int(buf.f_flags_high) << 32) | int(buf.f_flags)
     return MountInfo(local=bool(flags & MNT_LOCAL), fs_type=fs_type)
@@ -302,20 +304,23 @@ def _converge_managed_directory(path: Path) -> None:
 def ensure_runtime_directories(paths: RuntimePaths) -> None:
     """创建数据目录（root/backups/exports），逐组件 dirfd walk。
 
-    进入即先做本地挂载守卫（目录不存在时对最近现存父目录探针），
-    全部创建后再对 root 复核——网络文件系统上的 SQLite WAL 会损坏
-    数据库，任何迁移/备份/数据库打开都不得发生。中间祖先（不属于
-    SurgeConf 的共享目录，如 ``~/Library`` 或自定义 data dir 的上层）
-    只验证、绝不修改权限；本次新建的中间组件以 0700 创建；最终
-    managed root/backups/exports 收敛 0700（它们是 SurgeConf 管理
-    目录）。嵌套的新 ``SURGECONF_DATA_DIR`` 全程不 follow symlink。
-    日志目录 ``log_dir`` 由实际启用文件日志的任务负责创建。
+    进入即先做本地挂载守卫（目录不存在时对最近现存父目录探针）；
+    全部创建后对 root/backups/exports **逐一**复核——三者各自可能
+    是独立挂载点（如 backups 单独 mount 到网络卷），任一非本地都
+    fail closed，任何迁移/备份/数据库打开都不得发生。中间祖先
+    （不属于 SurgeConf 的共享目录，如 ``~/Library`` 或自定义 data
+    dir 的上层）只验证、绝不修改权限；本次新建的中间组件以 0700
+    创建；最终 managed root/backups/exports 收敛 0700（它们是
+    SurgeConf 管理目录）。嵌套的新 ``SURGECONF_DATA_DIR`` 全程不
+    follow symlink。日志目录 ``log_dir`` 由实际启用文件日志的任务
+    负责创建，不在数据库挂载守卫范围内。
     """
     assert_local_filesystem(paths.root)
     for directory in (paths.root, paths.backups, paths.exports):
         _ensure_directory_safe(directory)
         _converge_managed_directory(directory)
-    assert_local_filesystem(paths.root)
+    for directory in (paths.root, paths.backups, paths.exports):
+        assert_local_filesystem(directory)
 
 
 def assert_regular_file(path: Path) -> None:

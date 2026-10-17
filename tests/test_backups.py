@@ -45,7 +45,7 @@ async def runtime_db(runtime_paths, monkeypatch):
     from app.services.database_migration import prepare_database
 
     await prepare_database(runtime_paths, runtime_paths.root / "missing.db")
-    runtime = DatabaseRuntime.create(runtime_paths.database)
+    runtime = await DatabaseRuntime.create(runtime_paths.database)
     monkeypatch.setattr("app.database.database", runtime)
     async with runtime.session_factory() as db:
         db.add(SystemConfig(key="marker", value="original"))

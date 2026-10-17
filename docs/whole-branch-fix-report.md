@@ -743,3 +743,58 @@ Commit: `fix: reject unsafe database filesystems`
   1191 + 新增 29）；tmp 本地目录真实 WAL smoke 通过（全新目录
   `SURGECONF_DATA_DIR` 下 prepare→bind 后 raw `PRAGMA journal_mode`
   == wal、-wal/-shm 伴生就位）。
+
+### 5. Fix Round 1 — verified bind 与守卫收口（5 项 Important）
+
+Commit: `fix: verify WAL before publishing database runtime`
+
+Important 1（bind 暴露未验证引用）：`bind` 原为同步「创建 engine 即
+成功」——`session_factory` 在 WAL hook 实际执行前就可被使用，
+`database_ready` 也可能在未验证前记录。改为 **async verified bind**：
+局部创建 engine + 注册 hook 后**实际 checkout 一次连接**（真实
+SQLAlchemy/aiosqlite 路径，非 raw sqlite 旁路），hook 全部成功才原子
+发布 engine/path/session_factory；失败 dispose 局部 engine 并抛错，
+runtime 保持未绑定或维持旧绑定。LSP 迁移全部调用点：
+
+- 生产：`bootstrap.lifespan`、`backups._recover_live_and_rebind`/
+  `restore_backup`/`reset_database`（后两者原本就在 try 内，失败照常
+  走 safety 恢复链）、`database_migration.upgrade_staging`。
+- 测试：`test_runtime_paths`、`test_api_endpoints`（client fixture、
+  standby/order/disposal 三脚手架）、`test_auth`、`test_udp_api`（含
+  rebind 用例转 async）、`test_udp_ui`、`test_profile_tokens`、
+  `test_config_validation`、`test_subscription_status_api`、
+  `test_backups`、`test_database_maintenance`、
+  `test_subscription_scheduler`、`test_local_filesystem_guard`。
+- 附带语义收口：fixture 预建 runtime 改为「`prepare_database` 先行
+  再 create」（verified bind 现在会真实建库文件，空库会干扰 lifespan
+  的 schema 判定——预建完整库与生产链一致）；
+  `test_lifespan_prepares_database_before_binding_live_runtime` 的
+  bind 替身同步改 async。
+
+Important 2（逐目录复核）：`ensure_runtime_directories` 创建后对
+root/backups/exports **逐一** `assert_local_filesystem`（各自可能是
+独立挂载点）；操作级入口经 `refresh_runtime_permissions` 自动覆盖
+目标目录。新增测试：root 本地、backups/exports 模拟网络挂载时拒绝；
+root 本地、backups 为网络挂载时备份在任何 tmp/target 产生前拒绝。
+文档明确日志目录不在数据库挂载守卫范围（不误称数据库保障）。
+
+Important 3（非 ASCII 挂载点）：Darwin `f_mntonname` 不再 ASCII
+解码——原始字节 NUL 截断后验证首字节 `/`（`/Volumes/数据` 等 UTF-8
+卷名合法）；`f_fstypename` 仍按内核约定 ASCII。新增伪造缓冲区测试
+证明非 ASCII 挂载点不再被误拒。
+
+Important 4（cursor 异常关闭）：`apply_connection_pragmas` 全部
+execute/fetchone/后续 PRAGMA 纳入 try/finally——任意步骤异常都恰好
+close 一次。新增参数化测试（execute1/fetchone/execute2/execute4
+四故障点）。
+
+Important 5（平台冒烟边界）：真实 Darwin statfs 冒烟加
+`skipif(sys.platform != "darwin")`；新增 `_probe_mount` 调度单元测试
+（两平台路径均以注入替身验证，绝不触发 Darwin ABI）。
+
+**验证**：guard 专项 **41 passed**（29 + 12 新增/增强）；受影响专项
+（runtime/maintenance/migration/backups/migrations/udp_api/auth/
+profile_tokens/config_validation/status_api/scheduler/udp_ui/
+api_endpoints + guard）**510+56 passed**；全量 pytest **1232 passed**
+（Slice 5 基线 1220 + 新增/增强 12）；tmp 本地目录真实 WAL smoke
+通过（verified bind 后 raw `PRAGMA journal_mode` == wal）。

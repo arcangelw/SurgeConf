@@ -26,7 +26,11 @@ async def secure_app(tmp_path, monkeypatch):
     from app.database import DatabaseRuntime
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
-    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.database_migration import prepare_database
+    paths = resolve_runtime_paths()
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
+    test_runtime = await DatabaseRuntime.create(paths.database)
 
     with patch("app.database.database", test_runtime), \
          patch("app.bootstrap.database", test_runtime):
@@ -652,18 +656,18 @@ async def test_db_statement_error_update_rolls_back(
     assert row["enabled"] is True  # rollback：修改未落库
 
 
-def test_runtime_engine_hides_bound_parameters(tmp_path):
+@pytest.mark.asyncio
+async def test_runtime_engine_hides_bound_parameters(tmp_path):
     """运行时引擎（含 rebind 路径）一律 hide_parameters：异常不带绑定值"""
     from app.database import DatabaseRuntime
 
-    runtime = DatabaseRuntime.create(tmp_path / "hide.db")
+    runtime = await DatabaseRuntime.create(tmp_path / "hide.db")
     try:
         assert runtime.engine.sync_engine.hide_parameters is True
-        runtime.bind(tmp_path / "hide2.db")  # rebind 同一创建点
+        await runtime.bind(tmp_path / "hide2.db")  # rebind 同一创建点
         assert runtime.engine.sync_engine.hide_parameters is True
     finally:
-        import asyncio
-        asyncio.run(runtime.dispose())
+        await runtime.dispose()
 
 
 # ===== Fix round 2：跨记录掩码碰撞（对全库敏感值集合 fail closed） =====

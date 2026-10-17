@@ -26,7 +26,11 @@ async def secure_app(tmp_path, monkeypatch):
     from app.database import DatabaseRuntime
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
-    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.database_migration import prepare_database
+    paths = resolve_runtime_paths()
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
+    test_runtime = await DatabaseRuntime.create(paths.database)
 
     with patch("app.database.database", test_runtime), \
          patch("app.bootstrap.database", test_runtime):

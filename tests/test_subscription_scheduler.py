@@ -96,7 +96,7 @@ class _TrackingDatabase:
 
 @pytest_asyncio.fixture
 async def sched_db(tmp_path):
-    runtime = DatabaseRuntime.create(tmp_path / "sched.sqlite3")
+    runtime = await DatabaseRuntime.create(tmp_path / "sched.sqlite3")
     async with runtime.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     try:

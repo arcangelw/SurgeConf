@@ -34,9 +34,13 @@ async def client(tmp_path, monkeypatch):
     import re
     from app.main import app as fastapi_app
     from app.database import DatabaseRuntime, get_db
+    from app.runtime_paths import resolve_runtime_paths
+    from app.services.database_migration import prepare_database
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
-    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    paths = resolve_runtime_paths()
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
+    test_runtime = await DatabaseRuntime.create(paths.database)
 
     async def override_get_db():
         async with test_runtime.session_factory() as session:
@@ -1088,8 +1092,9 @@ async def test_lifespan_standby_when_lock_held(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
     paths = resolve_runtime_paths()
-    paths.root.mkdir(parents=True, exist_ok=True)
-    test_runtime = DatabaseRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    from app.services.database_migration import prepare_database
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
+    test_runtime = await DatabaseRuntime.create(paths.database)
 
     async def override_get_db():
         async with test_runtime.session_factory() as session:
@@ -1132,7 +1137,8 @@ async def test_lifespan_stops_scheduler_before_db_dispose(tmp_path, monkeypatch)
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
     paths = resolve_runtime_paths()
-    paths.root.mkdir(parents=True, exist_ok=True)
+    from app.services.database_migration import prepare_database
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
 
     class _OrderRecordingRuntime(DatabaseRuntime):
         dispose_seen_scheduler_stopped: bool | None = None
@@ -1143,7 +1149,7 @@ async def test_lifespan_stops_scheduler_before_db_dispose(tmp_path, monkeypatch)
                 sched is not None and sched._task is None)
             await super().dispose()
 
-    test_runtime = _OrderRecordingRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    test_runtime = await _OrderRecordingRuntime.create(paths.database)
 
     async def override_get_db():
         async with test_runtime.session_factory() as session:
@@ -1190,8 +1196,9 @@ async def _drive_lifespan_expecting_failure(tmp_path, monkeypatch, sabotager):
 
     monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
     paths = resolve_runtime_paths()
-    paths.root.mkdir(parents=True, exist_ok=True)
-    test_runtime = _DisposalRecordingRuntime.create(tmp_path / "runtime" / "surge_conf.db")
+    from app.services.database_migration import prepare_database
+    await prepare_database(paths, tmp_path / "missing-legacy.db")
+    test_runtime = await _DisposalRecordingRuntime.create(paths.database)
 
     async def override_get_db():
         async with test_runtime.session_factory() as session:

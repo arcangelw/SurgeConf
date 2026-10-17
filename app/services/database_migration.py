@@ -717,7 +717,7 @@ def _sync_schema(database_path: Path) -> None:
 async def upgrade_staging(staging: Path) -> tuple:
     """staging 上依次完成 schema 推进、种子、业务数据迁移；返回应用的迁移 key"""
     _sync_schema(staging)
-    runtime = DatabaseRuntime.create(staging)
+    runtime = await DatabaseRuntime.create(staging)
     try:
         await seed_defaults(runtime.session_factory)
         applied = await apply_data_migrations(runtime.session_factory)

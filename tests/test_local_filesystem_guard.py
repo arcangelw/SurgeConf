@@ -15,6 +15,8 @@
 import sqlite3
 from pathlib import Path
 
+import sys
+
 import pytest
 
 from app import runtime_paths
@@ -129,6 +131,47 @@ def test_assert_sqlite_database_safe_requires_local_parent(tmp_path, monkeypatch
     assert_sqlite_database_safe(tmp_path / "brand-new.db")
 
 
+
+def test_ensure_rechecks_backups_and_exports_as_independent_mounts(tmp_path, monkeypatch):
+    """root 本地但 backups 是独立网络挂载点：创建后逐一复核拒绝（exports 同理）"""
+    paths = _paths(tmp_path, monkeypatch)
+
+    def selective_probe(directory):
+        directory = Path(directory)
+        if directory in (paths.backups, paths.exports):
+            return MountInfo(local=False, fs_type="nfs")
+        return MountInfo(local=True, fs_type="apfs")
+
+    monkeypatch.setattr(runtime_paths, "_probe_mount", selective_probe)
+    with pytest.raises(RuntimeError, match="non-local"):
+        ensure_runtime_directories(paths)
+    assert paths.root.is_dir() and paths.backups.is_dir(), "复核发生在创建后"
+
+
+def test_backup_rejected_when_backups_dir_is_network_mount(tmp_path, monkeypatch):
+    """root 本地、backups 模拟网络挂载：备份在任何 tmp/target 产生前拒绝"""
+    from app.services.backups import backup_database
+
+    paths = _paths(tmp_path, monkeypatch)
+    ensure_runtime_directories(paths)
+    source = tmp_path / "src.db"
+    conn = sqlite3.connect(source)
+    conn.execute("create table t(x)")
+    conn.commit()
+    conn.close()
+
+    original_probe = runtime_paths._probe_mount
+
+    def selective_probe(directory):
+        if Path(directory) == paths.backups:
+            return MountInfo(local=False, fs_type="smbfs")
+        return original_probe(directory)
+
+    monkeypatch.setattr(runtime_paths, "_probe_mount", selective_probe)
+    with pytest.raises(RuntimeError, match="non-local"):
+        backup_database(source, paths, "test")
+    assert list(paths.backups.iterdir()) == [], "不得残留任何 tmp/半成品"
+
 @pytest.mark.asyncio
 async def test_prepare_database_rejects_before_any_artifact(tmp_path, monkeypatch):
     """非本地挂载：prepare_database（迁移/staging/备份链入口）在产生任何文件前拒绝"""
@@ -163,12 +206,54 @@ def test_backup_database_rejects_before_tmp_artifact(tmp_path, monkeypatch):
 # ===== B. Darwin statfs 探针：结构/返回码校验（真实 API 冒烟 + 故障注入） =====
 
 
+@pytest.mark.skipif(sys.platform != "darwin",
+                    reason="真实 Darwin statfs ABI 冒烟仅在 macOS 执行")
 def test_darwin_probe_reports_local_for_test_tmp(tmp_path):
     """真实 statfs64 探针：pytest tmp 位于本地卷，local=True 且类型名非空"""
     info = runtime_paths._darwin_statfs_info(tmp_path)
     assert isinstance(info.local, bool)
     assert info.fs_type, "fstypename 结构校验应得到非空类型名"
     assert info.local is True
+
+
+def test_probe_dispatch_follows_platform_without_darwin_abi(tmp_path, monkeypatch):
+    """调度单元：darwin 走 statfs 探针、其余走 /proc/mounts——两条路径
+    都以注入替身验证，绝不触发真实 Darwin ABI 调用"""
+    seen = {}
+    monkeypatch.setattr(runtime_paths.sys, "platform", "darwin")
+    def fake_darwin(p):
+        seen["darwin"] = Path(p)
+        return MountInfo(local=True, fs_type="apfs")
+
+    monkeypatch.setattr(runtime_paths, "_darwin_statfs_info", fake_darwin)
+    assert runtime_paths._probe_mount(tmp_path) == \
+        MountInfo(local=True, fs_type="apfs")
+    assert seen["darwin"] == tmp_path
+
+    monkeypatch.setattr(runtime_paths.sys, "platform", "linux")
+    def fake_proc(p):
+        seen["linux"] = Path(p)
+        return MountInfo(local=False, fs_type="nfs")
+
+    monkeypatch.setattr(runtime_paths, "_proc_mounts_info", fake_proc)
+    assert runtime_paths._probe_mount(tmp_path) == \
+        MountInfo(local=False, fs_type="nfs")
+    assert seen["linux"] == tmp_path
+
+
+def test_darwin_probe_accepts_non_ascii_mountpoint(tmp_path, monkeypatch):
+    """挂载点为 UTF-8 卷名（/Volumes/数据）：原始字节首字节 / 校验通过，
+    不得因 ASCII 解码失败而误拒"""
+    def fake_statfs64(path, buf):
+        buf.f_fstypename = b"apfs\x00" + b"\x00" * 11
+        buf.f_mntonname = "/Volumes/数据".encode("utf-8") + b"\x00" * 100
+        buf.f_mntfromname = b"/dev/disk1s1" + b"\x00" * 100
+        buf.f_flags = runtime_paths.MNT_LOCAL
+        return 0
+
+    monkeypatch.setattr(runtime_paths, "_darwin_statfs64", fake_statfs64)
+    info = runtime_paths._darwin_statfs_info(tmp_path)
+    assert info == MountInfo(local=True, fs_type="apfs")
 
 
 def test_darwin_probe_fails_closed_on_error_return_code(tmp_path, monkeypatch):
@@ -284,10 +369,10 @@ def test_wal_reported_mode_normalized_before_acceptance(row):
 
 @pytest.mark.asyncio
 async def test_real_connection_confirms_wal_end_to_end(tmp_path):
-    """真实连接（本地 tmp 卷）：hook 请求后实际模式确为 wal"""
+    """真实连接（本地 tmp 卷）：verified bind 实际触发 hook，实际模式确为 wal"""
     from app.database import DatabaseRuntime
 
-    runtime = DatabaseRuntime.create(tmp_path / "runtime.db")
+    runtime = await DatabaseRuntime.create(tmp_path / "runtime.db")
     try:
         from sqlalchemy import text
         async with runtime.engine.connect() as conn:
@@ -299,6 +384,119 @@ async def test_real_connection_confirms_wal_end_to_end(tmp_path):
         assert raw.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     finally:
         raw.close()
+
+
+class _ExplodingCursor:
+    """在指定步骤抛异常的 cursor：记录 close 次数"""
+
+    def __init__(self, fail_at):
+        self.fail_at = fail_at
+        self.calls = 0
+        self.close_count = 0
+
+    def execute(self, sql):
+        self.calls += 1
+        if self.fail_at == f"execute{self.calls}":
+            raise sqlite3.OperationalError("boom")
+
+    def fetchone(self):
+        if self.fail_at == "fetchone":
+            raise sqlite3.OperationalError("boom")
+        return ("wal",)
+
+    def close(self):
+        self.close_count += 1
+
+
+class _ExplodingConn:
+    def __init__(self, fail_at):
+        self._fail_at = fail_at
+        self.cursor_obj = None
+
+    def cursor(self):
+        self.cursor_obj = _ExplodingCursor(self._fail_at)
+        return self.cursor_obj
+
+
+@pytest.mark.parametrize("fail_at", [
+    "execute1",           # WAL 请求本身失败
+    "fetchone",           # 读取返回值失败
+    "execute2",           # 确认后第一条后续 PRAGMA 失败
+    "execute4",           # 最后一条后续 PRAGMA 失败
+])
+def test_cursor_closed_on_every_exception_path(fail_at):
+    """execute/fetchone/后续 PRAGMA 任意步骤异常：cursor 恰好关闭一次"""
+    from app.database import apply_connection_pragmas
+
+    conn = _ExplodingConn(fail_at)
+    with pytest.raises(sqlite3.OperationalError, match="boom"):
+        apply_connection_pragmas(conn)
+    assert conn.cursor_obj.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_verified_bind_proves_real_hook_execution(tmp_path, monkeypatch):
+    """verified bind 走真实 SQLAlchemy/aiosqlite hook：发布前 hook 实际
+    执行过（记录 wrapper 包裹真实实现，非 raw sqlite 旁路）"""
+    import app.database as database_mod
+
+    calls = []
+    real = database_mod.apply_connection_pragmas
+
+    def recording(dbapi_conn):
+        calls.append(dbapi_conn)
+        real(dbapi_conn)
+
+    monkeypatch.setattr(database_mod, "apply_connection_pragmas", recording)
+    runtime = await database_mod.DatabaseRuntime.create(tmp_path / "a.db")
+    try:
+        assert runtime.engine is not None and runtime.session_factory is not None
+        assert calls, "bind 必须实际建立连接触发 hook（真实路径）"
+    finally:
+        await runtime.dispose()
+
+
+@pytest.mark.asyncio
+async def test_verified_bind_failure_keeps_previous_binding(tmp_path, monkeypatch):
+    """重绑失败：局部 engine 被 dispose，runtime 维持旧绑定且旧会话可用"""
+    import app.database as database_mod
+
+    runtime = database_mod.DatabaseRuntime()
+    await runtime.bind(tmp_path / "old.db")
+    old_engine, old_path, old_factory = runtime.engine, runtime.path, \
+        runtime.session_factory
+
+    def boom(dbapi_conn):
+        raise RuntimeError("WAL downgrade")
+
+    monkeypatch.setattr(database_mod, "apply_connection_pragmas", boom)
+    with pytest.raises(RuntimeError, match="WAL downgrade"):
+        await runtime.bind(tmp_path / "new.db")
+    assert runtime.engine is old_engine, "失败不得替换旧 engine"
+    assert runtime.path == old_path
+    assert runtime.session_factory is old_factory
+    from sqlalchemy import text
+    # 恢复真实 PRAGMA 后旧绑定仍可正常服务（引用未变即旧 engine 存活）
+    monkeypatch.undo()
+    async with runtime.session() as session:
+        await session.execute(text("SELECT 1"))
+    await runtime.dispose()
+
+
+@pytest.mark.asyncio
+async def test_verified_bind_failure_on_fresh_runtime_keeps_unbound(tmp_path, monkeypatch):
+    """全新 runtime 绑定失败：保持未绑定（engine/session_factory 为 None）"""
+    import app.database as database_mod
+
+    def boom(dbapi_conn):
+        raise RuntimeError("WAL downgrade")
+
+    monkeypatch.setattr(database_mod, "apply_connection_pragmas", boom)
+    runtime = database_mod.DatabaseRuntime()
+    with pytest.raises(RuntimeError, match="WAL downgrade"):
+        await runtime.bind(tmp_path / "fresh.db")
+    assert runtime.engine is None
+    assert runtime.session_factory is None
 
 
 # ===== E. raw 备份落盘：DELETE 模式同样验证返回 =====
@@ -383,3 +581,26 @@ async def test_startup_propagates_wal_rejection(tmp_path, monkeypatch):
     root = tmp_path / "runtime"
     assert not (root / "surge_conf.db").exists(), "live 未产生"
     assert not (root / "surge_conf.db.staging").exists(), "staging 已被失败清理"
+
+
+@pytest.mark.asyncio
+async def test_startup_never_logs_database_ready_on_wal_rejection(tmp_path, monkeypatch):
+    """database_ready 只在 verified bind 成功后记录：WAL 拒绝时绝不出现"""
+    from app.main import app as fastapi_app
+    import app.database as database_mod
+    import app.logging_config as logging_config
+
+    monkeypatch.setenv("SURGECONF_DATA_DIR", str(tmp_path / "runtime"))
+    events = []
+    monkeypatch.setattr(logging_config, "log_event",
+                        lambda name, **kw: events.append(name))
+
+    def simulated_downgrade(dbapi_conn):
+        raise RuntimeError("simulated journal_mode downgrade")
+
+    monkeypatch.setattr(database_mod, "apply_connection_pragmas", simulated_downgrade)
+    with pytest.raises(RuntimeError, match="simulated journal_mode downgrade"):
+        async with fastapi_app.router.lifespan_context(fastapi_app):
+            pass
+    assert "database_ready" not in events
+    assert "startup_failed" in events

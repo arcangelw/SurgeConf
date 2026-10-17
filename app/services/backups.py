@@ -250,7 +250,7 @@ async def _recover_live_and_rebind(paths: RuntimePaths, safety: Path | None,
             raise RuntimeError("live 数据库缺失且无可恢复的安全备份")
     if not live.exists():
         raise RuntimeError("live 数据库缺失且无可恢复的安全备份")
-    database.bind(live)
+    await database.bind(live)
 
 
 async def restore_backup(name: str) -> None:
@@ -292,7 +292,7 @@ async def restore_backup(name: str) -> None:
                 raise publish_exc from recover_exc
             raise publish_exc
         try:
-            database.bind(paths.database)
+            await database.bind(paths.database)
         except BaseException as bind_exc:
             # publish 已成功（live 已被替换为新内容）：必须经 safety
             # 恢复旧 live 一致内容并重绑；恢复失败链回原异常（不伪装成功）
@@ -337,7 +337,7 @@ async def reset_database() -> None:
                 raise publish_exc from recover_exc
             raise publish_exc
         try:
-            database.bind(paths.database)
+            await database.bind(paths.database)
         except BaseException as bind_exc:
             # publish 已成功（live 已被替换为新内容）：必须经 safety
             # 恢复旧 live 一致内容并重绑；恢复失败链回原异常（不伪装成功）
