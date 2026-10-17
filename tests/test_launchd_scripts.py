@@ -119,21 +119,46 @@ exit 0
 """
 
 FAKE_MV = r"""#!/bin/sh
-# 透传真 mv；FAKE_MV_SIGNAL=to-backup/to-final 时在「目标匹配的 mv 已完成、
-# 返回前」向父进程（被测 bash）一次性发信号——用于制造 mv 与状态赋值
-# 之间的信号窗口
+# 透传真 mv；FAKE_MV_SIGNAL 精确选择四个切换窗口之一（基于源/目标
+# basename 与 candidate/backup 模式判定）：
+#   control-backup  旧 launchd.env → .launchd.env.backup.*
+#   control-final   .launchd.env.candidate.* → launchd.env
+#   plist-backup    旧 com.surgeconf.plist → .com.surgeconf.plist.backup.*
+#   plist-final     .com.surgeconf.plist.candidate.* → com.surgeconf.plist
+# 命中时在「mv 已完成、返回前」向父进程（入口 PID）一次性发信号，
+# 并把命中标签写入 marker 文件供测试断言注入点确实命中。
 /bin/mv "$@"
 rc=$?
-for last in "$@"; do :; done
-hit=""
-case "${FAKE_MV_SIGNAL:-}" in
-  to-backup)
-    case "$last" in *.backup.*) hit=1 ;; esac ;;
-  to-final)
-    case "$last" in */launchd.env|*/com.surgeconf.plist) hit=1 ;; esac ;;
-esac
-if [ -n "$hit" ] && [ ! -f "${FAKE_MV_SIGNAL_MARK:-/nonexistent}" ]; then
-  : > "${FAKE_MV_SIGNAL_MARK:-/dev/null}" 2>/dev/null
+src=""; dst=""
+for arg in "$@"; do
+  case "$arg" in -*) continue ;; esac
+  if [ -z "$src" ]; then src="$arg"
+  elif [ -z "$dst" ]; then dst="$arg"
+  else src="$dst"; dst="$arg"; fi
+done
+label=""
+if [ -n "$src" ] && [ -n "$dst" ]; then
+  case "${FAKE_MV_SIGNAL:-}" in
+    control-backup)
+      case "$src" in */launchd.env)
+        case "$dst" in *.launchd.env.backup.*) label=control-backup ;; esac ;;
+      esac ;;
+    control-final)
+      case "$src" in *.launchd.env.candidate.*)
+        case "$dst" in */launchd.env) label=control-final ;; esac ;;
+      esac ;;
+    plist-backup)
+      case "$src" in */com.surgeconf.plist)
+        case "$dst" in *.com.surgeconf.plist.backup.*) label=plist-backup ;; esac ;;
+      esac ;;
+    plist-final)
+      case "$src" in *.com.surgeconf.plist.candidate.*)
+        case "$dst" in */com.surgeconf.plist) label=plist-final ;; esac ;;
+      esac ;;
+  esac
+fi
+if [ -n "$label" ] && [ ! -f "${FAKE_MV_SIGNAL_MARK:-/nonexistent}" ]; then
+  printf '%s' "$label" > "${FAKE_MV_SIGNAL_MARK:-/dev/null}" 2>/dev/null
   kill -"${FAKE_MV_SIGNAL_KIND:-TERM}" "$PPID" 2>/dev/null
 fi
 exit "$rc"
@@ -1397,9 +1422,19 @@ def test_fake_launchctl_load_requires_real_plist(tmp_path, fake_launchctl):
 # ===== Slice 4 Fix Round 2：入口 PID trap / mv 窗口原子性 / 提交顺序 =====
 
 
-def test_mv_signal_window_to_backup_is_atomic(tmp_path, fake_launchctl):
-    """TERM 于旧 control→备份 mv 完成后、MOVED 置位前：临界区挂起信号，
-    状态先更新再回滚——唯一备份不被删除，旧字节完整恢复"""
+@pytest.mark.parametrize("window,kind,expected_rc", [
+    ("control-backup", "TERM", 143),
+    ("control-final", "INT", 130),
+    ("plist-backup", "TERM", 143),
+    ("plist-final", "INT", 130),
+])
+def test_mv_signal_window_is_atomic(window, kind, expected_rc, tmp_path, fake_launchctl):
+    """四个切换 rename 窗口（旧文件→备份 / 候选→正式，control 与 plist
+    各一）逐一注入信号于「mv 已完成、状态赋值前」：临界区挂起信号，
+    状态先更新再回滚——注入点命中（marker 标签）、退出非零、唯一备份
+    不被删、旧 control/plist 字节与 loaded 状态恢复、无临时残留。
+    marker 标签同时证明后续窗口（如 control-final 之后的 plist-final）
+    未消耗本次注入。"""
     log, env, state = fake_launchctl
     home, control_dir, control_env, plist, _ = _prepare(tmp_path)
     env["HOME"] = str(home)
@@ -1408,41 +1443,18 @@ def test_mv_signal_window_to_backup_is_atomic(tmp_path, fake_launchctl):
     plist.write_bytes(b"OLD-PLIST")
     before_control = control_env.read_bytes()
     before_plist = plist.read_bytes()
+    mv_signal_mark = tmp_path / "mv-signal.mark"
 
     r = run_script(["restart"], tmp_path, extra_env={
         **env,
-        "FAKE_MV_SIGNAL": "to-backup",
-        "FAKE_MV_SIGNAL_KIND": "TERM",
+        "FAKE_MV_SIGNAL": window,
+        "FAKE_MV_SIGNAL_KIND": kind,
     })
-    assert r.returncode == 143
+    assert r.returncode == expected_rc
+    assert mv_signal_mark.read_text() == window      # 注入点确实命中且仅命中
     assert control_env.read_bytes() == before_control   # 备份恢复，未被删除
     assert plist.read_bytes() == before_plist
     assert state.exists()                                # 旧 job 重新加载
-    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
-    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
-
-
-def test_mv_signal_window_to_final_is_atomic(tmp_path, fake_launchctl):
-    """INT 于候选 plist→正式路径 mv 完成后、SWITCHED 置位前：同上原子
-    回滚，不留半文件"""
-    log, env, state = fake_launchctl
-    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
-    env["HOME"] = str(home)
-    state.write_text("running")
-    control_env.write_text("SURGE_PORT=61900\n")
-    plist.write_bytes(b"OLD-PLIST")
-    before_control = control_env.read_bytes()
-    before_plist = plist.read_bytes()
-
-    r = run_script(["restart"], tmp_path, extra_env={
-        **env,
-        "FAKE_MV_SIGNAL": "to-final",
-        "FAKE_MV_SIGNAL_KIND": "INT",
-    })
-    assert r.returncode == 130
-    assert control_env.read_bytes() == before_control
-    assert plist.read_bytes() == before_plist
-    assert state.exists()
     assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
     assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
 

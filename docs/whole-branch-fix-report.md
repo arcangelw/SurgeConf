@@ -589,3 +589,33 @@ launchd 专项 **52 passed**；launchd + 开源安全专项 **129 passed**；
 全量 pytest **1189 passed**。既有信号三时点测试（after-unload/
 before-load/after-load）在新实现下语义升级为「真实入口 PID 持有
 trap」，无需改动即通过。
+
+### 8. Fix Round 3 — 四个 rename 信号窗口的逐一测试证据
+
+Commit: `test: cover every launchd rename signal window`
+
+Important（测试证据缺口）：fake mv 注入只有粗粒度
+`to-backup`/`to-final`（按目标名模式命中**任一**文件），无法证明
+四个切换 rename 窗口（control/plist × 旧→备份/候选→正式）**各自**
+被信号用例覆盖——尤其 control-final 用例中后续 plist-final 的 mv
+可能误消耗唯一一次注入，使「通过」并不代表该窗口被测到。
+
+修复（纯测试侧，生产实现无改动）：
+
+- **fake mv 精确四标签**：`FAKE_MV_SIGNAL` 改为
+  `control-backup`/`control-final`/`plist-backup`/`plist-final`，
+  基于源/目标 basename 与 candidate/backup 模式双重判定（如
+  control-final = 源匹配 `.launchd.env.candidate.*` 且目标为
+  `launchd.env`）；回滚恢复 mv（备份→正式）不匹配任何标签，不会
+  误触发。命中时把标签写入 marker 文件（一次性 marker 保留）。
+- **参数化四用例**（真实入口 PID 发 TERM/INT 各半，期望 143/130）：
+  各自断言 marker 内容==所选窗口（注入点确实命中且仅命中——同时
+  证明 control-final 之后 plist-final 等后续窗口未消耗注入）、退出
+  非零、唯一备份不被删、旧 control/plist 字节与 loaded 状态恢复、
+  目录无临时残留。
+- 旧 `to-backup`/`to-final` 两用例由参数化版替代；after-confirm
+  提交窗口用例保留。
+
+**验证**：launchd 专项 **54 passed**（含四窗口参数化各一）；
+launchd + 开源安全专项 **131 passed**；全量 pytest **1191 passed**。
+（生产实现零改动——四窗口在 Fix Round 2 的临界区实现下全部原子。）

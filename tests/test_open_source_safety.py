@@ -104,7 +104,7 @@ RULE_EXEMPTIONS: dict[tuple[str, int], str] = {
     # 合成 MITM 夹具：ca-p12 = <合成 base64>（规则 3）
     ("tests/fixtures/synthetic_profile.conf", 3): "6d0b5eeddc4c7670f03b486dd24836e33b155d17c8ea1e4d5952510cb4cfb103",
     # launchd 行为测试：合成凭据赋值断言行（规则 4）
-    ("tests/test_launchd_scripts.py", 4): "6e61b71536a9acb79865d8963cdb61ebf775782762f4702ced5709029e459734",
+    ("tests/test_launchd_scripts.py", 4): "9c5e44f8073b05ffc4cf14dcb2d612ed9396a649a31607b79b4d0f362417489c",
 }
 
 
