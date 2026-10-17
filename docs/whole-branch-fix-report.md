@@ -117,9 +117,10 @@ client 上第一响应的 `Set-Cookie` 会自动进入后续请求（按请求 U
 - **authority（scheme, host, port）变化即 `aclose()` 旧 client 并
   新建**（`_new_fetch_client` 工厂）：连接池与 cookie jar 都不跨
   逻辑 authority；同 authority（如相对路径重定向）复用同一 client。
-  生产路径各 authority 自带独立 `AsyncHTTPTransport`/httpcore 池；
-  测试注入的 `MockTransport` 无连接状态、`aclose` no-op，可跨
-  client 重建复用。
+  生产路径各 authority 自带独立 `AsyncHTTPTransport`/httpcore 池
+  （~~注入的 MockTransport 可跨 client 复用~~——**Fix Round 2 更正**：
+  共享单实例是所有权缺陷，真实 transport 随第一个 client 关闭即失效，
+  详见下节）。
 - **Cookie 显式禁用**：每个响应后 `client.cookies.clear()`——订阅
   抓取无会话语义，即使同 authority 的相对路径跳转也不携带 Cookie。
   （注：`AsyncClient(cookies=NoCookieJar子类)` 方案无效——httpx
@@ -152,3 +153,38 @@ transport 跨重建可用。
 
 验证：SSRF 专项 78 passed；订阅/调度/安全扫描相关 161 passed；
 全量 pytest **1140 passed**。
+
+### 6. Fix Round 2 — transport 所有权与生命周期
+
+Commit: `test: enforce subscription transport ownership`
+
+**问题（Important）**：上一版把单一 `_transport` 实例注入跨
+authority 的所有 client：第一处 `client.aclose()` 即关闭该 transport，
+后续 authority 复用的是已关闭实例——真实 `AsyncHTTPTransport` 在此
+语义下请求会失败；`MockTransport.aclose` 恰好是 no-op 才掩盖了缺陷。
+
+**修复**：私有注入改为 `_transport_factory`——每个逻辑 authority
+建立时调用一次，获得**独立 transport 实例与所有权**（随所属
+client `aclose()` 恰好关闭一次）；同 authority（含多地址重试、相对
+路径跳转）继续复用同实例；生产不注入时每 authority 由 httpx 自建
+独立 `AsyncHTTPTransport`/连接池。同时调整循环顺序为**地址校验先行**
+（被拒的 authority 不消耗 factory 调用、不建 client/transport）。
+
+**测试设施**：新增 `StatefulTransport`（状态型 transport）：关闭后
+请求即失败；记录 instance id 与 close 计数；首次请求把
+`sni_hostname`（http 用 Host）锁定为该实例的模拟握手身份，同实例
+后续不同身份拒绝——错误共享实例会同时被关闭态与身份检查暴露。
+`Recorder` 支持 Response / Exception / BaseException（取消传播）/
+async callable（在途挂起）响应项。全部用例迁移到 factory 注入，
+删除误导用例 `test_injected_transport_survives_client_rebuilds`
+（其断言的"跨重建复用"正是缺陷本身）。
+
+**新增/迁移用例**：a→b 同 IP 使用不同 pool 与握手身份（各自 SNI
+锁定、instance id 不同、Set-Cookie 不跨跳）；关闭后请求失败且下一
+authority 不复用已关闭实例；成功 / 请求异常 / 栈内 CancelledError /
+真实 task.cancel() 四路径下每个已建 transport 恰好 aclose 一次；
+重定向循环 6 跳 6 实例各关闭一次；同 authority 单实例复用；
+`_new_fetch_client(None)` 生产构造参数单元验证。零真实网络。
+
+**验证**：SSRF 专项 **83 passed**；订阅/调度/安全扫描相关 **160
+passed**；全量 pytest **1145 passed**。

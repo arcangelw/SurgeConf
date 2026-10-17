@@ -429,8 +429,7 @@ async def _request_bound_to_addresses(
 
 
 async def fetch_subscription(url: str, *,
-                             _transport: "httpx.AsyncBaseTransport | None" = None
-                             ) -> list[dict]:
+                             _transport_factory=None) -> list[dict]:
     """拉取订阅链接并解析节点（纯网络阶段，不持有任何数据库事务）。
 
     SSRF 防护（初始与每跳重定向均执行）：
@@ -456,14 +455,22 @@ async def fetch_subscription(url: str, *,
     authority: tuple[str, str, int] | None = None
     try:
         for _hop in range(_FETCH_MAX_REDIRECTS + 1):
+            # 地址校验先行：被拒的 authority 不建 client/transport，
+            # 绝不为其打开任何池
+            addresses = await _validated_target_addresses(host, port)
             # authority（scheme, host, port）变化即关闭旧 client 另建：
             # 连接池与 cookie jar 都不跨逻辑 authority（同 authority 复用）
             if authority != (scheme, host, port):
                 if client is not None:
                     await client.aclose()
-                client = _new_fetch_client(_transport)
+                # 每个 authority 获得独立 transport 实例与所有权：
+                # 注入 factory 每 authority 调用一次（同 authority 复用
+                # 同实例）；生产为 None，由 httpx 自建独立
+                # AsyncHTTPTransport/连接池。transport 随所属 client
+                # aclose() 恰好关闭一次，绝不跨 authority 共享。
+                transport = _transport_factory() if _transport_factory else None
+                client = _new_fetch_client(transport)
                 authority = (scheme, host, port)
-            addresses = await _validated_target_addresses(host, port)
             resp = await _request_bound_to_addresses(
                 client, scheme, host, port, logical, addresses)
             # 订阅抓取无会话语义：响应 Set-Cookie 即弃，绝不进入任何
