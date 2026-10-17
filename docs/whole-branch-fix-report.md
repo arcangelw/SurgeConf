@@ -619,3 +619,39 @@ Important（测试证据缺口）：fake mv 注入只有粗粒度
 **验证**：launchd 专项 **54 passed**（含四窗口参数化各一）；
 launchd + 开源安全专项 **131 passed**；全量 pytest **1191 passed**。
 （生产实现零改动——四窗口在 Fix Round 2 的临界区实现下全部原子。）
+
+### 9. Fix Round 4 — final 窗口回滚必须依赖 SWITCHED（首次 enable 场景）
+
+Commit: `test: prove launchd final rename rollback state`
+
+Important（测试证据缺口）：Round 3 的四窗口参数化用例统一预建
+「旧 control/plist + loaded」状态——control-final/plist-final 窗口下
+即使对应 rename 的临界区保护被移除（mutation），信号在 SWITCHED
+赋值前触发回滚时 `MOVED=1`（旧文件已在备份），回滚凭备份照样恢复
+旧字节，用例依旧通过。final 两例无法捕获「临界区移除」这一回归。
+
+修复（纯测试侧，生产实现无改动）：
+
+- **backup 两例保持原场景**（`test_mv_signal_backup_window_restores_moved`）：
+  旧文件 + loaded 状态预建，验证回滚按 MOVED 恢复备份字节——这是
+  backup 窗口的正确断言对象。
+- **final 两例改用首次 enable 场景**（`test_mv_signal_final_window_
+  first_enable_rollback`）：正式 control/plist 原先都不存在、旧 job
+  未加载（无 MOVED 备份可依赖）；fake mv 完成 candidate→final 后、
+  SWITCHED 赋值前向真实入口 PID 发 INT——回滚必须依赖对应 SWITCHED
+  删除刚就位的文件。断言退出码 130、marker 标签精确命中、control/plist
+  最终仍不存在、job 未 loaded、候选/备份目录零残留。
+- 四标签精确选择（marker 断言证明后续窗口未消耗注入）与 after-confirm
+  提交窗口用例保留不变。
+- `tests/test_open_source_safety.py` 的 launchd 文件规则 4 豁免按
+  设计随文件变更重新审查后更新 SHA-256（新增代码仅路径/退出码/marker
+  断言，无凭据赋值）。
+
+**mutation 自检（未提交，仅验证捕获能力）**：逐一临时移除
+`launchd_lib.sh` 中 control-final / plist-final 对应 mv 的
+`sc_critical_enter`/`sc_critical_leave`——对应用例必须红（官方
+`launchd.env` / `com.surgeconf.plist` 残留在正式路径，断言
+`not exists()` 失败），另一用例不受影响；还原临界区后全绿，
+`git diff launchd_lib.sh` 为空。
+
+**131 passed**；全量 pytest **1191 passed**。

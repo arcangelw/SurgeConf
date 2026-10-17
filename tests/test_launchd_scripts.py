@@ -1424,17 +1424,16 @@ def test_fake_launchctl_load_requires_real_plist(tmp_path, fake_launchctl):
 
 @pytest.mark.parametrize("window,kind,expected_rc", [
     ("control-backup", "TERM", 143),
-    ("control-final", "INT", 130),
     ("plist-backup", "TERM", 143),
-    ("plist-final", "INT", 130),
 ])
-def test_mv_signal_window_is_atomic(window, kind, expected_rc, tmp_path, fake_launchctl):
-    """四个切换 rename 窗口（旧文件→备份 / 候选→正式，control 与 plist
-    各一）逐一注入信号于「mv 已完成、状态赋值前」：临界区挂起信号，
-    状态先更新再回滚——注入点命中（marker 标签）、退出非零、唯一备份
-    不被删、旧 control/plist 字节与 loaded 状态恢复、无临时残留。
-    marker 标签同时证明后续窗口（如 control-final 之后的 plist-final）
-    未消耗本次注入。"""
+def test_mv_signal_backup_window_restores_moved(tmp_path, fake_launchctl,
+                                                 window, kind, expected_rc):
+    """备份切换窗口（旧文件→备份，control 与 plist 各一）：旧文件与
+    loaded 状态预建，信号注入于「mv 已完成、MOVED 赋值前」——临界区
+    挂起信号、状态先更新再回滚，按 MOVED 精确恢复旧字节。断言注入点
+    命中（marker 标签）、退出非零、唯一备份不被删、旧 control/plist
+    字节与 loaded 状态恢复、无临时残留。final 两窗口的首次 enable
+    场景见 test_mv_signal_final_window_first_enable_rollback。"""
     log, env, state = fake_launchctl
     home, control_dir, control_env, plist, _ = _prepare(tmp_path)
     env["HOME"] = str(home)
@@ -1457,6 +1456,39 @@ def test_mv_signal_window_is_atomic(window, kind, expected_rc, tmp_path, fake_la
     assert state.exists()                                # 旧 job 重新加载
     assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
     assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+
+
+@pytest.mark.parametrize("window,kind,expected_rc", [
+    ("control-final", "INT", 130),
+    ("plist-final", "INT", 130),
+])
+def test_mv_signal_final_window_first_enable_rollback(window, kind, expected_rc,
+                                                       tmp_path, fake_launchctl):
+    """正式就位窗口（候选→正式，control 与 plist 各一）：首次 enable
+    场景——正式 control/plist 原先都不存在、旧 job 未加载（无 MOVED
+    备份可依赖）。信号注入于「mv 已完成、SWITCHED 赋值前」的真实入口
+    PID：回滚必须依赖对应 SWITCHED 删除刚就位的文件。断言非零退出、
+    注入点精确命中（marker 标签，同时证明其他窗口未消耗注入）、
+    control/plist 最终仍不存在、job 未加载、候选/备份无残留。
+    若对应 rename 的临界区保护被移除，信号将在 SWITCHED 赋值前触发
+    回滚，官方文件残留导致本测试变红。"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+    mv_signal_mark = tmp_path / "mv-signal.mark"
+
+    r = run_script(["enable"], tmp_path, extra_env={
+        **env,
+        "FAKE_MV_SIGNAL": window,
+        "FAKE_MV_SIGNAL_KIND": kind,
+    })
+    assert r.returncode == expected_rc
+    assert mv_signal_mark.read_text() == window      # 注入点确实命中且仅命中
+    assert not control_env.exists()                  # 刚就位文件已按 SWITCHED 删除
+    assert not plist.exists()
+    assert not state.exists()                        # job 从未加载（首次 enable）
+    assert list(control_dir.iterdir()) == []         # 候选/备份无残留
+    assert list(plist.parent.iterdir()) == []
 
 
 def test_signal_after_confirm_respects_commit(tmp_path, fake_launchctl):
