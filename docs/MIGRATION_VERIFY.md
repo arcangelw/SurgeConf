@@ -247,4 +247,6 @@ cd <SurgeConf 目录> && git pull && ./venv/bin/python -m pip install -r require
 | ipv6-vif 仍旧值 | 迁移只归一 auto/native/off/disable 四个旧值，`always` 视为用户选择不动；确认库值后手工 UPDATE 为 disabled |
 | DNS 未升级 | 迁移只精确匹配旧默认串；该设备曾自定义 DNS 则有意跳过（不算失败），需要新默认时手工改或删键重启 |
 | STUN 仍通 | 确认该档案 UDP 模式非 compatible；确认 Surge 重载了新生成配置（SurgeConf 生成 ≠ Surge 已加载）；确认增强模式开启 |
+| 启动即失败且 console 日志含 `non-local filesystem` | 数据目录（`SURGECONF_DATA_DIR`）位于网络卷（NFS/SMB/AFP 等）：SQLite WAL 在网络卷上会静默损坏数据库，服务 fail closed 拒绝启动/迁移/备份。把数据目录改回本地磁盘（`statfs64` 的 `MNT_LOCAL` 权威标志判定）后 `./surgeconf.sh restart`。**不要关闭 WAL 绕过**——WAL 是备份快照、崩溃恢复与迁移原子发布的前提 |
+| console 日志含 `journal_mode=WAL was not honored` | SQLite 对 WAL 请求返回了降级值（delete/memory 等），连接被拒绝：多为数据目录所在卷不支持所需语义（如被替换到网络/受限卷）。确认数据目录在本地卷（`mount | grep <数据目录上级挂载点>`）并重启；持续出现则检查卷的可用空间与文件系统健康度 |
 | 例外进程/设备的 UDP 仍被拒 | 档案是 strict（strict 不输出例外）；或例外被禁用；或网关侧该设备 Fast Path 未关闭；或配置未重载——见 `docs/UDP_COMPATIBILITY.md` 排障表 |

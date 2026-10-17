@@ -655,3 +655,91 @@ Important（测试证据缺口）：Round 3 的四窗口参数化用例统一预
 `git diff launchd_lib.sh` 为空。
 
 **131 passed**；全量 pytest **1191 passed**。
+
+## Slice 5 — 拒绝非本地数据库文件系统 + WAL 生效验证
+
+Commit: `fix: reject unsafe database filesystems`
+
+### 1. Finding
+
+- `runtime_paths` 仅校验绝对路径/symlink/权限：`SURGECONF_DATA_DIR`
+  可指向 SMB/NFS 挂载——SQLite WAL 依赖同卷原子 rename 与 mmap
+  一致性，网络卷上会静默损坏数据库。
+- `DatabaseRuntime.bind` 的 connect hook 执行
+  `PRAGMA journal_mode=WAL` 但**不读取返回值**：SQLite 在网络/受限
+  卷上会静默降级为 delete/memory，服务带着错误日志模式照常启动。
+
+### 2. 修复（生产实现）
+
+**本地挂载守卫（`app/runtime_paths.py`）**：
+
+- 平台探针封装为可注入小函数 `_probe_mount`（monkeypatch 即可模拟
+  任意平台结果）：
+  - **Darwin（产品目标）**：ctypes 定义 `struct statfs64`（LP64 布局，
+    挂载标志为 `f_flags` 低 32 位 + `f_flags_high` 高 32 位拼成的
+    64 位），调 libc `statfs64` 后以内核权威挂载标志 `MNT_LOCAL`
+    （0x1000，sys/mount.h）判定。返回码非 0、`f_fstypename` 空/
+    不可解码、`f_mntonname` 不以 `/` 开头（结构布局不符特征）一律
+    RuntimeError fail closed，绝不把读错的标志当权威结果。
+  - **非 Darwin（测试环境）**：`/proc/mounts` 最长挂载点前缀匹配 +
+    已知网络 fs 类型表（nfs/cifs/smbfs/afpfs/lustre/ceph/sshfs 等），
+    黑名单未列名类型默认本地（文档声明产品目标 macOS，此路径仅
+    服务测试）；读取失败或无覆盖条目同样 fail closed。
+- `assert_local_filesystem(directory)`：目录不存在时对最近现存父目录
+  探针（其挂载即未来目录的挂载）；错误文本只含 fs 类型名，不含
+  绝对路径。
+- 接入点（任何迁移/备份/数据库打开前）：
+  `ensure_runtime_directories` 进入即探针 + 全部创建后对 root 复核
+  （lifespan 与 `prepare_database` 的共同入口）；
+  `refresh_runtime_permissions` 经 ensure 复核（备份/恢复/重置/列表
+  的操作级入口，防启动后被重定向）；`assert_sqlite_database_safe`
+  开头对 `path.parent` 断言（raw/staging/backup 源的最终验证，含主
+  文件尚不存在的全新路径）。symlink/no-follow 原语不动、不回归。
+
+**WAL 生效验证（`app/database.py`）**：
+
+- PRAGMA 逻辑提取为模块级 `apply_connection_pragmas(dbapi_conn)`：
+  请求 `journal_mode=WAL` 后**读取返回值**，严格归一（去空白、转
+  小写）等于 `wal` 才放行；否则关闭 cursor 抛固定 RuntimeError
+  （消息只含 reported 值，不含路径/参数），`synchronous`/
+  `busy_timeout`/`foreign_keys` 绝不带着错误日志模式执行。
+- raw 备份落盘（`backups._finalize_backup_file`）的
+  `journal_mode=DELETE` 请求同样验证返回（备份文件必须独立可读）。
+
+### 3. 测试（RED→GREEN，`tests/test_local_filesystem_guard.py` 29 例）
+
+全用 tmp + monkeypatch 注入，不操作真实挂载：
+
+- **A 挂载守卫**：local flag 缺失在目录/任何文件产生前拒绝且错误
+  不含绝对路径；探针错误 fail closed；缺失目录探针最近现存父
+  （断言探针参数==tmp_path）；创建后复核捕获翻转（断言第二次探针
+  参数==root 且目录已建）；`refresh` 拒绝启动后重定向；
+  `assert_sqlite_database_safe` 对全新路径同样要求本地父目录；
+  `prepare_database`/`backup_database` 拒绝时零产物（无 db/backup/
+  staging/tmp 残留）。
+- **B Darwin 探针**：真实 `statfs64` 冒烟（tmp 在本地 apfs，
+  local=True、类型名非空）；返回码非 0 与全零缓冲区（结构异常）
+  各自 fail closed。
+- **C /proc/mounts 策略**：最长前缀匹配（nfs 下非本地、更深 ext4
+  bind mount 覆盖为本地、smbfs/afpfs 拒绝）；不可读/无覆盖条目
+  fail closed。
+- **D WAL 验证**：fake cursor 参数化模拟返回 delete/memory/
+  truncate/persist/off/None/空行——一律关闭 cursor、RuntimeError、
+  后续 PRAGMA 未执行；`WAL`/` wal ` 归一后放行且四条 PRAGMA 完整；
+  真实连接端到端确认 hook 后实际模式==wal（raw 打开复核）。
+- **E raw 备份**：DELETE 请求返回 wal 时拒绝；正常路径确实收敛为
+  delete 模式。
+- **F startup 传播**：非本地数据目录/WAL 拒绝两种场景 lifespan 均
+  传播失败、`database.engine is None`（不宣告 ready）、零 live/
+  staging 残留。
+
+### 4. 验证与依据
+
+- **API 依据**：`statfs64`/`MNT_LOCAL` 来自 Apple `sys/mount.h`；
+  SQLite `PRAGMA journal_mode` 返回实际生效模式（网络 fs 上请求 WAL
+  会降级返回原模式）是 SQLite 文档化行为。
+- **验证**：新专项 29 passed；runtime/database/migration/backup/
+  migrations 专项 148 passed；全量 pytest **1220 passed**（基线
+  1191 + 新增 29）；tmp 本地目录真实 WAL smoke 通过（全新目录
+  `SURGECONF_DATA_DIR` 下 prepare→bind 后 raw `PRAGMA journal_mode`
+  == wal、-wal/-shm 伴生就位）。

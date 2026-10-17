@@ -46,7 +46,7 @@ Label/数据目录/端口，第二个 `enable` 会覆盖第一个的 plist）。
 
 - **结构化事件日志**由应用内私有轮转 handler 独占写入（5 MB × 3 备份，UTF-8）。launchd/nohup 的 stdout/stderr **只**写 console 回退日志——绝不能把任何 shell 重定向指向 `surgeconf.log`：轮转 rename 后旧文件描述符会继续写已轮换的 inode，破坏日志完整性。
 - console 日志包含启动 banner 与框架级 stderr，**不**包含 HTTP access log（服务以 `--no-access-log` 启动）。它可能含库栈信息，**禁止直接分享原文**，外发前人工复核并只摘取与问题相关的行。
-- 备份与导出经管理界面「备份」页或 API 进行，产物落在数据目录的 `backups/`、`exports/` 下（0600）。把数据目录整体拷贝（含 `surge_conf.db`）即完成冷备份；恢复用界面的恢复功能，不要在服务运行时直接覆盖数据库文件。
+- **数据目录必须位于本地卷**：`SURGECONF_DATA_DIR` 指向网络文件系统（NFS/SMB/AFP 等未置 `MNT_LOCAL` 的挂载）时服务**拒绝启动**（fail closed），备份/恢复/重置同样在操作前拒绝——SQLite WAL 依赖同卷原子 rename 与 mmap 一致性，网络卷会静默损坏数据库。判定依据是 macOS `statfs64` 返回的内核权威挂载标志 `MNT_LOCAL`（非路径前缀或类型名猜测）：目录不存在时检查最近现存父目录、创建后复核。启动失败/操作被拒且 console 日志出现 `runtime directory is on a non-local filesystem (type '…')` 时，把数据目录改回本地磁盘后重启即可。**不要尝试关闭 WAL 来绕过**：WAL 是备份一致性（页级快照）、崩溃恢复与迁移原子发布的前提，绕过等于放弃数据库完整性保证。产品目标平台为 macOS；Linux 等非 Darwin 环境仅用于测试，以 `/proc/mounts` 已知网络文件系统类型表做同类拒绝（黑名单未列名类型默认本地，仅测试环境语义）。
 
 ### 结构化事件行格式
 

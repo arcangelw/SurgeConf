@@ -26,6 +26,31 @@ from sqlalchemy.ext.asyncio import (AsyncEngine, AsyncSession,
 from sqlalchemy.orm import DeclarativeBase
 
 
+def apply_connection_pragmas(dbapi_conn) -> None:
+    """每连接安全 PRAGMA：先请求 WAL 并验证实际生效，再执行其余。
+
+    ``PRAGMA journal_mode=WAL`` 在网络文件系统/受限卷上会被 SQLite
+    静默降级（返回 delete/memory 等）——必须读取返回值并归一（去
+    空白、转小写）等于 ``wal`` 才放行；否则关闭 cursor 抛固定
+    RuntimeError（消息不含路径与参数），后续 PRAGMA（synchronous/
+    busy_timeout/foreign_keys）绝不带着错误日志模式执行。
+    """
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    row = cursor.fetchone()
+    reported = row[0] if row else None
+    mode = str(reported).strip().lower() if reported is not None else ""
+    if mode != "wal":
+        cursor.close()
+        raise RuntimeError(
+            "sqlite journal_mode=WAL was not honored "
+            f"(reported: {reported!r}); refusing this connection")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -71,12 +96,7 @@ class DatabaseRuntime:
 
         @event.listens_for(engine.sync_engine, "connect")
         def _apply_pragma(dbapi_conn, _connection_record):
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
+            apply_connection_pragmas(dbapi_conn)
 
         self.engine = engine
         self.path = path

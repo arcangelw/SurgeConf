@@ -104,10 +104,20 @@ def unique_path(directory: Path, base: str, suffix: str) -> Path:
 
 
 def _finalize_backup_file(tmp: Path) -> None:
-    """落盘为普通（非 WAL）模式并做完整性校验，保证备份文件独立可读。"""
+    """落盘为普通（非 WAL）模式并做完整性校验，保证备份文件独立可读。
+
+    ``journal_mode=DELETE`` 请求同样验证实际返回（归一后等于
+    delete），否则拒绝发布该备份（消息不含路径）。
+    """
     conn = sqlite3.connect(tmp)
     try:
-        conn.execute("PRAGMA journal_mode=DELETE")
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        reported = row[0] if row else None
+        mode = str(reported).strip().lower() if reported is not None else ""
+        if mode != "delete":
+            raise RuntimeError(
+                "backup journal_mode=DELETE was not honored "
+                f"(reported: {reported!r}); refusing this backup")
         result = conn.execute("PRAGMA integrity_check").fetchone()
         conn.commit()
     finally:

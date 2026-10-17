@@ -8,8 +8,11 @@ no-follow 原则：目录创建/验证逐层 ``O_DIRECTORY|O_NOFOLLOW``；文件
 ``O_CREAT|O_EXCL|O_NOFOLLOW`` 原子保留为普通文件后再交给 SQLite。
 """
 
+import ctypes
+import ctypes.util
 import os
 import stat as stat_mod
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +45,192 @@ def resolve_runtime_paths(home: Path | None = None) -> RuntimePaths:
     return RuntimePaths(root, root / "surge_conf.db", root / "backups",
                         root / "exports", root / "session.key",
                         log_dir, log_dir / "surgeconf.log")
+
+# ===== 本地文件系统守卫（Fix Slice 5） =====
+
+# Darwin sys/mount.h：MNT_LOCAL 是内核维护的权威挂载属性——置位表示
+# 数据存储在本机（apfs/hfs+/msdos 等），清零表示网络/远程文件系统
+# （nfs/smbfs/afpfs/lustre 等）。SQLite WAL 依赖同卷原子 rename 与
+# mmap 一致性，网络卷上会静默损坏数据库，必须在任何迁移/备份/数据库
+# 打开前拒绝。
+MNT_LOCAL = 0x00001000
+
+
+@dataclass(frozen=True)
+class MountInfo:
+    """平台挂载探针结果；``local=False`` 一律 fail closed。"""
+
+    local: bool
+    fs_type: str
+
+
+class _StatFs64(ctypes.Structure):
+    """Darwin ``sys/mount.h`` 的 ``struct statfs64``（LP64 布局）。
+
+    仅 Darwin 探针使用；挂载标志实际为 ``f_flags``（低 32 位）与
+    ``f_flags_high``（高 32 位）拼成的 64 位。
+    """
+
+    _fields_ = [
+        ("f_bsize", ctypes.c_uint32),
+        ("f_iosize", ctypes.c_int32),
+        ("f_blocks", ctypes.c_uint64),
+        ("f_bfree", ctypes.c_uint64),
+        ("f_bavail", ctypes.c_uint64),
+        ("f_files", ctypes.c_uint64),
+        ("f_ffree", ctypes.c_uint64),
+        ("f_fsid", ctypes.c_uint32 * 2),
+        ("f_owner", ctypes.c_uint32),
+        ("f_type", ctypes.c_uint32),
+        ("f_flags", ctypes.c_uint32),
+        ("f_fssubtype", ctypes.c_uint32),
+        ("f_fstypename", ctypes.c_char * 16),
+        ("f_mntonname", ctypes.c_char * 1024),
+        ("f_mntfromname", ctypes.c_char * 1024),
+        ("f_flags_high", ctypes.c_uint32),
+        ("f_reserved", ctypes.c_uint32 * 7),
+        ("f_reserved2", ctypes.c_uint64 * 8),
+    ]
+
+
+_statfs64_call = None
+
+
+def _darwin_statfs64(path: bytes, buf: "_StatFs64") -> int:
+    """``statfs64(path, buf)`` → 返回码；libc 符号惰性解析并进程内缓存。"""
+    global _statfs64_call
+    if _statfs64_call is None:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        statfs64 = libc.statfs64
+        statfs64.restype = ctypes.c_int
+        statfs64.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        _statfs64_call = statfs64
+    return _statfs64_call(path, ctypes.byref(buf))
+
+
+def _darwin_statfs_info(path: Path) -> MountInfo:
+    """macOS 权威探针：libc ``statfs64`` 读取挂载标志与类型名。
+
+    返回码非 0，或缓冲区校验失败（``f_fstypename`` 空/不可解码、
+    ``f_mntonname`` 不以 ``/`` 开头——结构布局不符的典型特征）时抛
+    RuntimeError fail closed，绝不把读错的标志当成权威结果。
+    """
+    buf = _StatFs64()
+    rc = _darwin_statfs64(os.fsencode(str(path)), buf)
+    if rc != 0:
+        errno = ctypes.get_errno()
+        raise RuntimeError(f"statfs64 probe failed with errno {errno}")
+    try:
+        fs_type = buf.f_fstypename.split(b"\0", 1)[0].decode("ascii")
+        mountpoint = buf.f_mntonname.split(b"\0", 1)[0].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("statfs64 returned malformed buffer") from exc
+    if not fs_type or not mountpoint.startswith("/"):
+        raise RuntimeError("statfs64 returned malformed buffer")
+    flags = (int(buf.f_flags_high) << 32) | int(buf.f_flags)
+    return MountInfo(local=bool(flags & MNT_LOCAL), fs_type=fs_type)
+
+
+# 产品目标是 macOS（权威判定走 statfs64 的 MNT_LOCAL）；非 Darwin 的
+# Linux 测试/CI 环境没有该 API，退化为明确策略：/proc/mounts 最长
+# 前缀匹配 + 已知网络文件系统类型表。黑名单未列名的类型默认本地——
+# 与 Darwin 权威路径不同，仅服务于测试环境（docs/RUNTIME_OPERATIONS.md
+# 声明产品目标平台）。
+_PROC_MOUNTS = "/proc/mounts"
+
+KNOWN_NETWORK_FS_TYPES = frozenset({
+    "nfs", "nfs4", "cifs", "smbfs", "afpfs", "afp", "ncpfs", "sshfs",
+    "fuse.sshfs", "lustre", "ceph", "glusterfs", "gfs", "gfs2", "9p",
+    "vboxsf", "prl_fs", "vmhgfs", "virtiofs", "coda",
+})
+
+
+def _unescape_mount_spec(spec: str) -> str:
+    """解码 /proc/mounts 字段的八进制转义（空格 ``\\040`` 等）。"""
+    out = []
+    i = 0
+    n = len(spec)
+    while i < n:
+        ch = spec[i]
+        if ch == "\\" and i + 3 < n and all(
+                c in "01234567" for c in spec[i + 1:i + 4]):
+            out.append(chr(int(spec[i + 1:i + 4], 8)))
+            i += 4
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _proc_mounts_info(path: Path) -> MountInfo:
+    """非 Darwin 策略：最长挂载点前缀匹配 + 已知网络 fs 类型表。
+
+    读取失败（OSError/编码异常）或没有任何条目覆盖目标（结构异常）
+    都 fail closed；命中已知网络类型判非本地。
+    """
+    try:
+        content = Path(_PROC_MOUNTS).read_text(encoding="ascii",
+                                               errors="strict")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "cannot read /proc/mounts to classify filesystem") from exc
+    target = os.path.realpath(str(path))
+    best_len = -1
+    fs_type = None
+    for line in content.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mountpoint = _unescape_mount_spec(fields[1])
+        if target != mountpoint and not target.startswith(
+                mountpoint.rstrip("/") + "/"):
+            continue
+        if len(mountpoint) > best_len:
+            best_len = len(mountpoint)
+            fs_type = fields[2]
+    if fs_type is None:
+        raise RuntimeError(
+            "no /proc/mounts entry covers the runtime directory")
+    return MountInfo(local=fs_type not in KNOWN_NETWORK_FS_TYPES,
+                     fs_type=fs_type)
+
+
+def _probe_mount(path: Path) -> MountInfo:
+    """平台探针调度（测试注入点：monkeypatch 本函数模拟任意平台结果）。
+
+    Darwin → ``statfs64`` 的 ``MNT_LOCAL`` 权威标志；其余平台 →
+    ``/proc/mounts`` 已知网络 fs 类型表。
+    """
+    if sys.platform == "darwin":
+        return _darwin_statfs_info(path)
+    return _proc_mounts_info(path)
+
+
+def _nearest_existing_directory(path: Path) -> Path:
+    """目录不存在时向上取最近现存祖先目录（探针作用对象）。"""
+    current = Path(path)
+    while not current.is_dir():
+        parent = current.parent
+        if parent == current:
+            return current
+        current = parent
+    return current
+
+
+def assert_local_filesystem(directory: Path) -> None:
+    """断言目录位于本地文件系统（fail closed，错误不含绝对路径）。
+
+    目录不存在时对最近现存父目录探针（该父目录的挂载即未来目录的
+    挂载）；创建方负责创建后复核。探针自身错误同样传播拒绝。
+    """
+    directory = Path(directory)
+    if not directory.is_absolute():
+        raise RuntimeError(f"runtime directory must be absolute: {directory}")
+    info = _probe_mount(_nearest_existing_directory(directory))
+    if not info.local:
+        raise RuntimeError(
+            "runtime directory is on a non-local filesystem "
+            f"(type {info.fs_type!r}); WAL requires local storage")
 
 
 # ===== no-follow 原语 =====
@@ -113,15 +302,20 @@ def _converge_managed_directory(path: Path) -> None:
 def ensure_runtime_directories(paths: RuntimePaths) -> None:
     """创建数据目录（root/backups/exports），逐组件 dirfd walk。
 
-    中间祖先（不属于 SurgeConf 的共享目录，如 ``~/Library`` 或自定义
-    data dir 的上层）只验证、绝不修改权限；本次新建的中间组件以 0700
-    创建；最终 managed root/backups/exports 收敛 0700（它们是 SurgeConf
-    管理目录）。嵌套的新 ``SURGECONF_DATA_DIR`` 全程不 follow symlink。
+    进入即先做本地挂载守卫（目录不存在时对最近现存父目录探针），
+    全部创建后再对 root 复核——网络文件系统上的 SQLite WAL 会损坏
+    数据库，任何迁移/备份/数据库打开都不得发生。中间祖先（不属于
+    SurgeConf 的共享目录，如 ``~/Library`` 或自定义 data dir 的上层）
+    只验证、绝不修改权限；本次新建的中间组件以 0700 创建；最终
+    managed root/backups/exports 收敛 0700（它们是 SurgeConf 管理
+    目录）。嵌套的新 ``SURGECONF_DATA_DIR`` 全程不 follow symlink。
     日志目录 ``log_dir`` 由实际启用文件日志的任务负责创建。
     """
+    assert_local_filesystem(paths.root)
     for directory in (paths.root, paths.backups, paths.exports):
         _ensure_directory_safe(directory)
         _converge_managed_directory(directory)
+    assert_local_filesystem(paths.root)
 
 
 def assert_regular_file(path: Path) -> None:
@@ -153,12 +347,14 @@ def assert_parent_chain(path: Path) -> None:
 
 
 def assert_sqlite_database_safe(path: Path) -> None:
-    """SQLite 数据库打开前校验：最终普通文件、父链无 symlink、
-    现存 -wal/-shm 伴生文件同样为普通文件。
+    """SQLite 数据库打开前校验：父目录位于本地挂载（raw/staging/
+    backup 源的最终验证——含主文件尚不存在的全新路径）、最终普通
+    文件、父链无 symlink、现存 -wal/-shm 伴生文件同样为普通文件。
 
     缺失的 sidecar 可由 SQLite 在已验证的安全 parent 下自行创建；
     主文件本身缺失时放行（新建路径由调用方的 ensure/占位流程负责）。
     """
+    assert_local_filesystem(Path(path).parent)
     import os as _os
     if not _os.path.lexists(path):
         return
@@ -216,7 +412,8 @@ def validate_reserved_empty_file(path: Path) -> None:
 
 
 def refresh_runtime_permissions(paths: RuntimePaths) -> None:
-    """操作级安全入口：安全重建目录结构并收敛全部运行产物权限。
+    """操作级安全入口：复核数据目录仍位于本地挂载（防启动后被重定向
+    到网络卷），再安全重建目录结构并收敛全部运行产物权限。
 
     备份/恢复/重置/导出在每次操作前调用，防止启动后目录被替换。
     """
