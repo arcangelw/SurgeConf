@@ -38,6 +38,7 @@ SC_ROLLBACK_DONE=0
 SC_COMMITTED=0
 SC_PENDING_SIGNAL=""
 SC_LIST_PROBE=""
+SC_READY_PID=""
 
 # 复位事务状态（每次 sc_install_launchd 开始时调用）
 sc_switch_state_reset() {
@@ -58,6 +59,7 @@ sc_switch_state_reset() {
   SC_COMMITTED=0
   SC_PENDING_SIGNAL=""
   SC_LIST_PROBE=""
+  SC_READY_PID=""
 }
 
 # 清理候选/备份临时文件并清空记录（幂等；成功路径与回滚完成路径调用；
@@ -770,23 +772,91 @@ sc_critical_leave() {
   fi
 }
 
-# 单次精确 label 查询：结果重定向到探测文件后以 read 解析，设置
-# SC_LIST_PID 为首个 tab 字段（数字 PID 或 "-" 等），返回码表达加载
-# 状态。绝不用命令替换捕获 launchctl 输出——bash 命令替换执行期间
-# 收到信号会污染退出码（128+signum）且 trap 赋值丢失（在替换子
-# 上下文执行），信号保护语义会被破坏；直接重定向则 trap 在当前
-# shell 正确执行、等待恢复后拿到子进程真实退出码。
-sc_list_first_field() {
-  local file="$1" line=""
+# 无参 `launchctl list` 三列表解析（Apple launchctl(1)：无参数时以三列
+# 输出全部已加载 job——第一列 PID（运行中才有）、第二列 last exit
+# status、第三列 label；带 label 参数时打印的是该 job 的详情字典，
+# 首行 "{"，绝不能当三列表解析——那正是旧实现的阻断：永远解析不到
+# PID）。本函数逐行以 tab 精确匹配第三列：
+#   - header 行（PID<TAB>Status<TAB>Label）跳过；
+#   - 第三列不等于 label 的行（其他 job / anonymous / 两列行 / 详情
+#     字典行）全部跳过，不做任何子串匹配；
+#   - 精确匹配行第一列仅接受全数字或 "-"（loaded 未运行）；
+#   - 空第一列、非数字非 "-"、精确匹配行数不为 1（0=未加载，>1=
+#     重复 label）→ fail closed 返回非 0。
+# 纯 shell read 解析（无 grep/awk/命令替换），输入是 0600 探测文件；
+# 单元测试可直接构造文件内容验证解析矩阵。
+sc_parse_list_pid() {
+  local file="$1" line="" first="" rest="" third="" matches=0
   SC_LIST_PID=""
   [ -n "$file" ] || return 2
-  : > "$file" 2>/dev/null || return 2
-  if ! launchctl list "$SC_LAUNCHD_LABEL" > "$file" 2>/dev/null; then
+  [ -f "$file" ] || return 2
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" = $'PID\tStatus\tLabel' ] && continue
+    first="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    [ "$rest" = "$line" ] && continue          # 无 tab：与本 label 无关
+    third="${rest#*$'\t'}"
+    [ "$third" = "$rest" ] && continue         # 只有一个 tab：无第三列
+    [ "$third" = "$SC_LAUNCHD_LABEL" ] || continue
+    case "$first" in
+      *[!0-9]*)
+        if [ "$first" = "-" ]; then
+          SC_LIST_PID="-"
+        else
+          SC_LIST_PID=""
+          return 4                             # 第一列畸形：fail closed
+        fi
+        ;;
+      '')
+        SC_LIST_PID=""
+        return 4                               # tab 开头空第一列：fail closed
+        ;;
+      *)
+        SC_LIST_PID="$first"
+        ;;
+    esac
+    matches=$((matches + 1))
+  done < "$file"
+  if [ "$matches" -ne 1 ]; then
+    SC_LIST_PID=""
+    return 3                                   # 0=未加载；>1=重复 label
+  fi
+  return 0
+}
+
+# 无参 list 探测：输出重定向到 0600 探测文件（mktemp O_EXCL 随机名）
+# 后交 sc_parse_list_pid 解析，loaded 判定仍由带 label 精确查询的
+# exit status 表达（调用方自行发起）。绝不用命令替换捕获 launchctl
+# 输出——bash 命令替换执行期间收到信号会污染退出码（128+signum）
+# 且 trap 赋值丢失（在替换子上下文执行），信号保护语义会被破坏；
+# 直接重定向则 trap 在当前 shell 正确执行、等待恢复后拿到子进程
+# 真实退出码。
+sc_job_pid_probe() {
+  SC_LIST_PID=""
+  [ -n "$SC_LIST_PROBE" ] || return 2
+  : > "$SC_LIST_PROBE" 2>/dev/null || return 2
+  if ! launchctl list > "$SC_LIST_PROBE" 2>/dev/null; then
     return 3
   fi
-  IFS= read -r line < "$file" || true
-  SC_LIST_PID="${line%%$'\t'*}"
-  return 0
+  sc_parse_list_pid "$SC_LIST_PROBE"
+}
+
+# 事务外状态查询（status 展示用）：带 label 精确查询 exit 判 loaded，
+# 再以临时 0600 探测文件走同一套无参三列表解析。返回：0=已解析
+# （SC_LIST_PID 为数字或 "-""）；3=未加载/无参查询失败；4=输出异常
+# fail closed。探测文件即用即删。
+sc_query_job_pid() {
+  local probe="" rc=0
+  SC_LIST_PID=""
+  launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1 || return 3
+  probe="$(sc_mktemp_private "${TMPDIR:-/tmp}" ".sc-list.probe")" || return 4
+  if ! launchctl list > "$probe" 2>/dev/null; then
+    rc=3
+  else
+    sc_parse_list_pid "$probe" || rc=$?
+  fi
+  rm -f "$probe" || true
+  return "$rc"
 }
 
 # readiness 探测 host 归一：绑定地址转为本机可连接地址。
@@ -804,14 +874,22 @@ sc_readiness_host() {
 # 候选 job 确认轮询（有界，提交门）：
 #   1. `launchctl list <label>` 精确查询 exit 非 0 → job 已不在加载
 #      状态 → 立即失败；
-#   2. 首个 tab 字段非数字（"-" 或空）→ 进程未运行：曾出现数字 PID
-#      又回到非数字视同进程退出立即失败，否则继续等待（首次迁移/
-#      冷启动场景 PID 会延迟出现）；
+#   2. 无参 `launchctl list` 三列表精确匹配 label 行的 PID 列非数字
+#      （"-" 等）→ 进程未运行：曾出现数字 PID 又回到非数字视同进程
+#      退出立即失败，否则继续等待（首次迁移/冷启动场景 PID 会延迟
+#      出现）；解析异常/重复 label → fail closed 立即失败；
 #   3. 数字 PID 时 curl 直连候选 readiness 端点：--fail（非 2xx 即
 #      失败）、--noproxy '*'（绝不经任何代理/env 代理配置）、
 #      --max-time 单次短超时；URL 只含归一 host 与端口，无凭据；
-#   4. 总时限（SC_READINESS_TIMEOUT，默认 60s——覆盖首次数据库迁移
+#   4. curl 成功 ≠ 可提交：立即复核当前 PID 必须仍是刚探测的那个
+#      进程——KeepAlive 在 curl 成功后换进程（A→B）时清除 READY_PID
+#      并在同一总时限内对新 PID 重新执行 readiness，再次稳定确认
+#      （curl 成功 + 复核一致）才返回；复核发现进程退回 "-" 视同
+#      退出立即失败；
+#   5. 总时限（SC_READINESS_TIMEOUT，默认 60s——覆盖首次数据库迁移
 #      可完成；测试可注入缩短）内未收敛即失败。
+# 成功返回时 SC_READY_PID 记录 readiness 绑定的进程，提交临界区
+# 以「当前 PID == SC_READY_PID」收口。
 # loaded 不等于可服务：应用因数据目录网络卷/WAL/迁移/绑定失败而
 # 反复退出时，本函数超时/退出返回非 0，由调用方走既有幂等回滚。
 sc_wait_candidate_ready() {
@@ -822,9 +900,14 @@ sc_wait_candidate_ready() {
   interval="${SC_READINESS_INTERVAL:-1}"
   curl_max="${SC_READINESS_CURL_MAX:-2}"
   deadline=$(( $(date +%s) + total ))
+  SC_READY_PID=""
   while :; do
-    if ! sc_list_first_field "$SC_LIST_PROBE"; then
+    if ! launchctl list "$SC_LAUNCHD_LABEL" >/dev/null 2>&1; then
       echo "候选 job 已不再处于加载状态" >&2
+      return 1
+    fi
+    if ! sc_job_pid_probe; then
+      echo "候选 job 状态无法确认（launchctl 列表解析异常）" >&2
       return 1
     fi
     pid="$SC_LIST_PID"
@@ -840,7 +923,25 @@ sc_wait_candidate_ready() {
         if curl --fail --silent --show-error --noproxy '*' \
              --max-time "$curl_max" \
              "http://${url_host}:${port}/api/health/ready" >/dev/null 2>&1; then
-          return 0
+          # PID 稳定复核：readiness 通过的必须仍是刚探测的那个进程
+          if ! sc_job_pid_probe; then
+            echo "readiness 通过后候选 job 状态无法确认" >&2
+            return 1
+          fi
+          case "$SC_LIST_PID" in
+            "$pid")
+              SC_READY_PID="$pid"
+              return 0
+              ;;
+            ''|*[!0-9]*)
+              echo "候选进程在 readiness 通过后退出（PID 列回到未运行）" >&2
+              return 1
+              ;;
+            *)
+              SC_READY_PID=""
+              echo "readiness 通过后进程已切换（PID $pid → $SC_LIST_PID），对新进程重新确认" >&2
+              ;;
+          esac
         fi
         ;;
     esac
@@ -854,14 +955,16 @@ sc_wait_candidate_ready() {
 }
 
 # 提交临界区内的最终确认：readiness 通过瞬间到 committed 置位之间
-# 的退出/卸载窗口，以最后一次精确 PID 观测收口（数字 PID 才算活着）
+# 的退出/卸载/换进程窗口，以「当前 PID == readiness 通过时绑定的
+# SC_READY_PID」收口——仅是数字不够，必须是同一个进程
 sc_candidate_running() {
-  if ! sc_list_first_field "$SC_LIST_PROBE"; then
+  if ! sc_job_pid_probe; then
     return 1
   fi
   case "$SC_LIST_PID" in
     ''|*[!0-9]*) return 1 ;;
   esac
+  [ "$SC_LIST_PID" = "$SC_READY_PID" ] || return 1
   return 0
 }
 
@@ -953,9 +1056,10 @@ sc_switch_launchd() {
     sc_switch_failed
     return 1
   fi
-  # 候选确认（提交门）：`launchctl list` exit 0 只证明 loaded（第一列
-  # "-" = 未运行）——必须数字 PID 出现且本机直连 readiness 探测通过
-  # 才算候选真正可服务。host/port 取 prepare 已合并导出的运行值。
+  # 候选确认（提交门）：带 label 精确查询 exit 0 只证明 loaded（无参
+  # 三列表该行 PID 列 "-" = 未运行）——必须数字 PID 出现且本机直连
+  # readiness 探测通过、复核仍为同一 PID（SC_READY_PID）才算候选真正
+  # 可服务。host/port 取 prepare 已合并导出的运行值。
   local host port
   host="$(sc_env_value SURGE_HOST)"
   port="$(sc_env_value SURGE_PORT)"
@@ -967,14 +1071,15 @@ sc_switch_launchd() {
     return 1
   fi
   # 最终确认与置 committed 同在临界区：信号挂起至 committed 赋值后
-  # 处理；readiness 通过后进程退出的窗口以最后一次 PID 观测收口
+  # 处理；readiness 通过后进程退出/KeepAlive 换进程的窗口以
+  # 「当前 PID == SC_READY_PID」收口
   sc_critical_enter
   if sc_candidate_running; then
     SC_COMMITTED=1
   fi
   sc_critical_leave
   if [ "${SC_COMMITTED:-0}" != 1 ]; then
-    echo "候选进程在就绪确认后退出" >&2
+    echo "最终确认失败：当前进程与 readiness 通过时不一致（已切换或退出）" >&2
     sc_switch_failed
     return 1
   fi

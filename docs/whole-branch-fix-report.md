@@ -718,6 +718,78 @@ fake curl 默认成功、记录完整 argv、支持延迟成功/持续失败、�
 的端到端探测）尚需在物理 Mac 执行 `./surgeconf.sh restart` 人工
 验证。
 
+### 11. Fix Round 6 — 绑定真实 job PID（launchctl 真实输出格式 + readiness PID 一致性）
+
+Commit: `fix: bind launchd readiness to real job pid`
+
+**Ruling（决策记录）**：这是 Round 5 之后的 load-bearing 阻断，而非
+可延后的改进——Round 5 的 readiness 提交门在真实 macOS 上从不生效
+（阻断 1 使其永远超时回滚，`restart/enable` 对真实用户恒失败），
+且提交门本身存在「任意数字即放行」的绕过（阻断 2）。选择**最小兼容
+修复**而非停车重做：保留两阶段事务/回滚状态机/信号临界区全部既有
+语义，只替换 PID 观测来源并给提交门补一道 PID 一致性检查；所有
+signal/mv 四窗口/端口/首次 enable 回滚用例零改动通过。真实 Mac
+仍待物理 smoke（见文末）。
+
+**阻断 1（PID 来源错误）**：Apple launchctl(1)（apple-oss-distributions/
+launchd, man/launchctl.1）明确：`launchctl list` **无参数**时以三列
+表格输出全部已加载 job（第一列 PID、第二列 last exit status、第三列
+label，tab 分隔）；`launchctl list <label>` 打印的是该 job 的**详情
+字典**（首行 `{`，old-style plist，运行中才有 `"PID" = <数字>;` 行）。
+旧实现对带 label 输出取「首行第一个 tab 字段」——真实格式下永远解析
+出 `{`（非数字），readiness 只能超时。修复：
+loaded 判定继续用 `launchctl list "$label"` 的 exit status；PID 读取
+改为无参数 `launchctl list` 重定向到 0600 探测文件（`SC_LIST_PROBE`，
+prepare 阶段 mktemp O_EXCL，随 `sc_discard_candidates` 清理），由
+`sc_parse_list_pid` 逐行 `read` 解析（无 grep/awk/命令替换，保留信号
+pending 语义）：header 行字面跳过、第三列**精确等于** label 才匹配、
+第一列仅接受全数字或 `-`（loaded 未运行）、匹配行数必须恰为 1——
+0 行=未加载，>1 行（重复 label）/第一列畸形/空第一列一律 fail closed。
+`surgeconf.sh status` 的运行中判定同根因，改为复用同一解析
+（`sc_query_job_pid`，临时探测文件即用即删；解析异常 fail closed
+明确报错 exit 1，不猜测状态）。
+
+**阻断 2（提交门未绑定 readiness 时的进程）**：PID A readiness 通过
+后、最终确认前 KeepAlive 换成未 ready 的 PID B，旧实现
+`sc_candidate_running` 只验证「当前是数字」即置 SC_COMMITTED。修复：
+`sc_wait_candidate_ready` 在 curl 成功时记录 `SC_READY_PID` 并**立即
+复核**——当前 PID 必须仍是刚探测的那个进程；不一致（A→B）则清除
+READY_PID 并在同一总 deadline 内对新 PID 重新执行 readiness，再次
+「curl 成功 + 复核一致」才算稳定确认；复核发现退回 `-` 视同退出立即
+失败。提交临界区内 `sc_candidate_running` 收紧为「当前 PID ==
+SC_READY_PID」——仅数字不够，必须是同一个进程；不一致走既有幂等
+回滚。进程退回 `-`/消失的继续/失败策略沿用 Round 5 既有有限语义。
+
+**测试（RED→GREEN）**：fake launchctl 对齐真实格式——带 label 查询
+输出详情字典（含 `"PID" = 12345;` 行），无参查询输出三列表（header +
+`com.apple.dock`/anonymous 干扰行 + com.surgeconf 行），并新增
+`PID_SWITCH_AT`（无参查询第 N 次起 A=12345→B=54321）、`ALL_PID`/
+`ALL_EXTRA`（强制 PID 列/追加畸形与重复行）注入；fake curl 记录
+`pid=<关联PID>` 前缀并支持 `READY_PIDS`（仅指定 PID 可服务）。RED
+证据（旧实现 + 新 fake）：真实格式端到端用例 8s 超时回滚、两个换进程
+用例与单元矩阵全部失败（`sc_parse_list_pid` 尚不存在 → RC=127）。
+GREEN（新实现）：真实格式最终提交（无参查询 ≥3 次：轮询+复核+最终
+确认）；A curl 成功后换 B 且 B 未 ready → 同一 deadline 内重试 B 至
+超时、回滚旧字节并恢复旧 loaded；复核后临界区再换 B → 当前 PID ≠
+READY_PID 拒绝提交并回滚（curl 仅 A 一次）；A→B 且 B 随后 ready →
+仅在 B 上再次成功后才提交（curl 两次，末次关联 54321）；详情字典
+伪造 PID 行 + 无参表格 `-` → 不误判、curl 零调用；解析矩阵覆盖
+重复 label/畸形第一列/两列行/空文件/无 header。after-confirm 信号
+注入点随实现迁移至「readiness 通过后的第 2 次无参查询」（第 1 次
+=复核、第 2 次=临界区最终确认），`test_signal_after_confirm_
+respects_commit`（提交被尊重、退出 143）原样通过；signal/mv 四窗口/
+端口/首次 enable 回滚等既有用例零改动通过。
+
+**验证**：launchd 专项 **69 passed**（61 + 8 新增；含 detail-dict
+防御用例）；安全专项与全量见提交说明。开源安全豁免 SHA-256 随
+测试文件变更同步更新。
+
+**未验证限制声明**：以上为代码层自动确认（fake launchctl 输出对齐
+Apple 手册描述的格式；未调用真实 launchctl/真实服务）。真实 Mac 上
+的物理 smoke——`./surgeconf.sh restart` 后以真实 `launchctl list`
+三列表核对 com.surgeconf 行 PID、KeepAlive 崩溃循环下的超时回滚、
+真实 curl 对 `/api/health/ready` 的端到端探测——仍待人工执行。
+
 ## Slice 5 — 拒绝非本地数据库文件系统 + WAL 生效验证
 
 Commit: `fix: reject unsafe database filesystems`

@@ -1,9 +1,12 @@
-"""launchd 安装/持久化脚本行为测试（fix round 2）。
+"""launchd 安装/持久化脚本行为测试（fix round 2 起，多次追加）。
 
 直接 source ``launchd_lib.sh`` 验证函数行为；入口级测试执行真实
 ``surgeconf.sh start/restart``。launchctl 一律用 PATH 注入的 fake
-可执行文件替代（支持 ``launchctl list <label>`` 精确 exit status），
-绝不真实 load/unload，不污染用户现有 job。
+可执行文件替代，输出格式对齐真实 macOS（Apple launchctl(1)）：
+``launchctl list <label>`` 打印该 job 的详情字典（exit status 表达
+加载状态），无参数 ``launchctl list`` 打印全部 job 的三列表
+（PID/Status/Label，tab 分隔）。绝不真实 load/unload，不污染用户
+现有 job。
 """
 
 import plistlib
@@ -31,8 +34,9 @@ _signal_once() {
 case "$1" in
   list)
     if [ -n "$2" ]; then
-      # 精确 label 查询：输出 PID\tStatus\tLabel，exit status 表达加载状态；
-      # state 文件内容为 "running" 时第一列为数字 PID，其余（含空）为 "-"
+      # 精确 label 查询：真实 macOS 输出该 job 的详情字典（首行 "{"、
+      # tab 缩进、运行中才有 "PID" = <数字>; 行），exit status 表达加载
+      # 状态。绝不能当作无参三列表解析——旧实现正是栽在这里。
       # FAKE_LAUNCHCTL_LIST_FAIL_AT=N：第 N 次精确查询 exit 1（计数文件持久）
       if [ -n "${FAKE_LAUNCHCTL_LIST_FAIL_AT:-}" ]; then
         n=$(($(cat "${FAKE_LAUNCHCTL_LIST_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
@@ -40,41 +44,85 @@ case "$1" in
         [ "$n" = "${FAKE_LAUNCHCTL_LIST_FAIL_AT}" ] && exit 1
       fi
       if [ -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}" ]; then
-        pid_col="-"
+        detail_pid="-"
         if [ "$(cat "${FAKE_LAUNCHCTL_STATE}")" = "running" ]; then
-          pid_col="12345"
+          detail_pid="12345"
         fi
-        # FAKE_LAUNCHCTL_PID_FROM / PID_UNTIL：按精确查询计数控制第一列
-        # （延迟启动 / 进程退出模拟；计数包含 prepare 探测与回滚确认）
-        if [ -n "${FAKE_LAUNCHCTL_PID_FROM:-}" ] || [ -n "${FAKE_LAUNCHCTL_PID_UNTIL:-}" ]; then
-          pn=$(($(cat "${FAKE_LAUNCHCTL_PID_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
-          echo "$pn" > "${FAKE_LAUNCHCTL_PID_COUNT:-/dev/null}" 2>/dev/null
-          pid_col="-"
-          if [ "$pn" -ge "${FAKE_LAUNCHCTL_PID_FROM:-1}" ]; then
-            pid_col="12345"
-          fi
-          if [ -n "${FAKE_LAUNCHCTL_PID_UNTIL:-}" ] && \
-             [ "$pn" -gt "${FAKE_LAUNCHCTL_PID_UNTIL}" ]; then
-            pid_col="-"
-          fi
+        printf '{\n'
+        printf '\t"LimitLoadToSessionType" = "Aqua";\n'
+        printf '\t"Label" = "%s";\n' "$2"
+        printf '\t"OnDemand" = false;\n'
+        printf '\t"LastExitStatus" = 0;\n'
+        if [ "$detail_pid" != "-" ]; then
+          printf '\t"PID" = %s;\n' "$detail_pid"
         fi
-        printf -- '%s\t0\t%s\n' "$pid_col" "$2"
-        # after-confirm 注入点：候选 load 已发生且 readiness 已通过
-        # （curl-ok 标记存在）后的第一次精确查询——即 switch 提交
-        # 临界区内的最终确认；轮询阶段的查询不触发（ok 标记未写）
-        if [ "${FAKE_LAUNCHCTL_SIGNAL:-}" = "after-confirm" ] && \
-           [ -f "${FAKE_LAUNCHCTL_LOAD_MARK:-/nonexistent}" ] && \
-           [ -f "${FAKE_CURL_OK_MARK:-/nonexistent}" ] && \
-           [ ! -f "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/nonexistent}" ]; then
-          : > "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/dev/null}" 2>/dev/null
-          kill -"${FAKE_LAUNCHCTL_SIGNAL_KIND:-TERM}" "$PPID" 2>/dev/null
-        fi
+        printf '\t"TimeOut" = 30;\n'
+        printf '};\n'
         exit 0
       fi
       exit 1
     fi
+    # 无参数查询：真实三列表（header + 全部已加载 job，tab 分隔）。
+    # com.surgeconf 行的 PID 列由 state 与注入机制决定（不消耗机制
+    # 计数时详情字典独立于这些开关）：
+    #   state=running → 12345（进程 A）；其余（norun/loaded）→ "-"
+    #   FAKE_LAUNCHCTL_PID_FROM / PID_UNTIL：按无参查询计数延迟出现/退出
+    #   FAKE_LAUNCHCTL_PID_SWITCH_AT：第 N 次无参查询起换进程 B=54321
+    #     （KeepAlive 重启、readiness 通过前后换进程的模拟）
+    #   FAKE_LAUNCHCTL_ALL_PID：直接覆盖 PID 列（如强制 "-"）
+    #   FAKE_LAUNCHCTL_ALL_EXTRA：追加任意原始行（%b 转义，畸形/重复注入）
+    # 每次调用把当前 PID 写入 FAKE_LAUNCHCTL_CURRENT_PID，供 fake curl
+    # 记录每次 readiness 探测的关联 PID。
+    pid_col="-"
     if [ -f "${FAKE_LAUNCHCTL_STATE:-/nonexistent}" ]; then
-      printf -- '-\t0\tcom.surgeconf\n'
+      if [ "$(cat "${FAKE_LAUNCHCTL_STATE}")" = "running" ]; then
+        pid_col="12345"
+      fi
+      if [ -n "${FAKE_LAUNCHCTL_PID_FROM:-}" ] || [ -n "${FAKE_LAUNCHCTL_PID_UNTIL:-}" ]; then
+        pn=$(($(cat "${FAKE_LAUNCHCTL_PID_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
+        echo "$pn" > "${FAKE_LAUNCHCTL_PID_COUNT:-/dev/null}" 2>/dev/null
+        pid_col="-"
+        if [ "$pn" -ge "${FAKE_LAUNCHCTL_PID_FROM:-1}" ]; then
+          pid_col="12345"
+        fi
+        if [ -n "${FAKE_LAUNCHCTL_PID_UNTIL:-}" ] && \
+           [ "$pn" -gt "${FAKE_LAUNCHCTL_PID_UNTIL}" ]; then
+          pid_col="-"
+        fi
+      fi
+      if [ -n "${FAKE_LAUNCHCTL_PID_SWITCH_AT:-}" ]; then
+        sn=$(($(cat "${FAKE_LAUNCHCTL_SWITCH_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
+        echo "$sn" > "${FAKE_LAUNCHCTL_SWITCH_COUNT:-/dev/null}" 2>/dev/null
+        if [ "$sn" -ge "${FAKE_LAUNCHCTL_PID_SWITCH_AT}" ]; then
+          pid_col="54321"
+        fi
+      fi
+      if [ -n "${FAKE_LAUNCHCTL_ALL_PID:-}" ]; then
+        pid_col="${FAKE_LAUNCHCTL_ALL_PID}"
+      fi
+      printf 'PID\tStatus\tLabel\n'
+      printf -- '271\t0\tcom.apple.dock\n'
+      printf -- '97\t0\t0xdeadbeef.anonymous.somehelper\n'
+      printf -- '%s\t0\tcom.surgeconf\n' "$pid_col"
+      if [ -n "${FAKE_LAUNCHCTL_ALL_EXTRA:-}" ]; then
+        printf -- '%b\n' "${FAKE_LAUNCHCTL_ALL_EXTRA}"
+      fi
+    fi
+    printf '%s' "$pid_col" > "${FAKE_LAUNCHCTL_CURRENT_PID:-/dev/null}" 2>/dev/null
+    # after-confirm 注入点：readiness 已通过（curl-ok 标记存在）后的
+    # 第 2 次无参查询——第 1 次是 wait 内的 PID 稳定复核，第 2 次是
+    # 提交临界区内的最终确认（sc_candidate_running），信号恰在
+    # committed 置位前到达；轮询阶段的查询不触发（ok 标记未写）
+    if [ "${FAKE_LAUNCHCTL_SIGNAL:-}" = "after-confirm" ] && \
+       [ -f "${FAKE_LAUNCHCTL_LOAD_MARK:-/nonexistent}" ] && \
+       [ -f "${FAKE_CURL_OK_MARK:-/nonexistent}" ] && \
+       [ ! -f "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/nonexistent}" ]; then
+      okq=$(($(cat "${FAKE_LAUNCHCTL_OKQ_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
+      echo "$okq" > "${FAKE_LAUNCHCTL_OKQ_COUNT:-/dev/null}" 2>/dev/null
+      if [ "$okq" -ge 2 ]; then
+        : > "${FAKE_LAUNCHCTL_SIGNAL_MARK:-/dev/null}" 2>/dev/null
+        kill -"${FAKE_LAUNCHCTL_SIGNAL_KIND:-TERM}" "$PPID" 2>/dev/null
+      fi
     fi
     exit 0
     ;;
@@ -189,18 +237,29 @@ exit "$rc"
 
 FAKE_CURL = r"""#!/bin/sh
 # fake curl：绝不访问网络（纯 shell，无任何网络系统调用）。
-# 每次调用把完整 argv（空格 join，含 URL）追加到 FAKE_CURL_LOG。
+# 每次调用把「pid=<当前PID> <argv>」追加到 FAKE_CURL_LOG——PID 取自
+# fake launchctl 无参查询写入的 FAKE_LAUNCHCTL_CURRENT_PID，即本次
+# readiness 探测实际绑定的进程（curl 从不自行解析 launchctl）。
 # FAKE_CURL_FAIL_TIMES=N：前 N 次调用 exit 1（延迟成功模拟）；
-# FAKE_CURL_RC：持续失败退出码（默认 0 = 成功）。
+# FAKE_CURL_RC：持续失败退出码（默认 0 = 成功）；
+# FAKE_CURL_READY_PIDS（空格分隔）：设置后仅这些 PID 视为可服务，
+# 其余 exit 1（KeepAlive 换进程后新 PID 尚未 ready 的模拟）。
 # 成功时写 FAKE_CURL_OK_MARK（供 after-confirm 注入点区分
 # 「readiness 已通过后的最终确认」与「轮询期查询」）。
-printf '%s\n' "$*" >> "${FAKE_CURL_LOG:-/dev/null}"
+pid="$(cat "${FAKE_LAUNCHCTL_CURRENT_PID:-/nonexistent}" 2>/dev/null || printf '?')"
+printf 'pid=%s %s\n' "$pid" "$*" >> "${FAKE_CURL_LOG:-/dev/null}"
 if [ -n "${FAKE_CURL_FAIL_TIMES:-}" ]; then
   n=$(($(cat "${FAKE_CURL_COUNT:-/dev/null}" 2>/dev/null || echo 0) + 1))
   echo "$n" > "${FAKE_CURL_COUNT:-/dev/null}" 2>/dev/null
   [ "$n" -le "${FAKE_CURL_FAIL_TIMES}" ] && exit 1
 fi
 rc="${FAKE_CURL_RC:-0}"
+if [ "$rc" = "0" ] && [ -n "${FAKE_CURL_READY_PIDS:-}" ]; then
+  case " ${FAKE_CURL_READY_PIDS} " in
+    *" $pid "*) ;;
+    *) exit 1 ;;
+  esac
+fi
 if [ "$rc" = "0" ]; then
   : > "${FAKE_CURL_OK_MARK:-/dev/null}" 2>/dev/null
 fi
@@ -245,10 +304,13 @@ def fake_launchctl(tmp_path):
     FAKE_LAUNCHCTL_UNLOAD_COUNT（unload 计数）、FAKE_LAUNCHCTL_SIGNAL_MARK
     （一次性信号注入标记）、FAKE_LAUNCHCTL_LOAD_MARK（load 已发生标记）、
     FAKE_MV_SIGNAL_MARK（mv 窗口信号标记）、FAKE_LAUNCHCTL_PID_COUNT
-    （PID_FROM/PID_UNTIL 精确查询计数）、FAKE_CURL_LOG（curl argv 日志）、
-    FAKE_CURL_COUNT（curl 失败计数）、FAKE_CURL_OK_MARK（readiness
-    已通过标记）。curl 默认成功（launchd 事务仅在 readiness 探测
-    通过后提交）。"""
+    （PID_FROM/PID_UNTIL 无参查询计数）、FAKE_LAUNCHCTL_SWITCH_COUNT
+    （PID_SWITCH_AT 换进程计数）、FAKE_LAUNCHCTL_CURRENT_PID（无参查询
+    当前 PID，供 fake curl 关联）、FAKE_LAUNCHCTL_OKQ_COUNT（readiness
+    通过后的无参查询计数，after-confirm 注入用）、FAKE_CURL_LOG
+    （curl argv 日志，含 pid= 前缀）、FAKE_CURL_COUNT（curl 失败计数）、
+    FAKE_CURL_OK_MARK（readiness 已通过标记）。curl 默认成功（launchd
+    事务仅在 readiness 探测通过后提交）。"""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "launchctl").write_text(FAKE_LAUNCHCTL)
@@ -269,6 +331,9 @@ def fake_launchctl(tmp_path):
     load_mark = tmp_path / "load-happened.mark"
     mv_signal_mark = tmp_path / "mv-signal.mark"
     pid_count = tmp_path / "pid-count"
+    switch_count = tmp_path / "switch-count"
+    current_pid = tmp_path / "current-pid"
+    okq_count = tmp_path / "okq-count"
     curl_count = tmp_path / "curl-count"
     curl_ok_mark = tmp_path / "curl-ok.mark"
     env = {"PATH": f"{bindir}:/usr/bin:/bin",
@@ -281,6 +346,9 @@ def fake_launchctl(tmp_path):
            "FAKE_LAUNCHCTL_LOAD_MARK": str(load_mark),
            "FAKE_MV_SIGNAL_MARK": str(mv_signal_mark),
            "FAKE_LAUNCHCTL_PID_COUNT": str(pid_count),
+           "FAKE_LAUNCHCTL_SWITCH_COUNT": str(switch_count),
+           "FAKE_LAUNCHCTL_CURRENT_PID": str(current_pid),
+           "FAKE_LAUNCHCTL_OKQ_COUNT": str(okq_count),
            "FAKE_CURL_LOG": str(curl_log),
            "FAKE_CURL_COUNT": str(curl_count),
            "FAKE_CURL_OK_MARK": str(curl_ok_mark)}
@@ -1600,7 +1668,8 @@ def test_readiness_host_mapping_variants(tmp_path):
 def test_readiness_curl_contract_on_success(tmp_path, fake_launchctl):
     """成功提交路径的 curl argv 契约：--fail --silent --show-error
     --noproxy '*' --max-time 引用值；SURGE_HOST=0.0.0.0 时 URL host
-    归一为 127.0.0.1；URL 指向 /api/health/ready，无任何凭据"""
+    归一为 127.0.0.1；URL 指向 /api/health/ready，无任何凭据；
+    日志行以 pid= 前缀记录本次探测绑定的进程 PID"""
     log, env, state = fake_launchctl
     home, control_dir, control_env, plist, _ = _prepare(tmp_path)
     env["HOME"] = str(home)
@@ -1611,10 +1680,11 @@ def test_readiness_curl_contract_on_success(tmp_path, fake_launchctl):
     curl_calls = (tmp_path / "curl.log").read_text().strip().splitlines()
     assert len(curl_calls) == 1
     line = curl_calls[0]
-    assert line.startswith(
-        "--fail --silent --show-error --noproxy * --max-time ")
+    assert line.startswith("pid=")                     # 记录关联 PID
+    assert line.split(" ", 1)[0] == "pid=12345"        # 绑定无参表格中的 PID
+    assert "--fail --silent --show-error --noproxy * --max-time " in line
     assert line.endswith("http://127.0.0.1:61900/api/health/ready")
-    assert "@" not in line                          # URL 不含凭据
+    assert "@" not in line                              # URL 不含凭据
 
 
 def test_switch_loaded_without_running_pid_rolls_back(tmp_path, fake_launchctl):
@@ -1670,7 +1740,7 @@ def test_switch_numeric_pid_readiness_fail_rolls_back(tmp_path, fake_launchctl):
 
 
 def test_switch_delayed_pid_then_delayed_ready_commits(tmp_path, fake_launchctl):
-    """延迟启动（前两次精确查询 PID 为 "-"，首次迁移场景）+ 首次
+    """延迟启动（前两次无参查询 PID 为 "-"，首次迁移场景）+ 首次
     readiness 失败后成功：轮询在时限内收敛——最终提交新配置、
     job loaded、无候选残留、curl 恰好两次（一败一成）"""
     log, env, state = fake_launchctl
@@ -1680,7 +1750,7 @@ def test_switch_delayed_pid_then_delayed_ready_commits(tmp_path, fake_launchctl)
     r = run_script(["enable"], tmp_path, extra_env={
         **env,
         "SURGE_PORT": "61900",
-        "FAKE_LAUNCHCTL_PID_FROM": "3",      # prepare 探测(1) + 轮询首轮(2) 为 "-"
+        "FAKE_LAUNCHCTL_PID_FROM": "3",      # 无参查询 #1、#2 为 "-"，#3 起数字
         "FAKE_CURL_FAIL_TIMES": "1",
         "SC_READINESS_TIMEOUT": "5",
         "SC_READINESS_INTERVAL": "0.2",
@@ -1709,8 +1779,8 @@ def test_switch_process_exit_after_pid_rolls_back(tmp_path, fake_launchctl):
     started = time.monotonic()
     r = run_script(["restart"], tmp_path, extra_env={
         **env,
-        "FAKE_LAUNCHCTL_PID_FROM": "2",      # 轮询首轮（总第 2 次查询）数字
-        "FAKE_LAUNCHCTL_PID_UNTIL": "2",     # 第 3 次起回 "-"（进程退出）
+        "FAKE_LAUNCHCTL_PID_FROM": "2",      # 无参查询 #2 起数字（轮询首轮）
+        "FAKE_LAUNCHCTL_PID_UNTIL": "2",     # 无参查询 #3 起回 "-"（进程退出）
         "SC_READINESS_TIMEOUT": "8",
         "SC_READINESS_INTERVAL": "0.3",
     })
@@ -1721,6 +1791,178 @@ def test_switch_process_exit_after_pid_rolls_back(tmp_path, fake_launchctl):
     assert control_env.read_bytes() == old_control
     assert plist.read_bytes() == old_plist
     assert state.exists()
+
+# ===== Fix：真实 launchctl 输出格式 + readiness PID 绑定（round 5 收尾） =====
+
+
+def test_real_launchctl_format_eventually_ready_commits(tmp_path, fake_launchctl):
+    """真实输出格式端到端：带 label 查询返回详情字典（首行 "{"，运行中
+    含 "PID" = 12345; 行），无参查询返回三列表（header + 其他 job 干扰
+    行）。PID 必须取自无参表格逐行精确匹配——旧实现把详情字典首行 "{"
+    当 PID 列解析，永远等不到数字 PID 只能超时失败（本用例注入 8s 上限
+    使旧实现可观察地超时回滚）；正确实现最终提交成功"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r = run_script(["enable"], tmp_path, extra_env={
+        **env,
+        "SURGE_PORT": "61900",
+        "SC_READINESS_TIMEOUT": "8",
+        "SC_READINESS_INTERVAL": "0.2",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = plistlib.loads(plist.read_bytes())
+    assert data["EnvironmentVariables"]["SURGE_PORT"] == "61900"
+    assert state.exists()
+    calls = log.read_text().strip().splitlines()
+    assert calls.count("list") >= 3                    # 无参查询：轮询+复核+最终确认
+    assert "list com.surgeconf" in calls               # loaded 判定仍用精确查询
+    curl_calls = (tmp_path / "curl.log").read_text().strip().splitlines()
+    assert curl_calls and curl_calls[-1].startswith("pid=12345 ")
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+
+
+def test_pid_switch_after_curl_new_not_ready_rolls_back(tmp_path, fake_launchctl):
+    """A 上 curl 成功后 KeepAlive 换进程 B（复核即见新 PID）：清除
+    READY_PID，在同一总时限内对新 PID 重新 readiness；B 未 ready
+    （READY_PIDS 仅含 A）→ 超时回滚旧字节并恢复旧 loaded。旧实现
+    curl 成功即提交（B 是任意数字也放行）→ 本用例 RED"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_PID_SWITCH_AT": "2",   # 无参 #1=A；复核无参 #2 起为 B
+        "FAKE_CURL_READY_PIDS": "12345",       # 仅进程 A 可服务
+        "SC_READINESS_TIMEOUT": "3",
+        "SC_READINESS_INTERVAL": "0.2",
+    })
+    assert r.returncode != 0
+    assert "回滚" in (r.stdout + r.stderr)
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()                             # 旧 job 重新加载
+    curl_calls = (tmp_path / "curl.log").read_text().strip().splitlines()
+    assert any(c.startswith("pid=12345 ") for c in curl_calls)   # A 曾 ready
+    assert any(c.startswith("pid=54321 ") for c in curl_calls)   # 对 B 重新探测
+    assert curl_calls[-1].startswith("pid=54321 ")               # 超时前仍在等 B
+
+
+def test_pid_switch_at_final_confirm_rejects_commit(tmp_path, fake_launchctl):
+    """readiness 在 A 上通过、复核仍为 A；提交临界区最终确认时已换 B：
+    当前 PID ≠ readiness 通过 PID → 拒绝提交并回滚——绝不因 B 是数字
+    就放行。旧实现 sc_candidate_running 只看「是数字」→ 直接提交（RED）"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_PID_SWITCH_AT": "3",   # 无参 #3（临界区确认）起为 B
+        "SC_READINESS_TIMEOUT": "5",
+        "SC_READINESS_INTERVAL": "0.2",
+    })
+    assert r.returncode != 0
+    assert "回滚" in (r.stdout + r.stderr)
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()
+    curl_calls = (tmp_path / "curl.log").read_text().strip().splitlines()
+    assert len(curl_calls) == 1                        # 仅 A 的一次成功探测
+    assert curl_calls[0].startswith("pid=12345 ")
+
+
+def test_pid_switch_new_pid_ready_commits_on_b(tmp_path, fake_launchctl):
+    """A→B 且 B 随后 ready：只有在 B 上再次 readiness 成功且复核一致后
+    才提交（READY_PID 绑定 B）。curl 两次（A、B 各一）且第二次关联
+    54321——旧实现一次 curl 即提交，本用例对旧实现 RED"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, _ = _prepare(tmp_path)
+    env["HOME"] = str(home)
+
+    r = run_script(["enable"], tmp_path, extra_env={
+        **env,
+        "SURGE_PORT": "61900",
+        "FAKE_LAUNCHCTL_PID_SWITCH_AT": "2",
+        "FAKE_CURL_READY_PIDS": "12345 54321",
+        "SC_READINESS_TIMEOUT": "5",
+        "SC_READINESS_INTERVAL": "0.2",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = plistlib.loads(plist.read_bytes())
+    assert data["EnvironmentVariables"]["SURGE_PORT"] == "61900"
+    assert state.exists()
+    curl_calls = (tmp_path / "curl.log").read_text().strip().splitlines()
+    assert len(curl_calls) == 2                        # A 一次 + B 一次
+    assert curl_calls[0].startswith("pid=12345 ")
+    assert curl_calls[1].startswith("pid=54321 ")      # 提交前最后一次成功在 B
+    assert [p.name for p in plist.parent.iterdir()] == ["com.surgeconf.plist"]
+    assert [p.name for p in control_dir.iterdir()] == ["launchd.env"]
+
+
+def test_detail_dict_pid_line_not_mistaken_as_table(tmp_path, fake_launchctl):
+    """带 label 详情字典含 "PID" = 12345; 行而无参表格为 "-"（loaded
+    未运行）：PID 只能来自无参表格——绝不把详情输出当三列表解析。
+    readiness 超时回滚、curl 从未被调用"""
+    log, env, state = fake_launchctl
+    home, control_dir, control_env, plist, old_control, old_plist = \
+        _seed_running_service(tmp_path)
+    env["HOME"] = str(home)
+    state.write_text("running")
+
+    r = run_script(["restart"], tmp_path, extra_env={
+        **env,
+        "FAKE_LAUNCHCTL_ALL_PID": "-",        # 无参表格：loaded 未运行
+        "SC_READINESS_TIMEOUT": "2",
+        "SC_READINESS_INTERVAL": "0.2",
+    })
+    assert r.returncode != 0
+    assert "回滚" in (r.stdout + r.stderr)
+    assert control_env.read_bytes() == old_control
+    assert plist.read_bytes() == old_plist
+    assert state.exists()
+    assert (tmp_path / "curl.log").read_text().strip() == ""   # 无 PID 不探测
+
+
+def test_parse_list_pid_unit_matrix(tmp_path):
+    """sc_parse_list_pid 纯解析矩阵（直接喂探测文件内容）：
+    header 跳过 / 唯一精确行取第一列 / "-"=loaded 未运行 / 0 匹配=
+    未加载 / 重复精确 label fail closed / 畸形第一列 fail closed /
+    两列行不承载第三列匹配 / 详情字典行不误配 / 空文件未加载"""
+    cases = [
+        ("PID\\tStatus\\tLabel\\n271\\t0\\tcom.apple.dock\\n"
+         "12345\\t0\\tcom.surgeconf\\n", "PID=12345"),
+        ("PID\\tStatus\\tLabel\\n-\\t0\\tcom.surgeconf\\n", "PID=-"),
+        ("-\\t0\\tcom.surgeconf\\n", "PID=-"),                 # 老系统无 header
+        ("271\\t0\\tcom.apple.dock\\n", "RC=3"),               # 未加载
+        ("", "RC=3"),                                          # 空文件
+        ("12345\\t0\\tcom.surgeconf\\n999\\t0\\tcom.surgeconf\\n", "RC=3"),
+        ("abc\\t0\\tcom.surgeconf\\n", "RC=4"),                # 第一列畸形
+        ("12x45\\t0\\tcom.surgeconf\\n", "RC=4"),              # 第一列畸形
+        ("99\\tcom.surgeconf\\n", "RC=3"),                     # 两列行无第三列
+        ("{\\n\\t\"Label\" = \"com.surgeconf\";\\n"
+         "\\t\"PID\" = 12345;\\n};\\n", "RC=3"),              # 详情字典不当表格
+    ]
+    for content, expected in cases:
+        r = run_bash(f"""
+            source "$LIB"
+            printf '%b' '{content}' > "$HOME/probe"
+            if sc_parse_list_pid "$HOME/probe"; then
+              echo "PID=$SC_LIST_PID"
+            else
+              echo "RC=$?"
+            fi
+        """, tmp_path)
+        assert r.returncode == 0, r.stderr
+        out = r.stdout.strip()
+        assert out == expected, f"{content!r} -> {out!r}（期望 {expected}）"
 
 
 @pytest.mark.parametrize("bad_port", ["0", "65536"])

@@ -71,15 +71,20 @@ case "${1:-help}" in
     echo "SurgeConf 已取消开机自启"
     ;;
   status)
-    # 精确 label 查询（exit status + PID 列）：不解析 label、不做子串 grep。
-    # launchctl list <label> 成功仅表示已加载；第一列数字 PID 才是运行中，
-    # "-"/空 表示已加载但当前无进程（崩溃/退避状态）。
-    if listing="$(launchctl list "$SC_LAUNCHD_LABEL" 2>/dev/null)"; then
-      pid="${listing%%$'\t'*}"
-      case "$pid" in
+    # 精确 label 查询（exit status）判 loaded；运行中判定复用 lib 的
+    # 无参 `launchctl list` 三列表解析（Apple launchctl(1)：带 label
+    # 参数打印的是该 job 的详情字典，不是 PID 列表）。解析异常时
+    # fail closed 明确报错，不猜测状态。
+    rc=0
+    sc_query_job_pid || rc=$?
+    if [ "$rc" = 0 ]; then
+      case "$SC_LIST_PID" in
         ''|*[!0-9]*) echo "SurgeConf 已加载但未运行" ;;
         *) echo "SurgeConf 运行中" ;;
       esac
+    elif [ "$rc" = 4 ]; then
+      echo "SurgeConf 状态无法确认（launchctl 输出异常）" >&2
+      exit 1
     elif [ -f "$PLIST" ]; then
       echo "SurgeConf 已注册但未运行"
     else
